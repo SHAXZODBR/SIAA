@@ -1,0 +1,264 @@
+@import url('https://rsms.me/inter/inter.css');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================= */
+/* Professional Medical Imaging Base Styles     */
+/* ============================================= */
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html, body, #root {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss01', 'ss03';
+    background: #0f172a;
+    color: #e2e8f0;
+    user-select: none;
+  }
+
+  /* Premium scrollbars */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.15);
+    border-radius: 10px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(148, 163, 184, 0.3);
+    background-clip: padding-box;
+  }
+
+  /* Selection */
+  ::selection {
+    background: rgba(59, 130, 246, 0.3);
+    color: #e2e8f0;
+  }
+}
+
+/* ============================================= */
+/* Component Styles                              */
+/* ============================================= */
+
+@layer components {
+  /* Frosted glass panel */
+  .glass-panel {
+    @apply bg-ink-800/80 backdrop-blur-md border border-ink-700/50;
+  }
+
+  /* Professional button */
+  .btn-medical {
+    @apply px-3 py-1.5 text-xs font-medium rounded-md
+           transition-all duration-150 ease-out
+           focus:outline-none focus:ring-2 focus:ring-accent-500/50
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn-medical bg-accent-600 hover:bg-accent-500 text-white
+           shadow-sm hover:shadow-glow-accent;
+  }
+
+  .btn-secondary {
+    @apply btn-medical bg-ink-700 hover:bg-ink-600 text-ink-100
+           border border-ink-600/50 hover:border-ink-500;
+  }
+
+  .btn-ghost {
+    @apply btn-medical text-ink-300 hover:text-ink-100 hover:bg-ink-800/80;
+  }
+
+  .btn-danger {
+    @apply btn-medical bg-critical hover:bg-red-500 text-white;
+  }
+
+  /* Tool button (icon only) */
+  .tool-btn {
+    @apply w-9 h-9 flex items-center justify-center
+           text-ink-400 hover:text-ink-100 hover:bg-ink-800
+           rounded-md transition-all duration-150
+           cursor-pointer select-none;
+  }
+
+  .tool-btn.active {
+    @apply bg-accent-600/20 text-accent-400 border border-accent-500/30;
+  }
+
+  /* Menu item */
+  .menu-item {
+    @apply flex items-center gap-2 px-3 py-1.5 text-sm
+           text-ink-200 hover:bg-ink-700/50 hover:text-white
+           rounded cursor-pointer transition-colors;
+  }
+
+  /* Kbd shortcut */
+  .kbd {
+    @apply inline-flex items-center px-1.5 h-5
+           text-[10px] font-mono font-medium
+           bg-ink-900/50 text-ink-400
+           border border-ink-700 rounded;
+  }
+
+  /* Severity pill */
+  .severity-pill {
+    @apply inline-flex items-center gap-1 px-2 py-0.5
+           text-[10px] font-bold uppercase tracking-wider
+           rounded-full;
+  }
+
+  /* Confidence bar */
+  .confidence-track {
+    @apply relative w-full h-1 bg-ink-800 rounded-full overflow-hidden;
+  }
+
+  .confidence-fill {
+    @apply absolute inset-y-0 left-0 rounded-full
+           transition-all duration-500 ease-out;
+  }
+
+  /* Loading skeleton */
+  .skeleton {
+    @apply animate-pulse bg-gradient-to-r from-ink-800 via-ink-700 to-ink-800
+           bg-[length:400px_100%];
+  }
+
+  /* Card */
+  .card {
+    @apply bg-ink-800/50 border border-ink-700/50 rounded-lg
+           shadow-panel transition-all duration-200;
+  }
+
+  .card-hover {
+    @apply card hover:border-ink-600 hover:bg-ink-800/80;
+  }
+
+  /* Divider */
+  .divider {
+    @apply h-px bg-gradient-to-r from-transparent via-ink-700 to-transparent;
+  }
+
+  /* Input */
+  .input-medical {
+    @apply w-full px-3 py-2 text-sm
+           bg-ink-900/50 border border-ink-700 rounded-md
+           text-ink-100 placeholder-ink-500
+           focus:outline-none focus:ring-2 focus:ring-accent-500/30 focus:border-accent-500
+           transition-all duration-150;
+  }
+
+  /* Tab */
+  .tab {
+    @apply relative flex-1 py-2.5 text-xs font-medium
+           text-ink-400 hover:text-ink-200
+           transition-colors duration-150 cursor-pointer
+           border-b-2 border-transparent;
+  }
+
+  .tab.active {
+    @apply text-accent-400 border-accent-500;
+  }
+
+  /* DICOM viewer canvas */
+  .dicom-canvas {
+    image-rendering: pixelated;
+    cursor: crosshair;
+  }
+
+  /* Crosshair cursor for viewer */
+  .viewer-crosshair {
+    cursor: crosshair;
+  }
+
+  .viewer-pan {
+    cursor: grab;
+  }
+
+  .viewer-pan:active {
+    cursor: grabbing;
+  }
+
+  /* Severity indicator colors */
+  .severity-critical { @apply bg-critical/20 text-critical border border-critical/30; }
+  .severity-urgent { @apply bg-urgent/20 text-urgent border border-urgent/30; }
+  .severity-moderate { @apply bg-moderate/20 text-moderate border border-moderate/30; }
+  .severity-mild { @apply bg-mild/20 text-mild border border-mild/30; }
+  .severity-normal { @apply bg-normal/20 text-normal border border-normal/30; }
+
+  /* Status dot */
+  .status-dot {
+    @apply w-2 h-2 rounded-full;
+  }
+
+  /* Pulse ring for active indicators */
+  .pulse-ring-wrapper {
+    @apply relative;
+  }
+
+  .pulse-ring-wrapper::before {
+    @apply content-[''] absolute inset-0 rounded-full
+           animate-pulse-ring;
+  }
+}
+
+/* ============================================= */
+/* Utility Overrides                             */
+/* ============================================= */
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+
+  .drag {
+    -webkit-app-region: drag;
+  }
+
+  /* Glass effect */
+  .glass {
+    background: linear-gradient(180deg,
+      rgba(30, 41, 59, 0.75) 0%,
+      rgba(15, 23, 42, 0.85) 100%);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
+  }
+
+  /* Mesh gradient background */
+  .bg-mesh {
+    background-color: #0f172a;
+    background-image:
+      radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.08) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(147, 51, 234, 0.06) 0px, transparent 50%),
+      radial-gradient(at 100% 0%, rgba(34, 197, 94, 0.04) 0px, transparent 50%);
+  }
+
+  /* Grid pattern */
+  .bg-grid {
+    background-image: linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+                      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+}

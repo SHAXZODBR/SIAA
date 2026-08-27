@@ -1,0 +1,68 @@
+SENTINEL MEDICAL AI — END USER LICENSE AGREEMENT
+================================================
+
+SIA Medical AI · Tashkent, Uzbekistan · siaa.uz
+
+1. SCOPE
+   This software (Sentinel Medical AI, the "Software") is licensed, not sold,
+   to the licensee identified in the included license.dat file. Use of the
+   Software without a valid license file is restricted to demo mode (10
+   analyses per day).
+
+2. INTENDED USE
+   Sentinel is an ASSISTIVE radiology tool. The Software:
+   • Pre-analyzes medical images and drafts radiology reports;
+   • Is intended ONLY for use by licensed radiologists and physicians;
+   • Does NOT replace human medical judgment;
+   • Outputs are ADVISORY and require physician review and signature.
+
+3. NOT A MEDICAL DEVICE
+   The Software has not been certified by the Ministry of Health of the
+   Republic of Uzbekistan or any other regulatory body. Sentinel must not
+   be used as the sole basis for any clinical decision.
+
+4. DATA PRIVACY
+   • All patient data processed by the Software stays on the local machine.
+   • No patient DICOM data is transmitted to vendor servers or third parties.
+   • Anonymized findings (no patient identifiers) may be aggregated locally
+     for model improvement; the licensee may opt out at any time.
+
+5. LICENSE BINDING
+   The license.dat file is cryptographically bound to the hardware fingerprint
+   of the machine on which it was activated. The license cannot be transferred
+   to another machine; copying the install will not extend the license.
+
+6. PROHIBITED USE
+   The licensee shall not:
+   • Reverse-engineer, decompile, or disassemble the Software;
+   • Resell, sublicense, or redistribute the Software;
+   • Bypass the license-validation mechanism;
+   • Use the Software outside the bounds of the licensed tier.
+
+7. DISCLAIMER OF WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND.
+   SIA MEDICAL AI DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
+   FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+8. LIMITATION OF LIABILITY
+   In no event shall SIA Medical AI be liable for any direct, indirect,
+   incidental, or consequential damages arising from use of the Software.
+   The licensee assumes all responsibility for clinical decisions made based
+   on Software output.
+
+9. TERMINATION
+   This license terminates automatically on the expires_at date in the
+   license.dat file, or upon written notice to the licensee for breach of
+   this agreement.
+
+10. GOVERNING LAW
+    This agreement is governed by the laws of the Republic of Uzbekistan.
+    Disputes shall be resolved in Tashkent.
+
+For licensing inquiries: shakhzodbatirjonov@gmail.com
+For technical support: support@siaa.uz
+
+By installing or using Sentinel Medical AI, you acknowledge that you have
+read, understood, and agree to be bound by the terms of this Agreement.
+
+© 2026 SIA Medical AI. All rights reserved.

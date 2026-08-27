@@ -1,0 +1,36 @@
+{
+  "Name": "SentinelPACS",
+  "StorageDirectory": "/var/lib/orthanc/db",
+  "IndexDirectory": "/var/lib/orthanc/db",
+  "DicomAet": "SENTINEL",
+  "DicomPort": 4242,
+  "HttpPort": 8042,
+  "RemoteAccessAllowed": true,
+  "AuthenticationEnabled": true,
+  "RegisteredUsers": {
+    "sentinel": "sentinel2024"
+  },
+  "DicomModalities": {
+    "clinic_mri": ["CLINIC_MRI", "192.168.1.100", 104],
+    "clinic_ct": ["CLINIC_CT", "192.168.1.101", 104],
+    "clinic_xray": ["CLINIC_XRAY", "192.168.1.102", 104]
+  },
+  "StableAge": 10,
+  "DicomCheckCalledAet": false,
+  "UnknownSopClassAccepted": true,
+  "MediaArchiveSize": 1,
+  "StorageCompression": false,
+  "MaximumStorageSize": 0,
+  "MaximumPatientCount": 0,
+  "LuaScripts": [],
+  "Plugins": [],
+  "ConcurrentJobs": 2,
+  "HttpsCACertificates": "",
+  "SslEnabled": false,
+  "SslCertificate": "",
+  "DefaultEncoding": "Utf8",
+  "DeidentifyLogs": true,
+  "KeepAlive": true,
+  "DicomAlwaysAllowEcho": true,
+  "DicomAlwaysAllowStore": true
+}

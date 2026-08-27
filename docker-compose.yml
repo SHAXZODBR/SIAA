@@ -1,0 +1,102 @@
+version: '3.8'
+
+# ============================================================
+# Sentinel Medical AI — Full Deployment Stack
+# ============================================================
+# Runs on-premise at each clinic. No internet required.
+#
+# Services:
+#   1. orthanc   — PACS server (receives DICOM from imaging machines)
+#   2. inference  — FastAPI AI server (DenseNet121 + Grad-CAM)
+#   3. watcher    — Background service (monitors Orthanc, triggers AI)
+#
+# Usage:
+#   docker-compose up -d
+#
+# The Electron desktop app connects to these services locally.
+# ============================================================
+
+services:
+  # ===== Orthanc PACS Server =====
+  # Receives DICOM files from MRI/CT/X-ray machines via C-STORE protocol
+  orthanc:
+    image: jodogne/orthanc:latest
+    container_name: sentinel-orthanc
+    restart: unless-stopped
+    ports:
+      - "8042:8042"   # Web UI + REST API
+      - "4242:4242"   # DICOM port (C-STORE)
+    volumes:
+      - orthanc_data:/var/lib/orthanc/db
+      - ./configs/orthanc.json:/etc/orthanc/orthanc.json:ro
+    environment:
+      - ORTHANC__NAME=SentinelPACS
+      - ORTHANC__DICOM_AET=SENTINEL
+      - ORTHANC__DICOM_PORT=4242
+      - ORTHANC__REGISTERED_USERS={"sentinel": "sentinel2024"}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8042/system"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ===== Sentinel AI Inference Server =====
+  # DenseNet121 classification + Grad-CAM heatmaps
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel-inference
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - SENTINEL_DB_KEY=${SENTINEL_DB_KEY:-default_key_change_me}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      orthanc:
+        condition: service_healthy
+
+  # ===== Orthanc Watcher Service =====
+  # Monitors Orthanc for new studies, triggers AI analysis
+  watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel-watcher
+    restart: unless-stopped
+    command: python -m src.inference.orthanc_watcher
+    volumes:
+      - ./models:/app/models:ro
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - ORTHANC_URL=http://orthanc:8042
+      - INFERENCE_URL=http://inference:8000
+      - SENTINEL_DB_KEY=${SENTINEL_DB_KEY:-default_key_change_me}
+    depends_on:
+      orthanc:
+        condition: service_healthy
+      inference:
+        condition: service_healthy
+
+volumes:
+  orthanc_data:
+    driver: local

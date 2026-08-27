@@ -1,0 +1,133 @@
+{
+  "name": "sentinel-medical-ai",
+  "version": "1.0.0",
+  "description": "Sentinel Medical AI — On-premise brain MRI / CT / X-ray AI assistant for clinics",
+  "homepage": "https://siaa.uz",
+  "author": {
+    "name": "SIA Medical AI",
+    "email": "shakhzodbatirjonov@gmail.com",
+    "url": "https://siaa.uz"
+  },
+  "license": "Proprietary",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build": "vite build && electron-builder",
+    "build:win": "vite build && electron-builder --win",
+    "build:mac": "vite build && electron-builder --mac",
+    "build:all": "vite build && electron-builder --win --mac",
+    "preview": "vite preview",
+    "lint": "eslint src/",
+    "type-check": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "uz.siaa.sentinel",
+    "productName": "Sentinel Medical AI",
+    "copyright": "© 2026 SIA Medical AI",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json",
+      "!node_modules/**/*.md",
+      "!node_modules/**/*.txt",
+      "!node_modules/**/test/**",
+      "!node_modules/**/tests/**",
+      "!node_modules/**/__tests__/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../scripts/setup_gemma_brain.sh",
+        "to": "scripts/setup_gemma_brain.sh"
+      },
+      {
+        "from": "../scripts/install_clinic_local.sh",
+        "to": "scripts/install_clinic_local.sh"
+      }
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico",
+      "publisherName": "SIA Medical AI",
+      "verifyUpdateCodeSignature": false,
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Sentinel Medical AI",
+      "include": "build/installer.nsh",
+      "license": "build/license.txt",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "deleteAppDataOnUninstall": false,
+      "uninstallDisplayName": "Sentinel Medical AI"
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] }
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.medical",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "title": "Sentinel Medical AI ${version}",
+      "background": null,
+      "iconSize": 100,
+      "contents": [
+        { "x": 130, "y": 220 },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Science",
+      "maintainer": "SIA Medical AI <shakhzodbatirjonov@gmail.com>"
+    },
+    "publish": null
+  },
+  "dependencies": {
+    "@cornerstonejs/core": "^0.3.0",
+    "@cornerstonejs/dicom-image-loader": "^0.1.5",
+    "@cornerstonejs/tools": "^0.5.0",
+    "axios": "^1.7.0",
+    "better-sqlite3": "^11.0.0",
+    "date-fns": "^3.6.0",
+    "dicom-parser": "^1.8.21",
+    "electron-store": "^8.2.0",
+    "jspdf": "^4.2.1",
+    "lucide-react": "^0.400.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "react-router-dom": "^6.23.0",
+    "zustand": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.4.0",
+    "concurrently": "^8.2.0",
+    "electron": "^41.2.1",
+    "electron-builder": "^26.8.1",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.5.0",
+    "vite": "^8.0.9",
+    "wait-on": "^7.2.0"
+  }
+}
