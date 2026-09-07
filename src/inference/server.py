@@ -51,6 +51,7 @@ class AnalysisResponse(BaseModel):
     report_text: Optional[str] = None
     report_language: Optional[str] = None
     gemma_available: bool = False
+    preview_base64: Optional[str] = None  # data-URI PNG of the analyzed slice (for the viewer)
 
 
 class ReportRequest(BaseModel):
@@ -944,6 +945,19 @@ async def analyze_auto(
     target_size = card.input_size[0]
     processed_image = preprocess_study(study, target_size=target_size)
 
+    # Encode the ACTUAL analyzed slice as a PNG data-URI so the viewer shows
+    # the real scan (not a placeholder). This is exactly the image the model saw.
+    preview_base64 = None
+    try:
+        import io as _io, base64 as _b64
+        from PIL import Image as _Image
+        _img8 = (np.clip(processed_image, 0, 1) * 255).astype(np.uint8)
+        _buf = _io.BytesIO()
+        _Image.fromarray(_img8).convert("L").save(_buf, format="PNG")
+        preview_base64 = "data:image/png;base64," + _b64.b64encode(_buf.getvalue()).decode()
+    except Exception as _e:
+        logger.warning(f"preview encode failed: {_e}")
+
     # Run prediction (returns dict[class_name -> prob])
     raw_probs = predictor(processed_image)
 
@@ -1033,6 +1047,7 @@ async def analyze_auto(
         report_text=report_text,
         report_language=language,
         gemma_available=gemma_available,
+        preview_base64=preview_base64,
     )
 
 

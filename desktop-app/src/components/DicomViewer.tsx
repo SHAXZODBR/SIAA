@@ -36,6 +36,9 @@ export default function DicomViewer() {
   const [measurements, setMeasurements] = useState<any[]>([]);
   const [measurementInProgress, setMeasurementInProgress] = useState<any>(null);
   const [pixelValue, setPixelValue] = useState<number | null>(null);
+  // Cache of decoded real-scan preview images, keyed by their data-URI
+  const previewImgCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  const [previewTick, setPreviewTick] = useState(0);
 
   // ===== Main Image Rendering =====
   useEffect(() => {
@@ -83,8 +86,25 @@ export default function DicomViewer() {
     const brightness = (128 - windowLevel.center) / 128;
     ctx.filter = `contrast(${contrast}) brightness(${1 + brightness}) ${invert ? 'invert(1)' : ''}`;
 
-    // Pick the right image based on modality + body part
-    drawDemoImage(ctx, w, h, selStudy);
+    // Prefer the REAL analyzed slice (returned by the backend as a PNG data-URI).
+    // Fall back to the modality-keyed placeholder only if no real scan is available.
+    const result = aiResults[selectedStudyId];
+    const previewUri = result?.previewBase64;
+    let drewReal = false;
+    if (previewUri) {
+      let img = previewImgCache.current.get(previewUri);
+      if (!img) {
+        img = new Image();
+        img.onload = () => setPreviewTick((t) => t + 1);
+        img.src = previewUri;
+        previewImgCache.current.set(previewUri, img);
+      }
+      if (img.complete && img.naturalWidth > 0) {
+        drawScanImage(ctx, w, h, img);
+        drewReal = true;
+      }
+    }
+    if (!drewReal) drawDemoImage(ctx, w, h, selStudy);
     ctx.restore();
 
     // Draw overlays (not affected by transform)
@@ -92,7 +112,7 @@ export default function DicomViewer() {
     drawOrientationIndicators(ctx, w, h);
     drawScaleBar(ctx, w, h, viewerZoom);
 
-  }, [selectedStudyId, studies, viewerZoom, panOffset, rotation, invert, windowLevel]);
+  }, [selectedStudyId, studies, aiResults, previewTick, viewerZoom, panOffset, rotation, invert, windowLevel]);
 
   // ===== Overlay Rendering (AI findings) =====
   useEffect(() => {
@@ -460,6 +480,17 @@ function drawCornerOverlays(ctx: CanvasRenderingContext2D, w: number, h: number,
 }
 
 // ─── Dispatcher: pick which body part to draw based on the selected study ──
+// Draw a REAL scan image (the actual analyzed slice), fit to the viewport on black.
+function drawScanImage(ctx: CanvasRenderingContext2D, w: number, h: number, img: HTMLImageElement) {
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return;
+  const scale = (Math.min(w, h) * 0.94) / Math.max(iw, ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+}
+
 function drawDemoImage(ctx: CanvasRenderingContext2D, w: number, h: number, study: Study | null) {
   if (!study) return drawDemoXray(ctx, w, h);
   const mod = (study.modality || '').toUpperCase();

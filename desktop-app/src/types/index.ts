@@ -29,6 +29,9 @@ export interface AIResult {
   isNormal: boolean;
   overallImpression: string;
   createdAt: string;
+  previewBase64?: string;  // data-URI PNG of the actual analyzed slice (real scan)
+  modality?: string;       // real DICOM modality from backend, e.g. 'MR'
+  bodyPart?: string;       // resolved body part, e.g. 'BRAIN'
 }
 
 export interface Report {

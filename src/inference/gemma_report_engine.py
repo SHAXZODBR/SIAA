@@ -484,6 +484,30 @@ class GemmaReportEngine:
         """
         language = language if language in SYSTEM_PROMPTS else 'ru'
 
+        # Brain studies → use the deterministic, professionally-worded, fully
+        # multilingual brain templates rather than the small LLM. They are
+        # cleaner and never emit conversational preambles or placeholders,
+        # which matters for clinical reports. (Gemma is still used for chat Q&A.)
+        _bp = (body_part or '').upper()
+        _mod = (modality or '').upper()
+        if 'BRAIN' in _bp or 'HEAD' in _bp or ('MR' in _mod and not _bp):
+            try:
+                from src.inference.brain_report_templates import build_brain_report
+                sec = build_brain_report(findings, language=language, modality=modality)
+                labels = {
+                    'ru': ['КЛИНИЧЕСКОЕ ПОКАЗАНИЕ', 'МЕТОДИКА', 'ОПИСАНИЕ', 'ЗАКЛЮЧЕНИЕ', 'РЕКОМЕНДАЦИИ'],
+                    'uz': ['KLINIK KO‘RSATMA', 'METODIKA', 'TAVSIF', 'XULOSA', 'TAVSIYALAR'],
+                    'en': ['CLINICAL INDICATION', 'TECHNIQUE', 'DESCRIPTION', 'IMPRESSION', 'RECOMMENDATIONS'],
+                }.get(language, None)
+                keys = ['clinical_indication', 'technique', 'description', 'impression', 'recommendation']
+                if labels and isinstance(sec, dict):
+                    report = "\n\n".join(
+                        f"{lab}: {sec.get(k, '').strip()}" for lab, k in zip(labels, keys) if sec.get(k)
+                    )
+                    return self._strip_markdown(report)
+            except Exception as e:
+                logger.warning(f"brain template failed, using LLM path: {e}")
+
         # Build findings list in markdown format
         if not findings:
             findings_str = {
@@ -543,7 +567,23 @@ class GemmaReportEngine:
                 language,
             )
 
-        return report
+        return self._strip_markdown(report)
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """Remove markdown artefacts (##, **, backticks, bullets) so reports
+        render cleanly in the plain-text report editor and the exported PDF."""
+        if not text:
+            return text
+        import re
+        out = []
+        for line in text.splitlines():
+            s = re.sub(r'^\s*#{1,6}\s*', '', line)   # '## Heading' -> 'Heading'
+            s = s.replace('**', '').replace('__', '').replace('`', '')
+            s = re.sub(r'^\s*[-*]\s+', '• ', s)      # normalise bullets
+            out.append(s.rstrip())
+        cleaned = re.sub(r'\n{3,}', '\n\n', '\n'.join(out))
+        return cleaned.strip()
 
     def _fallback_template_report(self, data: dict, language: str) -> str:
         """Fallback template-based report (when Gemma is not available).

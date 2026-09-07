@@ -74,7 +74,15 @@ export default function Sidebar() {
       }
 
       const updatedStudies = useAppStore.getState().studies.map(s =>
-        s.id === studyId ? { ...s, aiStatus: 'complete' as const, aiAnalyzedAt: new Date().toISOString() } : s
+        s.id === studyId ? {
+          ...s,
+          aiStatus: 'complete' as const,
+          aiAnalyzedAt: new Date().toISOString(),
+          // Apply the REAL modality/body part detected by the backend
+          // (fixes 'Auto' uploads that were provisionally labelled CR/CHEST)
+          modality: (result as any).modality || s.modality,
+          bodyPart: (result as any).bodyPart || s.bodyPart,
+        } : s
       );
       useAppStore.setState({ studies: updatedStudies });
     } catch (e: any) {

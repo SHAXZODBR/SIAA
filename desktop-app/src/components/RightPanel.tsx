@@ -377,8 +377,8 @@ function ReportTab({ result }: { result: AIResult | null }) {
           findingsForApi,
           language,
           { id: 'P-20241001' },
-          'CR',
-          'CHEST',
+          result.modality || 'CR',
+          result.bodyPart || 'CHEST',
         );
         if (cancelled) return;
         if (text && text.trim()) {
@@ -437,8 +437,8 @@ function ReportTab({ result }: { result: AIResult | null }) {
       await downloadPDF({
         patientId: 'P-20241001',
         studyDate: '2024-10-01',
-        modality: 'CR',
-        bodyPart: 'CHEST',
+        modality: result.modality || 'CR',
+        bodyPart: result.bodyPart || 'CHEST',
         reportText,
         doctorName: currentUser?.fullName || 'Doctor',
         clinicName: 'SIA Medical AI',
@@ -473,8 +473,8 @@ function ReportTab({ result }: { result: AIResult | null }) {
             findingsForApi,
             lang,
             { id: 'P-20241001' },
-            'CR',
-            'CHEST',
+            result.modality || 'CR',
+            result.bodyPart || 'CHEST',
           );
           if (text && text.trim()) collected[lang] = text;
         } catch {
@@ -494,8 +494,8 @@ function ReportTab({ result }: { result: AIResult | null }) {
         {
           patientId: 'P-20241001',
           studyDate: '2024-10-01',
-          modality: 'CR',
-          bodyPart: 'CHEST',
+          modality: result.modality || 'CR',
+          bodyPart: result.bodyPart || 'CHEST',
           doctorName: currentUser?.fullName || 'Doctor',
           clinicName: 'SIA Medical AI',
           clinicAddress: 'Tashkent, Uzbekistan',

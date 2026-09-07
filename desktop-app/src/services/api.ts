@@ -45,6 +45,15 @@ export async function analyzeDicom(
   });
 
   const data = res.data;
+  // Backend modality looks like "MR/brain_2d" → split into DICOM modality + body part
+  const rawModality: string = data.modality || '';
+  const [modPart, keyPart] = rawModality.split('/');
+  const bodyPartMap: Record<string, string> = {
+    brain_2d: 'BRAIN', brain: 'BRAIN', head_ct: 'HEAD',
+    chest: 'CHEST', mammography: 'BREAST',
+  };
+  const modality = (modPart || 'CR').toUpperCase();
+  const bodyPart = bodyPartMap[keyPart] || (modality === 'MR' ? 'BRAIN' : 'CHEST');
   return {
     id: data.study_id,
     studyId: data.study_id,
@@ -61,6 +70,9 @@ export async function analyzeDicom(
     createdAt: new Date().toISOString(),
     reportText: data.report_text,
     gemmaAvailable: data.gemma_available,
+    previewBase64: data.preview_base64,
+    modality,
+    bodyPart,
   };
 }
 

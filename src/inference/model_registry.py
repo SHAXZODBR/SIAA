@@ -214,6 +214,34 @@ BRAIN_DEMENTIA = ModelCard(
 )
 
 
+BRAIN_TRIAGE = ModelCard(
+    modality='brain_triage',
+    display_name='Study Triage — Normal vs Abnormal (local, Uzbek-trained)',
+    classes=['abnormal', 'normal'],
+    classes_localized={
+        'abnormal': {'ru': 'Патологические изменения — требует внимания',
+                     'uz': "Patologik o'zgarishlar — e'tibor talab qiladi",
+                     'en': 'Abnormal study — needs review'},
+        'normal':   {'ru': 'Без флага (не является заключением о норме)',
+                     'uz': 'Bayroqsiz (norma xulosasi emas)',
+                     'en': 'Not flagged (not a normal certificate)'},
+    },
+    input_size=(224, 224),
+    backend='huggingface',
+    repo_id='',   # local-only: loads models/brain_triage_finetuned/
+    fallback_repos=[],
+    download_size_mb=0,
+    citation='SIAA fine-tune (ViT-B) on matched Tashkent hospital studies',
+    modality_dicom_tags=['MR', 'MRI'],
+    body_part_dicom_tags=['BRAIN'],
+    tier='beta',
+    license='proprietary',
+    notes='Trained AND validated on local patient studies: study-level sensitivity 0.90 / '
+          'specificity 0.47 at mean-prob 0.5 over 178 held-out local patients. Triage aid — '
+          'prioritizes studies for radiologist review; never certifies a scan as normal.',
+)
+
+
 BRAIN_STROKE = ModelCard(
     modality='brain_stroke',
     display_name='Ischemic Stroke Staging (Brain MRI, DWI)',
@@ -437,6 +465,7 @@ REGISTRY: dict[str, ModelCard] = {
     'brain_medsam':        BRAIN_MEDSAM,
     'brain_dementia':      BRAIN_DEMENTIA,
     'brain_stroke':        BRAIN_STROKE,
+    'brain_triage':        BRAIN_TRIAGE,
     'report_brain_vqa':    MEDGEMMA_BRATS,
     # Chest (multi-model — TorchXRayVision multilabel + dedicated binary classifiers)
     'chest':               CHEST,

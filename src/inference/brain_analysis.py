@@ -90,7 +90,46 @@ def _to_model_input(slc: np.ndarray) -> np.ndarray:
     return np.array(img).astype(np.float32) / 255.0
 
 
+def _triage_mean_probs(study: BrainStudy, sequence: str, predictor) -> dict:
+    """Mean class-probs over up to 5 central slices of the given sequence —
+    the SAME protocol the local triage model was validated with (study-level
+    sens 0.90 / spec 0.47 on 178 held-out local patients). Single-slice
+    inference would be a different, unvalidated operating point."""
+    vol = study.sequences[sequence]
+    if vol.ndim != 3:
+        slices = [robust_normalize_slice(vol)]
+    else:
+        d = vol.shape[0]; c = d // 2
+        step = max(1, d // 12)
+        idxs = sorted(set(max(0, min(d - 1, c + off))
+                          for off in range(-2 * step, 2 * step + 1, step)))[:5]
+        slices = [robust_normalize_slice(vol[i]) for i in idxs]
+    acc: dict[str, float] = {}
+    n = 0
+    for slc in slices:
+        probs = predictor(_to_model_input(slc))
+        clean = {k: float(v) for k, v in probs.items() if not k.startswith('_')}
+        if not clean:
+            continue
+        for k, v in clean.items():
+            acc[k] = acc.get(k, 0.0) + v
+        n += 1
+    return {k: v / n for k, v in acc.items()} if n else {}
+
+
 # ---- interpreters: turn a model's class probs into findings ----------------
+
+def _interpret_triage(probs: dict) -> list[dict]:
+    probs = {k: v for k, v in probs.items() if not k.startswith('_')}
+    p_abn = probs.get('abnormal')
+    if p_abn is None:
+        return []
+    if p_abn >= 0.5:
+        return [{'positive': True, 'class': 'abnormal', 'confidence': float(p_abn),
+                 'label': 'Abnormal study — prioritize for radiologist review (local triage)'}]
+    return [{'positive': False, 'class': 'normal', 'confidence': float(1 - p_abn),
+             'label': 'Not flagged by local triage (sensitivity 90% — not a normal certificate)'}]
+
 
 def _interpret_tumor(probs: dict) -> list[dict]:
     probs = {k: v for k, v in probs.items() if not k.startswith('_')}
@@ -138,6 +177,11 @@ def _interpret_stroke(probs: dict) -> list[dict]:
 
 
 DETECTORS = [
+    # Local Uzbek-trained triage — the only detector validated on local data
+    # (study-level sens 0.90 / spec 0.47, 178 held-out patients). Runs the
+    # SAME 5-central-slice mean protocol it was validated with.
+    Detector('triage', 'Study triage — normal vs abnormal (local)', 'validated', 'brain_triage',
+             ('T1ce', 'T1', 'T2', 'FLAIR'), _interpret_triage),
     Detector('tumor_class', 'Brain tumor', 'pending', 'brain_tumor_class',
              ('T1ce', 'T1', 'T2', 'FLAIR'), _interpret_tumor),
     # Stroke wants diffusion (DWI), then ADC/FLAIR. Skipped automatically until
@@ -184,7 +228,11 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
         if picked is None:
             continue
         try:
-            probs = entry['predictor'](_to_model_input(picked['slice']))
+            if det.key == 'triage':
+                # validated protocol: mean probs over 5 central slices
+                probs = _triage_mean_probs(study, picked['sequence'], entry['predictor'])
+            else:
+                probs = entry['predictor'](_to_model_input(picked['slice']))
         except Exception as e:
             logger.warning(f"Detector {det.key} failed: {e}")
             continue
