@@ -5,6 +5,11 @@ Handles all local data persistence: studies, AI results, reports, users, audit l
 SECURITY NOTE: This DB is currently stored UNENCRYPTED on local disk. For
 production deployment, run on an OS-level encrypted volume (FileVault / BitLocker /
 LUKS) or migrate to SQLCipher. Do NOT claim encryption-at-rest until implemented.
+
+Schema evolution: SCHEMA_SQL only ever uses CREATE ... IF NOT EXISTS, and
+MIGRATIONS lists columns added after v1.0 as (table, column, declaration).
+_migrate() applies ALTER TABLE ADD COLUMN for whichever are missing, so an old
+pilot DB upgrades in place on first open.
 """
 
 import sqlite3
@@ -24,7 +29,8 @@ CREATE TABLE IF NOT EXISTS users (
     full_name TEXT NOT NULL,
     role TEXT NOT NULL CHECK(role IN ('admin', 'radiologist', 'technician')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login TIMESTAMP
+    last_login TIMESTAMP,
+    must_change_password INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS studies (
@@ -37,7 +43,22 @@ CREATE TABLE IF NOT EXISTS studies (
     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     dicom_path TEXT,
     ai_status TEXT DEFAULT 'pending' CHECK(ai_status IN ('pending', 'processing', 'complete', 'error')),
-    ai_analyzed_at TIMESTAMP
+    ai_analyzed_at TIMESTAMP,
+    study_instance_uid TEXT,
+    accession_number TEXT,
+    patient_name TEXT,
+    patient_sex TEXT,
+    patient_age TEXT,
+    patient_birth_date TEXT,
+    study_description TEXT,
+    manufacturer TEXT,
+    scanner_model TEXT,
+    num_files INTEGER,
+    series_descriptions TEXT,
+    rejected INTEGER DEFAULT 0,
+    requires_review INTEGER DEFAULT 0,
+    created_at TIMESTAMP,
+    created_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ai_results (
@@ -49,7 +70,12 @@ CREATE TABLE IF NOT EXISTS ai_results (
     model_version TEXT,
     is_normal BOOLEAN DEFAULT FALSE,
     overall_impression TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    model_identity_json TEXT,
+    overall_json TEXT,
+    threshold REAL,
+    report_text TEXT,
+    report_language TEXT
 );
 
 CREATE TABLE IF NOT EXISTS reports (
@@ -63,7 +89,21 @@ CREATE TABLE IF NOT EXISTS reports (
     is_signed BOOLEAN DEFAULT FALSE,
     signed_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    signer_id TEXT,
+    sha256 TEXT,
+    findings_json TEXT,
+    model_identity_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS corrections (
+    id TEXT PRIMARY KEY,
+    study_id TEXT,
+    doctor_id TEXT,
+    language TEXT DEFAULT 'ru',
+    original_report TEXT,
+    corrected_report TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -84,20 +124,81 @@ CREATE INDEX IF NOT EXISTS idx_reports_study ON reports(study_id);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 """
 
+# Columns added after the v1.0 schema. ALTER TABLE ADD COLUMN cannot take a
+# non-constant default in SQLite, so timestamps here are set explicitly on insert.
+MIGRATIONS = [
+    ("users",      "must_change_password", "INTEGER DEFAULT 0"),
+    ("studies",    "study_instance_uid",   "TEXT"),
+    ("studies",    "accession_number",     "TEXT"),
+    ("studies",    "patient_name",         "TEXT"),
+    ("studies",    "patient_sex",          "TEXT"),
+    ("studies",    "patient_age",          "TEXT"),
+    ("studies",    "patient_birth_date",   "TEXT"),
+    ("studies",    "study_description",    "TEXT"),
+    ("studies",    "manufacturer",         "TEXT"),
+    ("studies",    "scanner_model",        "TEXT"),
+    ("studies",    "num_files",            "INTEGER"),
+    ("studies",    "series_descriptions",  "TEXT"),
+    ("studies",    "rejected",             "INTEGER DEFAULT 0"),
+    ("studies",    "requires_review",      "INTEGER DEFAULT 0"),
+    ("studies",    "created_at",           "TIMESTAMP"),
+    ("studies",    "created_by",           "TEXT"),
+    ("ai_results", "model_identity_json",  "TEXT"),
+    ("ai_results", "overall_json",         "TEXT"),
+    ("ai_results", "threshold",            "REAL"),
+    ("ai_results", "report_text",          "TEXT"),
+    ("ai_results", "report_language",      "TEXT"),
+    ("ai_results", "app_version",          "TEXT"),
+    ("reports",    "signer_id",            "TEXT"),
+    ("reports",    "sha256",               "TEXT"),
+    ("reports",    "findings_json",        "TEXT"),
+    ("reports",    "model_identity_json",  "TEXT"),
+    ("audit_log",  "ip_address",           "TEXT"),
+]
+
+
+class ReportAlreadySignedError(Exception):
+    """Raised when a signed report already exists for (study_id, language)."""
+
 
 class SentinelDB:
     """Local SQLite database manager for Sentinel."""
 
-    def __init__(self, db_path: str = "data/sentinel.db"):
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            from src.utils.paths import DB_PATH
+            db_path = DB_PATH
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _init_db(self):
-        """Initialize database and create tables."""
+        """Initialize database, create tables, apply column migrations."""
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate(conn)
         logger.info(f"Database initialized at {self.db_path}")
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection):
+        """Add any columns an older DB is missing (idempotent)."""
+        cols_cache: dict[str, set] = {}
+        for table, column, decl in MIGRATIONS:
+            if table not in cols_cache:
+                cols_cache[table] = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols_cache[table]:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                cols_cache[table].add(column)
+                logger.info(f"DB migration: added {table}.{column}")
+        # One signed report per (study, language). Partial index; tolerate an
+        # old DB that already violates it rather than refusing to open.
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_signed_unique "
+                "ON reports(study_id, language) WHERE is_signed=1"
+            )
+        except sqlite3.Error as e:
+            logger.warning(f"Could not create signed-report unique index: {e}")
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection.
@@ -119,20 +220,48 @@ class SentinelDB:
 
     def create_study(
         self,
-        patient_id: str,
-        modality: str,
+        patient_id: str = "",
+        modality: str = "",
         body_part: str = "",
         dicom_path: str = "",
         orthanc_id: str = "",
         study_date: Optional[str] = None,
+        *,
+        study_id: Optional[str] = None,
+        created_by: Optional[str] = None,
+        study_instance_uid: Optional[str] = None,
+        accession_number: Optional[str] = None,
+        patient_name: Optional[str] = None,
+        patient_sex: Optional[str] = None,
+        patient_age: Optional[str] = None,
+        patient_birth_date: Optional[str] = None,
+        study_description: Optional[str] = None,
+        manufacturer: Optional[str] = None,
+        scanner_model: Optional[str] = None,
+        num_files: Optional[int] = None,
+        series_descriptions: Optional[list] = None,
+        rejected: bool = False,
+        requires_review: bool = False,
     ) -> str:
-        """Create a new study record. Returns study ID."""
-        study_id = str(uuid.uuid4())[:8]
+        """Create a new study record. Returns study ID.
+
+        Positional args keep the watcher call sites working; the keyword-only
+        block carries the header fields persisted by /analyze/study."""
+        study_id = study_id or str(uuid.uuid4())
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO studies (id, orthanc_id, patient_id, modality, body_part,
-                   study_date, dicom_path) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (study_id, orthanc_id, patient_id, modality, body_part, study_date, dicom_path),
+                   study_date, dicom_path, study_instance_uid, accession_number, patient_name,
+                   patient_sex, patient_age, patient_birth_date, study_description, manufacturer,
+                   scanner_model, num_files, series_descriptions, rejected, requires_review,
+                   created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (study_id, orthanc_id, patient_id, modality, body_part, study_date, dicom_path,
+                 study_instance_uid, accession_number, patient_name, patient_sex, patient_age,
+                 patient_birth_date, study_description, manufacturer, scanner_model, num_files,
+                 json.dumps(series_descriptions or [], ensure_ascii=False),
+                 int(bool(rejected)), int(bool(requires_review)),
+                 datetime.now().isoformat(), created_by),
             )
         logger.debug(f"Created study: {study_id} ({modality})")
         return study_id
@@ -157,7 +286,7 @@ class SentinelDB:
         """Get a single study by ID."""
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM studies WHERE id=?", (study_id,)).fetchone()
-        return dict(row) if row else None
+        return self._study_row(row) if row else None
 
     def get_all_studies(self, limit: int = 100) -> list[dict]:
         """Get recent studies."""
@@ -166,6 +295,46 @@ class SentinelDB:
                 "SELECT * FROM studies ORDER BY received_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_studies(self, limit: int = 100) -> list[dict]:
+        """Newest-first studies with a compact AI summary + signed languages —
+        what the desktop worklist needs to restore itself after a restart."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM studies ORDER BY COALESCE(created_at, received_at) DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                study = self._study_row(r)
+                ai = conn.execute(
+                    "SELECT overall_json, is_normal, inference_time_ms, created_at FROM ai_results "
+                    "WHERE study_id=? ORDER BY created_at DESC LIMIT 1", (study["id"],)
+                ).fetchone()
+                overall = None
+                if ai and ai["overall_json"]:
+                    try:
+                        overall = json.loads(ai["overall_json"])
+                    except Exception:
+                        overall = None
+                signed = conn.execute(
+                    "SELECT language FROM reports WHERE study_id=? AND is_signed=1", (study["id"],)
+                ).fetchall()
+                study["overall_assessment"] = overall
+                study["signed_languages"] = [s["language"] for s in signed]
+                out.append(study)
+        return out
+
+    @staticmethod
+    def _study_row(row) -> dict:
+        d = dict(row)
+        try:
+            d["series_descriptions"] = json.loads(d.get("series_descriptions") or "[]")
+        except Exception:
+            d["series_descriptions"] = []
+        d["rejected"] = bool(d.get("rejected"))
+        d["requires_review"] = bool(d.get("requires_review"))
+        return d
 
     # ===== AI Results =====
 
@@ -178,28 +347,48 @@ class SentinelDB:
         is_normal: bool,
         overall_impression: str,
         heatmap_paths: str = "",
+        *,
+        model_identity_json: Optional[str] = None,
+        overall_json: Optional[str] = None,
+        threshold: Optional[float] = None,
+        report_text: Optional[str] = None,
+        report_language: Optional[str] = None,
+        app_version: Optional[str] = None,
     ) -> str:
         """Save AI analysis results. Returns result ID."""
         result_id = str(uuid.uuid4())[:8]
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO ai_results (id, study_id, findings_json, heatmap_paths,
-                   inference_time_ms, model_version, is_normal, overall_impression)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   inference_time_ms, model_version, is_normal, overall_impression,
+                   model_identity_json, overall_json, threshold, report_text, report_language,
+                   app_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result_id, study_id, findings_json, heatmap_paths,
-                 inference_time_ms, model_version, is_normal, overall_impression),
+                 inference_time_ms, model_version, is_normal, overall_impression,
+                 model_identity_json, overall_json, threshold, report_text, report_language,
+                 app_version),
             )
         self.update_study_status(study_id, "complete")
         return result_id
 
     def get_ai_result(self, study_id: str) -> Optional[dict]:
-        """Get AI results for a study."""
+        """Get AI results for a study (JSON columns parsed)."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM ai_results WHERE study_id=? ORDER BY created_at DESC LIMIT 1",
                 (study_id,),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        d = dict(row)
+        for col, key in (("findings_json", "findings"), ("model_identity_json", "model_identity"),
+                         ("overall_json", "overall_assessment")):
+            try:
+                d[key] = json.loads(d.get(col) or "null")
+            except Exception:
+                d[key] = None
+        return d
 
     # ===== Reports =====
 
@@ -229,21 +418,116 @@ class SentinelDB:
             )
 
     def sign_report(self, report_id: str, doctor_id: str) -> bool:
-        """Digitally sign a report (locks it from further editing)."""
+        """Digitally sign an existing report row (locks it from further editing)."""
         with self._connect() as conn:
             conn.execute(
-                "UPDATE reports SET is_signed=1, signed_at=? WHERE id=? AND is_signed=0",
-                (datetime.now().isoformat(), report_id),
+                "UPDATE reports SET is_signed=1, signed_at=?, signer_id=? WHERE id=? AND is_signed=0",
+                (datetime.now().isoformat(), doctor_id, report_id),
             )
             self.log_action(doctor_id, "sign_report", "report", report_id)
         logger.info(f"Report {report_id} signed by {doctor_id}")
         return True
+
+    def create_signed_report(
+        self,
+        study_id: str,
+        signer_id: str,
+        report_text: str,
+        language: str = "ru",
+        ai_draft_text: Optional[str] = None,
+        findings_json: Optional[str] = None,
+        model_identity_json: Optional[str] = None,
+        sha256: Optional[str] = None,
+    ) -> dict:
+        """Persist a signed report for (study, language) in one transaction.
+
+        Raises ReportAlreadySignedError if one is already signed (-> HTTP 409),
+        sqlite3.IntegrityError if the study does not exist (-> HTTP 404).
+
+        signer_id is always recorded verbatim (audit trail). doctor_id carries a
+        foreign key to users, so it is only set when the signer is a real user
+        row — the SENTINEL_DEV_INSECURE anonymous principal has none."""
+        report_id = str(uuid.uuid4())[:8]
+        signed_at = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            dup = conn.execute(
+                "SELECT id FROM reports WHERE study_id=? AND language=? AND is_signed=1",
+                (study_id, language),
+            ).fetchone()
+            if dup:
+                conn.rollback()
+                raise ReportAlreadySignedError(dup["id"])
+            user_row = conn.execute("SELECT id FROM users WHERE id=?", (signer_id,)).fetchone()
+            doctor_id = signer_id if user_row else None
+            conn.execute(
+                """INSERT INTO reports (id, study_id, doctor_id, report_text, ai_draft_text,
+                   language, is_signed, signed_at, signer_id, sha256, findings_json,
+                   model_identity_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)""",
+                (report_id, study_id, doctor_id, report_text, ai_draft_text, language,
+                 signed_at, signer_id, sha256, findings_json, model_identity_json,
+                 signed_at, signed_at),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            if "idx_reports_signed_unique" in str(e):
+                raise ReportAlreadySignedError(study_id) from e
+            raise
+        finally:
+            conn.close()
+        logger.info(f"Report {report_id} signed for study {study_id} ({language}) by {signer_id}")
+        return {"report_id": report_id, "study_id": study_id, "signed_at": signed_at,
+                "language": language, "sha256": sha256}
 
     def get_report(self, report_id: str) -> Optional[dict]:
         """Get a report by ID."""
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         return dict(row) if row else None
+
+    def get_reports_for_study(self, study_id: str) -> list[dict]:
+        """All report rows for a study, newest first, with signer info joined."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT r.*, u.username AS signer_username, u.full_name AS signer_full_name
+                   FROM reports r LEFT JOIN users u ON u.id = COALESCE(r.signer_id, r.doctor_id)
+                   WHERE r.study_id=? ORDER BY r.created_at DESC""",
+                (study_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["is_signed"] = bool(d.get("is_signed"))
+            for col, key in (("findings_json", "findings"), ("model_identity_json", "model_identity")):
+                try:
+                    d[key] = json.loads(d.get(col) or "null")
+                except Exception:
+                    d[key] = None
+            out.append(d)
+        return out
+
+    # ===== Corrections =====
+
+    def save_correction(
+        self,
+        study_id: str,
+        doctor_id: str,
+        original_report: str,
+        corrected_report: str,
+        language: str = "ru",
+    ) -> str:
+        """Persist a radiologist's edit of the AI draft. Returns correction ID."""
+        correction_id = str(uuid.uuid4())[:8]
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO corrections (id, study_id, doctor_id, language,
+                   original_report, corrected_report) VALUES (?, ?, ?, ?, ?, ?)""",
+                (correction_id, study_id, doctor_id, language, original_report, corrected_report),
+            )
+        return correction_id
 
     # ===== Users =====
 
@@ -253,16 +537,27 @@ class SentinelDB:
         password_hash: str,
         full_name: str,
         role: str = "radiologist",
+        must_change_password: bool = False,
     ) -> str:
         """Create a new user. Returns user ID."""
         user_id = str(uuid.uuid4())[:8]
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO users (id, username, password_hash, full_name, role) VALUES (?, ?, ?, ?, ?)",
-                (user_id, username, password_hash, full_name, role),
+                "INSERT INTO users (id, username, password_hash, full_name, role, must_change_password) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, username, password_hash, full_name, role, int(bool(must_change_password))),
             )
         logger.info(f"User created: {username} ({role})")
         return user_id
+
+    def get_user(self, user_id: str) -> Optional[dict]:
+        """Public user fields (no password hash)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, username, full_name, role, created_at, last_login, must_change_password "
+                "FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     # ===== Audit Log =====
 
@@ -275,21 +570,13 @@ class SentinelDB:
         details: str = "",
         ip_address: str = "",
     ):
-        """Record an action in the audit log (now captures ip_address)."""
+        """Record an action in the audit log (captures ip_address)."""
         with self._connect() as conn:
-            # Populate ip_address column if it exists in the schema.
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()]
-            if "ip_address" in cols:
-                conn.execute(
-                    "INSERT INTO audit_log (user_id, action, entity_type, entity_id, details, ip_address) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, action, entity_type, entity_id, details, ip_address),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO audit_log (user_id, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, action, entity_type, entity_id, details),
-                )
+            conn.execute(
+                "INSERT INTO audit_log (user_id, action, entity_type, entity_id, details, ip_address) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, action, entity_type, entity_id, details, ip_address),
+            )
 
     def get_audit_log(self, limit: int = 500) -> list:
         """Return recent audit entries (admin view / compliance export)."""

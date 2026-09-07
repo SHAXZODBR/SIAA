@@ -217,6 +217,7 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
 
     findings = []
     detectors_run = []
+    preview_slice = None   # the routed classifier slice (full-res, [0,1]) for the viewer
     for det in DETECTORS:
         if det.status == 'experimental' and not include_experimental:
             continue
@@ -227,6 +228,8 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
         picked = _slice_for(study, det.sequence_pref)
         if picked is None:
             continue
+        if preview_slice is None or det.key == 'tumor_class':
+            preview_slice = picked['slice']
         try:
             if det.key == 'triage':
                 # validated protocol: mean probs over 5 central slices
@@ -277,6 +280,8 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
         'has_brats_quartet': study.has_brats_quartet,
         'patient_id': study.patient_id,
         'study_uid': study.study_uid,
+        # numpy array — callers must pop this before JSON-serialising the result
+        '_preview_slice': preview_slice,
         'coverage': [
             {'key': k, 'label': lbl, 'status': st, 'wired': wired}
             for (k, lbl, st, wired) in BRAIN_FINDING_CATALOG

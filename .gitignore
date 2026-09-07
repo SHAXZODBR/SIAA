@@ -32,9 +32,10 @@ Thumbs.db
 .env
 
 # === Sentinel security ===
-# NEVER commit private keys
+# NEVER commit private keys or issued license files
 vendor_keys/vendor_private_key.pem
 vendor_keys/*.private.*
+vendor_keys/*.dat
 *.private.pem
 data/public/
 desktop-app/node_modules/
@@ -64,3 +65,9 @@ models/monai_bundles/
 # --- Patient data & model weights: NEVER commit (medical) ---
 /data/
 /models/
+
+# Test runner cache
+.pytest_cache/
+
+# build output
+desktop-app/dist/

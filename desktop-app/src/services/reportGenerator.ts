@@ -6,6 +6,7 @@
  */
 
 import type { Finding, AIResult } from '../types';
+import { translateFinding, findingUrgency } from './findingTranslations';
 
 interface ReportTemplate {
   clinicalIndication: string;
@@ -144,31 +145,53 @@ const FINDING_DESCRIPTIONS: Record<string, Record<Lang, string>> = {
 // ---------------------------------------------------------------------------
 // Static text per language
 // ---------------------------------------------------------------------------
+// Shown when the AI flagged nothing. This is deliberately NOT a normal read:
+// the detectors cover a fixed set of classes and the radiologist reads everything.
 const NORMAL_BLOCK: Record<Lang, { description: string; conclusion: string; recommendation: string }> = {
   ru: {
     description:
-      'На представленных снимках лёгочные поля прозрачны, без очаговых и инфильтративных изменений. Корни лёгких структурны, не расширены. Сердечная тень обычной формы и размеров. Диафрагма расположена обычно. Костные структуры без видимой патологии.',
-    conclusion: 'Патологических изменений не выявлено.',
-    recommendation: 'Контрольное обследование согласно клиническим показаниям.',
+      'ИИ-система не отметила находок на представленных изображениях. Это НЕ является заключением о норме: автоматический анализ охватывает только валидированные классы находок и не заменяет полное описание врачом-рентгенологом.',
+    conclusion: 'ИИ-находки не отмечены. Требуется полное чтение исследования врачом-рентгенологом.',
+    recommendation: 'Полное описание исследования врачом-рентгенологом. Дальнейшая тактика — согласно клиническим показаниям.',
   },
   uz: {
     description:
-      "Taqdim etilgan suratlarda o'pka maydonlari tiniq, o'choqli va infiltrativ o'zgarishlarsiz. O'pka ildizlari strukturali, kengaymagan. Yurak soyasi odatiy shakl va o'lchamda. Diafragma odatiy joylashgan. Suyak tuzilmalarida ko'rinarli patologiya yo'q.",
-    conclusion: "Patologik o'zgarishlar aniqlanmadi.",
-    recommendation: "Klinik ko'rsatmalarga muvofiq nazorat tekshiruvi.",
+      "AI tizimi taqdim etilgan tasvirlarda topilmalarni belgilamadi. Bu norma xulosasi EMAS: avtomatik tahlil faqat tasdiqlangan topilma sinflarini qamrab oladi va rentgenolog shifokorning to'liq tavsifini o'rnini bosmaydi.",
+    conclusion: "AI topilmalari belgilanmagan. Tekshiruvni rentgenolog shifokor to'liq o'qishi kerak.",
+    recommendation: "Tekshiruvning rentgenolog shifokor tomonidan to'liq tavsifi. Keyingi taktika — klinik ko'rsatmalarga muvofiq.",
   },
   en: {
     description:
-      'The lung fields are clear, without focal or infiltrative changes. The hila are well-defined and not enlarged. Cardiac silhouette is of normal size and contour. The diaphragm is in normal position. Bony structures appear unremarkable.',
-    conclusion: 'No pathological findings.',
-    recommendation: 'Follow-up examination per clinical indications.',
+      'The AI system flagged no findings on the submitted images. This is NOT a normal read: automated analysis covers only the validated finding classes and does not replace a full radiologist report.',
+    conclusion: 'No AI findings flagged. A full radiologist read of the study is required.',
+    recommendation: 'Full radiologist report of the study. Further management per clinical indications.',
   },
 };
 
-const CLINICAL_INDICATION: Record<Lang, string> = {
-  ru: 'Обследование органов грудной клетки.',
-  uz: "Ko'krak qafasi a'zolarini tekshirish.",
-  en: 'Chest examination.',
+const CLINICAL_INDICATION: Record<'CHEST' | 'BRAIN', Record<Lang, string>> = {
+  CHEST: {
+    ru: 'Обследование органов грудной клетки.',
+    uz: "Ko'krak qafasi a'zolarini tekshirish.",
+    en: 'Chest examination.',
+  },
+  BRAIN: {
+    ru: 'Обследование головного мозга.',
+    uz: 'Bosh miyani tekshirish.',
+    en: 'Brain examination.',
+  },
+};
+
+const TECHNIQUE_BRAIN: Record<string, Record<Lang, string>> = {
+  MR: {
+    ru: 'Выполнена магнитно-резонансная томография головного мозга.',
+    uz: 'Bosh miyaning magnit-rezonans tomografiyasi bajarildi.',
+    en: 'Brain magnetic resonance imaging was performed.',
+  },
+  CT: {
+    ru: 'Выполнена компьютерная томография головного мозга.',
+    uz: 'Bosh miyaning kompyuter tomografiyasi bajarildi.',
+    en: 'Head computed tomography was performed.',
+  },
 };
 
 const TECHNIQUE: Record<string, Record<Lang, string>> = {
@@ -255,12 +278,18 @@ export function generateReport(
   aiResult: AIResult,
   language: Lang = 'ru',
   modality: string = 'CR',
-  _bodyPart: string = 'CHEST',
+  bodyPart: string = 'CHEST',
 ): ReportTemplate {
-  const clinicalIndication = CLINICAL_INDICATION[language];
-  const technique = (TECHNIQUE[modality] || TECHNIQUE['CR'])[language];
+  const region = /BRAIN|HEAD/i.test(bodyPart) ? 'BRAIN' : 'CHEST';
+  const clinicalIndication = CLINICAL_INDICATION[region][language];
+  const techniqueTable = region === 'BRAIN' ? { ...TECHNIQUE, ...TECHNIQUE_BRAIN } : TECHNIQUE;
+  const technique = (techniqueTable[modality] || TECHNIQUE['CR'])[language];
 
-  if (aiResult.isNormal || aiResult.findings.length === 0) {
+  // Only findings the server flagged as positive are described — a multi-class
+  // detector reports every class, and listing the negatives would read as pathology.
+  const positives = aiResult.findings.filter((f) => f.positive);
+
+  if (aiResult.isNormal || positives.length === 0) {
     return {
       clinicalIndication,
       technique,
@@ -272,7 +301,7 @@ export function generateReport(
 
   // Description — one sentence per finding, with confidence
   const descriptions: string[] = [];
-  for (const finding of aiResult.findings) {
+  for (const finding of positives) {
     const conf = Math.round(finding.confidence * 100);
     const locTranslated = translateLocation(finding.location, language);
     const tpl = FINDING_DESCRIPTIONS[finding.className];
@@ -293,7 +322,7 @@ export function generateReport(
   }
 
   // Conclusion — list top findings
-  const top = aiResult.findings.slice(0, 5).map((f) => f.className);
+  const top = positives.slice(0, 5).map((f) => translateFinding(f.className, language));
   const conclusion = (() => {
     if (top.length === 1) {
       return language === 'ru'
@@ -309,13 +338,10 @@ export function generateReport(
         : `Imaging findings: ${top.join(', ')}.`;
   })();
 
-  // Recommendation severity
-  const severeFindings = aiResult.findings.some(
-    (f) =>
-      ['Pneumothorax', 'Mass', 'Nodule', 'Lung_Lesion', 'Lung Lesion'].includes(f.className) &&
-      f.confidence > 0.7,
-  );
-  const moderateFindings = aiResult.findings.some((f) => f.confidence >= 0.6);
+  // Recommendation strength follows the urgency rule (positive + validated
+  // detector) — never the raw confidence value.
+  const severeFindings = positives.some((f) => findingUrgency(f) === 'review');
+  const moderateFindings = positives.length > 0;
   const recommendation =
     severeFindings
       ? RECOMMENDATIONS.severe[language]

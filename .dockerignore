@@ -1,0 +1,33 @@
+# Patient data, weights, secrets — NEVER in an image layer
+data/
+models/
+vendor_keys/
+logs/
+*.csv
+*.db
+*.db-shm
+*.db-wal
+*.pem
+*.dcm
+*.dicom
+
+# VCS / editor
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Desktop app build artefacts (backend image does not need them)
+desktop-app/node_modules/
+desktop-app/dist*
+desktop-app/release/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+mlruns/
+.env

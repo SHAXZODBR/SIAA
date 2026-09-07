@@ -87,6 +87,11 @@ class ModelCard:
     license: str = ''
     is_3d: bool = False
     sequences_required: list[str] = field(default_factory=list)  # ['T1', 'T2', 'FLAIR']
+    # Clinical validation status surfaced in every response's model_identity:
+    #   'validated'    — checked against ground-truth labels on local patient data
+    #   'pending'      — pretrained, plausible, UNVERIFIED on this clinic's population
+    #   'experimental' — different task/population; screening hint only
+    validation_status: str = 'pending'
 
 
 # ============================================================================
@@ -210,6 +215,7 @@ BRAIN_DEMENTIA = ModelCard(
     body_part_dicom_tags=['BRAIN'],
     tier='beta',
     license='Apache-2.0',
+    validation_status='experimental',
     notes='Trained on ADNI. Use as screening tool, not diagnostic.',
 )
 
@@ -236,6 +242,7 @@ BRAIN_TRIAGE = ModelCard(
     body_part_dicom_tags=['BRAIN'],
     tier='beta',
     license='proprietary',
+    validation_status='validated',
     notes='Trained AND validated on local patient studies: study-level sensitivity 0.90 / '
           'specificity 0.47 at mean-prob 0.5 over 178 held-out local patients. Triage aid — '
           'prioritizes studies for radiologist review; never certifies a scan as normal.',
@@ -261,6 +268,7 @@ BRAIN_STROKE = ModelCard(
     body_part_dicom_tags=['BRAIN', 'HEAD'],
     tier='experimental',  # low-reputation community model; UNVALIDATED on local data
     license='Apache-2.0',
+    validation_status='experimental',
     notes=(
         'Stroke staging on DWI/diffusion MRI. Community model, not validated on '
         'this clinic population — screening hint only until local labels confirm. '
@@ -845,6 +853,7 @@ def _build_xrv_predictor(card: ModelCard, device: str):
         labels = model.pathologies
         return {labels[i]: float(probs[i]) for i in range(len(labels)) if labels[i]}
 
+    predict.weights_source = 'torchxrayvision:densenet121-res224-all'
     return predict, True, ''
 
 
@@ -918,6 +927,7 @@ def _build_hf_predictor(card: ModelCard, device: str):
                     probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
                 return {_i2l.get(i, f'class_{i}'): float(p) for i, p in enumerate(probs)}
 
+            predict.weights_source = repo   # local dir or HF repo id — used by get_model_identity
             return predict, True, f'loaded from {repo}'
         except Exception as e:
             last_err = e
@@ -1052,6 +1062,106 @@ def _build_monai_predictor(card: ModelCard, device: str):
 
 
 # ============================================================================
+# MODEL IDENTITY (provenance for every clinical response)
+# ============================================================================
+
+_identity_cache: dict[str, dict] = {}
+
+
+def _resolve_weight_files(source: str) -> list[Path]:
+    """Map a predictor's weights_source (local dir or HF repo id) to the
+    weight file(s) actually on disk, so we can hash them."""
+    if not source:
+        return []
+    p = Path(source)
+    if p.is_dir():
+        cands = [p / 'model.safetensors', p / 'pytorch_model.bin', p / 'model.pt']
+        return [c for c in cands if c.exists()]
+    if '/' not in source or ':' in source:
+        return []   # not an HF repo id (e.g. 'torchxrayvision:...')
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        hf_root = Path(HF_HUB_CACHE)
+    except Exception:
+        hf_root = Path.home() / '.cache' / 'huggingface' / 'hub'
+    repo_dir = hf_root / f'models--{source.replace("/", "--")}'
+    if not repo_dir.exists():
+        return []
+    for name in ('model.safetensors', 'pytorch_model.bin'):
+        found = sorted(repo_dir.rglob(name))
+        if found:
+            return [found[0].resolve()]
+    return []
+
+
+def _sha256_of(paths: list[Path]) -> Optional[str]:
+    import hashlib
+    if not paths:
+        return None
+    h = hashlib.sha256()
+    for fp in paths:
+        with open(fp, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def get_model_identity(modality_key: str) -> Optional[dict]:
+    """Provenance card for a LOADED model: which weights ran, their sha256
+    (first 12 hex chars), and the clinical validation status. Cached per key
+    (hashing a 350 MB ViT once is ~1 s). Returns None for unknown keys; for a
+    key that failed to load, source/sha are None and validation_note says why."""
+    if modality_key in _identity_cache:
+        return _identity_cache[modality_key]
+    card = REGISTRY.get(modality_key)
+    if card is None:
+        return None
+    entry = _loaded_models.get(modality_key)
+    source = None
+    sha12 = None
+    note = card.notes
+    if entry and entry.get('available'):
+        source = getattr(entry.get('predictor'), 'weights_source', None)
+        if not source and str(entry.get('reason', '')).startswith('loaded from '):
+            source = entry['reason'][len('loaded from '):]
+        try:
+            full = _sha256_of(_resolve_weight_files(source or ''))
+            sha12 = full[:12] if full else None
+        except Exception as e:
+            logger.debug(f"sha256 for {modality_key} failed: {e}")
+    elif entry:
+        note = f"not loaded: {entry.get('reason', '')}"
+    else:
+        note = 'not loaded'
+    identity = {
+        'key': modality_key,
+        'display_name': card.display_name,
+        'source': source,
+        'sha256_12': sha12,
+        'status': card.validation_status,
+        'validation_note': note,
+    }
+    if entry and entry.get('available'):
+        _identity_cache[modality_key] = identity   # only cache a successful load
+    return identity
+
+
+def get_loaded_status(keys: Optional[list[str]] = None) -> dict[str, dict]:
+    """{key: {loaded, reason}} for /health. Never triggers a load — reports
+    what has actually been attempted. Keys not yet attempted show loaded=False
+    with reason 'not loaded'."""
+    keys = keys or [k for k in REGISTRY if k != 'brain_2d']
+    out = {}
+    for k in keys:
+        entry = _loaded_models.get(k)
+        if entry is None:
+            out[k] = {'loaded': False, 'reason': 'not loaded'}
+        else:
+            out[k] = {'loaded': bool(entry.get('available')), 'reason': entry.get('reason', '') or ''}
+    return out
+
+
+# ============================================================================
 # AVAILABILITY REPORT
 # ============================================================================
 
@@ -1082,6 +1192,7 @@ def get_availability() -> list[dict]:
             'key': key,
             'name': card.display_name,
             'tier': card.tier,
+            'validation_status': card.validation_status,
             'license': card.license,
             'is_3d': card.is_3d,
             'sequences_required': card.sequences_required,

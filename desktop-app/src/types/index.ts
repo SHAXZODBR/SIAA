@@ -1,5 +1,10 @@
 // ===== Core Types for Sentinel Medical AI =====
 
+export type Lang = 'ru' | 'uz' | 'en';
+
+/** Per-detector validation status reported by the server (API contract v1). */
+export type FindingStatus = 'validated' | 'pending' | 'experimental';
+
 export interface Study {
   id: string;
   orthancId?: string;
@@ -11,13 +16,48 @@ export interface Study {
   dicomPath: string;
   aiStatus: 'pending' | 'processing' | 'complete' | 'error';
   aiAnalyzedAt?: string;
+  // Real DICOM header fields (null when the server could not read them)
+  studyInstanceUid?: string | null;
+  accessionNumber?: string | null;
+  patientName?: string | null;
+  patientSex?: string | null;
+  patientAge?: string | null;
+  patientBirthDate?: string | null;
+  studyDescription?: string | null;
+  manufacturer?: string | null;
+  scannerModel?: string | null;
+  numFiles?: number | null;
+  seriesDescriptions?: string[];
+  /** true when restored from GET /studies (result must be lazily fetched) */
+  restored?: boolean;
 }
 
 export interface Finding {
   className: string;
+  /** Human-readable label from the server (falls back to className) */
+  finding: string;
   confidence: number;
+  positive: boolean;
+  status: FindingStatus;
+  detector: string | null;
+  sequenceUsed: string | null;
   heatmapBase64: string;
   location: string;
+}
+
+export interface ModelIdentity {
+  key: string;
+  displayName: string;
+  source: string | null;
+  sha256_12: string | null;
+  status: FindingStatus | string;
+  validationNote: string | null;
+}
+
+export interface OverallAssessment {
+  abnormalFlagged: boolean;
+  flags: string[];
+  text: string;
 }
 
 export interface AIResult {
@@ -26,12 +66,23 @@ export interface AIResult {
   findings: Finding[];
   inferenceTimeMs: number;
   modelVersion: string;
+  /** ALWAYS false for the brain panel — the product never certifies normal */
   isNormal: boolean;
   overallImpression: string;
   createdAt: string;
   previewBase64?: string;  // data-URI PNG of the actual analyzed slice (real scan)
   modality?: string;       // real DICOM modality from backend, e.g. 'MR'
   bodyPart?: string;       // resolved body part, e.g. 'BRAIN'
+  overallAssessment: OverallAssessment | null;
+  disclaimer: string;
+  modelIdentity: ModelIdentity[];
+  threshold: number | null;
+  requiresReview: boolean;
+  rejected: boolean;
+  rejectionReason: string | null;
+  appVersion: string | null;
+  reportLanguage?: Lang;
+  gemmaAvailable?: boolean;
 }
 
 export interface Report {
@@ -41,28 +92,53 @@ export interface Report {
   reportText: string;
   aiDraftText: string;
   pdfPath?: string;
-  language: 'ru' | 'uz' | 'en';
+  language: Lang;
   isSigned: boolean;
   signedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
 
+/** Server-confirmed signature (POST /report/sign 200) */
+export interface SignedReport {
+  reportId: string;
+  studyId: string;
+  language: Lang;
+  signedAt: string;
+  signer: { id: string; username: string; fullName: string };
+  sha256: string;
+  modelIdentity: ModelIdentity[];
+  reportText: string;
+}
+
 export interface User {
   id: string;
   username: string;
   fullName: string;
-  role: 'admin' | 'radiologist' | 'technician';
+  role: 'admin' | 'radiologist' | 'technician' | string;
   lastLogin?: string;
+}
+
+export interface HealthStatus {
+  /** false when /health could not be reached at all */
+  reachable: boolean;
+  status: 'ok' | 'degraded' | 'error';
+  version: string | null;
+  device: string | null;
+  authRequired: boolean;
+  models: Record<string, { loaded: boolean; reason: string | null }>;
+  llm: { backend: string | null; reachable: boolean };
+  license: { mode: string | null };
+  dataDir: string | null;
 }
 
 export interface AppSettings {
   orthancUrl: string;
   inferenceUrl: string;
-  storagePath: string;
-  language: 'ru' | 'uz' | 'en';
-  autoAnalyze: boolean;
-  refreshInterval: number;
+  language: Lang;
+  clinicName: string;
+  clinicAddress: string;
+  supportContact: string;
   theme: 'dark' | 'light';
 }
 

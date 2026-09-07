@@ -189,6 +189,43 @@ DEMENTIA_DESCRIPTIONS = {
 
 
 # ---------------------------------------------------------------------------
+# LOCAL TRIAGE (brain_triage panel detector — the only locally validated one)
+# ---------------------------------------------------------------------------
+
+TRIAGE_DESCRIPTIONS = {
+    'abnormal': {
+        'ru': ('Локальная модель триажа (валидирована на данных клиники: чувствительность 90%, '
+               'специфичность 47%) отнесла исследование к категории «патологические изменения» — '
+               'приоритетный просмотр рентгенологом.'),
+        'uz': ("Mahalliy triaj modeli (klinika ma'lumotlarida validatsiya qilingan: sezuvchanlik 90%, "
+               "spetsifiklik 47%) tekshiruvni «patologik o'zgarishlar» toifasiga kiritdi — "
+               "rentgenolog tomonidan ustuvor ko'rib chiqish."),
+        'en': ('The local triage model (validated on this clinic\'s data: sensitivity 90%, '
+               'specificity 47%) flagged this study as ABNORMAL — prioritize for radiologist review.'),
+    },
+    'normal': {
+        'ru': ('Локальная модель триажа не отметила исследование (чувствительность 90%) — '
+               'это НЕ заключение о норме.'),
+        'uz': ("Mahalliy triaj modeli tekshiruvni belgilamadi (sezuvchanlik 90%) — "
+               "bu norma xulosasi EMAS."),
+        'en': ('The local triage model did not flag this study (sensitivity 90%) — '
+               'this is NOT a normal read.'),
+    },
+}
+
+# Panel-honest wording when nothing was flagged: the product never certifies
+# a scan as normal, so the impression must say so explicitly.
+NO_FLAG_IMPRESSION = {
+    'ru': ('Панель ИИ не отметила находок. Это НЕ заключение о норме — панель выявляет только '
+           'перечисленные типы патологии; требуется полный просмотр рентгенологом.'),
+    'uz': ("AI paneli topilmalarni belgilamadi. Bu norma xulosasi EMAS — panel faqat sanab o'tilgan "
+           "patologiya turlarini aniqlaydi; rentgenolog tomonidan to'liq ko'rib chiqish talab qilinadi."),
+    'en': ('No finding flagged by the AI panel. This is NOT a normal read — the panel only detects '
+           'the listed finding types; full radiologist review is required.'),
+}
+
+
+# ---------------------------------------------------------------------------
 # COMPOSITE TEMPLATE BUILDERS
 # ---------------------------------------------------------------------------
 
@@ -250,19 +287,25 @@ def build_brain_report(findings: list[dict], language: str = 'ru',
             descriptions.append(BRATS_DESCRIPTIONS[cls][lang])
             classes_found.append(cls)
 
-    # Default if nothing detected
+        # Local triage (panel) — 'abnormal' is a flag, 'normal' is explicitly not a normal read
+        elif cls in TRIAGE_DESCRIPTIONS:
+            tpl = TRIAGE_DESCRIPTIONS[cls][lang]
+            if cls == 'abnormal':
+                descriptions.append(f"{tpl} {_conf_str(conf, lang)}")
+                classes_found.append('triage_abnormal')
+            else:
+                descriptions.append(tpl)
+
+    # Default if nothing detected — panel-honest, never a normal certificate
     if not descriptions:
-        descriptions.append(TUMOR_DESCRIPTIONS['no_tumor'][lang])
+        descriptions.append(NO_FLAG_IMPRESSION[lang])
 
     description = ' '.join(descriptions)
 
-    # Impression
+    # Impression. A single pending detector saying 'no_tumor' does NOT make the
+    # study normal — the product never certifies normal.
     if not classes_found or classes_found == ['no_tumor']:
-        impression = {
-            'ru': 'МР-картина без патологических изменений.',
-            'uz': 'MR-ko\'rinishda patologik o\'zgarishlar yo\'q.',
-            'en': 'MRI findings without significant pathology.',
-        }[lang]
+        impression = NO_FLAG_IMPRESSION[lang]
     else:
         impression = {
             'ru': f'МР-признаки: {", ".join(classes_found)}.',

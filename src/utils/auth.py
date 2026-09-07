@@ -16,24 +16,26 @@ import bcrypt
 from jose import jwt, JWTError
 
 from src.utils.database import SentinelDB
+from src.utils.paths import JWT_SECRET_PATH
+
+
+# ─── Runtime security flags ──────────────────────────────────────────────────
+# Auth is REQUIRED BY DEFAULT. It is switched off only by SENTINEL_DEV_INSECURE=1
+# (local development), and SENTINEL_REQUIRE_AUTH=1 forces it back on even then.
+# DEV_INSECURE also gates DEV_BYPASS_LICENSE and the OpenAPI docs in server.py.
+DEV_INSECURE = os.environ.get("SENTINEL_DEV_INSECURE") == "1"
+REQUIRE_AUTH = (not DEV_INSECURE) or os.environ.get("SENTINEL_REQUIRE_AUTH") == "1"
 
 
 def _load_or_create_secret() -> str:
-    """JWT secret: prefer env var, else persist a stable key to disk so tokens
-    survive restarts and work across workers. (Fix: previously regenerated
-    every process start, invalidating all sessions.)"""
+    """JWT secret: prefer env var, else persist a stable key under DATA_DIR so
+    tokens survive restarts and work across workers. (Fix: previously
+    regenerated every process start, invalidating all sessions.)"""
     env = os.environ.get("SENTINEL_JWT_SECRET")
     if env:
         return env
-    # Persist under the user data dir so it's stable but not in the repo
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA", Path.home())) / "Sentinel Medical AI"
-    elif os.sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support" / "sentinel-medical-ai"
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "sentinel-medical-ai"
-    base.mkdir(parents=True, exist_ok=True)
-    key_file = base / "jwt_secret.key"
+    key_file = JWT_SECRET_PATH
+    key_file.parent.mkdir(parents=True, exist_ok=True)
     if key_file.exists():
         try:
             return key_file.read_text().strip()
@@ -159,7 +161,7 @@ class AuthManager:
             if not verify_password(old_password, dict(row)["password_hash"]):
                 conn.close()
                 return False
-            conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+            conn.execute("UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
                          (hash_password(new_password), user_id))
             conn.commit()
             conn.close()
@@ -172,8 +174,9 @@ class AuthManager:
     def login(self, username: str, password: str) -> Optional[dict]:
         """Authenticate user and return token + user info.
 
-        Returns:
-            Dict with token and user data, or None if auth fails.
+        Returns the API-contract login payload
+        {access_token, token_type, user{id, username, full_name, role},
+        must_change_password} or None if auth fails.
         """
         import sqlite3
 
@@ -212,13 +215,15 @@ class AuthManager:
 
         logger.info(f"User logged in: {username} ({user['role']})")
         return {
-            "token": token,
+            "access_token": token,
+            "token_type": "bearer",
             "user": {
                 "id": user["id"],
                 "username": user["username"],
-                "fullName": user["full_name"],
+                "full_name": user["full_name"],
                 "role": user["role"],
             },
+            "must_change_password": bool(user.get("must_change_password") or 0),
         }
 
     def check_permission(self, role: str, action: str) -> bool:
@@ -248,33 +253,50 @@ class AuthManager:
             # Default admin password comes from env if set; otherwise a random
             # one-time password is generated and printed ONCE. We never ship a
             # known hardcoded credential. (Fix: was hardcoded 'sentinel2024'.)
+            # Either way the account is flagged must_change_password until
+            # POST /auth/change_password succeeds.
             pw = os.environ.get("SENTINEL_ADMIN_PASSWORD")
             generated = False
             if not pw:
                 pw = secrets.token_urlsafe(12)
                 generated = True
-            self.register_user(
+            user_id = self.register_user(
                 username="admin",
                 password=pw,
                 full_name="Administrator",
                 role="admin",
             )
+            if user_id:
+                conn = self.db._connect()
+                conn.execute("UPDATE users SET must_change_password=1 WHERE id=?", (user_id,))
+                conn.commit()
+                conn.close()
             if generated:
-                logger.warning("=" * 70)
-                logger.warning("  FIRST-RUN ADMIN ACCOUNT CREATED")
-                logger.warning(f"  username: admin")
-                logger.warning(f"  password: {pw}")
-                logger.warning("  ^ Save this now and change it via /auth/change_password.")
-                logger.warning("  (Set SENTINEL_ADMIN_PASSWORD env to choose your own.)")
-                logger.warning("=" * 70)
+                banner = [
+                    "=" * 70,
+                    "  FIRST-RUN ADMIN ACCOUNT CREATED (one-time password)",
+                    "  username: admin",
+                    f"  password: {pw}",
+                    "  ^ Save this now and change it via /auth/change_password.",
+                    "  (Set SENTINEL_ADMIN_PASSWORD env to choose your own.)",
+                    "=" * 70,
+                ]
+                # Console (stdout, so a wrapping launcher can capture it) AND the
+                # rotating log file in DATA_DIR at WARNING level.
+                print("\n".join(banner), flush=True)
+                for line in banner:
+                    logger.warning(line)
             else:
-                logger.info("Default admin created with SENTINEL_ADMIN_PASSWORD from env.")
+                logger.warning(
+                    "Default admin created with SENTINEL_ADMIN_PASSWORD from env — "
+                    "must_change_password is set; change it via /auth/change_password."
+                )
 
     def list_users(self) -> list[dict]:
         """List all users (admin only)."""
         conn = self.db._connect()
         rows = conn.execute(
-            "SELECT id, username, full_name, role, created_at, last_login FROM users"
+            "SELECT id, username, full_name, role, created_at, last_login, must_change_password FROM users"
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]

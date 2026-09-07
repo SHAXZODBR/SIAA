@@ -160,6 +160,12 @@ Generate a full radiology report using the structure above.""",
 }
 
 
+def _cloud_llm_allowed() -> bool:
+    """Cloud (Google AI) backend is opt-in only — never on by default."""
+    import os
+    return os.environ.get('SENTINEL_ALLOW_CLOUD_LLM') == '1'
+
+
 # ============================================================================
 # REPORT ENGINE
 # ============================================================================
@@ -207,31 +213,42 @@ class GemmaReportEngine:
     _google_client: Optional[object] = None
 
     def __post_init__(self):
-        # Auto-detect best available backend
+        # Auto-detect best available backend. The cloud backend is opt-in ONLY
+        # (SENTINEL_ALLOW_CLOUD_LLM=1): an on-prem clinic must never have
+        # report prompts leave the building by accident.
         if self.backend == 'auto':
             if self._check_ollama():
                 self.backend = 'ollama'
-            elif self._check_google_ai():
+            elif _cloud_llm_allowed() and self._check_google_ai():
                 self.backend = 'google_ai'
-                logger.info("Using Google AI Studio (cloud, free tier)")
+                logger.info("Using Google AI Studio (cloud, free tier) — SENTINEL_ALLOW_CLOUD_LLM=1")
             else:
                 self.backend = 'template'
-                logger.warning("No AI backend available — using templates only")
+                logger.warning("No local AI backend available — using templates only")
             return
 
         if self.backend == 'ollama':
             self._check_ollama()
         elif self.backend == 'google_ai':
-            self._check_google_ai()
+            if not _cloud_llm_allowed():
+                logger.warning(
+                    "backend='google_ai' requested but SENTINEL_ALLOW_CLOUD_LLM is not 1 — "
+                    "cloud LLM disabled, using templates")
+                self.backend = 'template'
+            else:
+                self._check_google_ai()
         elif self.backend == 'transformers':
             self._load_transformers()
 
     def _check_google_ai(self) -> bool:
-        """Check if Google AI Studio is available (needs API key).
+        """Check if Google AI Studio is available (needs API key AND the
+        SENTINEL_ALLOW_CLOUD_LLM=1 opt-in).
 
         Tries new google-genai SDK first, falls back to old google-generativeai.
         """
         import os
+        if not _cloud_llm_allowed():
+            return False
         api_key = self.google_api_key or os.environ.get('GOOGLE_AI_KEY')
         if not api_key:
             logger.debug("No GOOGLE_AI_KEY set — Google AI unavailable")
@@ -533,17 +550,19 @@ class GemmaReportEngine:
                 'en': f"High-confidence findings: {len(high_conf)}" if high_conf else f"Findings: {len(findings)}",
             }[language]
 
-        # Patient info
-        patient_info = patient_info or {}
+        # Patient info is deliberately NOT sent to the LLM (PHI minimisation:
+        # the prompt may reach a remote Ollama host or, when explicitly
+        # allowed, a cloud API). The template keeps its slots as 'N/A'.
+        patient_info = {}
 
         # Build prompts
         system_prompt = SYSTEM_PROMPTS[language]
         user_prompt = USER_PROMPT_TEMPLATES[language].format(
             modality=modality,
             body_part=body_part,
-            patient_id=patient_info.get('id', 'N/A'),
-            age=patient_info.get('age', 'N/A'),
-            sex=patient_info.get('sex', 'N/A'),
+            patient_id='N/A',
+            age='N/A',
+            sex='N/A',
             study_date=study_date or 'N/A',
             findings_list=findings_str,
             overall_status=overall_status,

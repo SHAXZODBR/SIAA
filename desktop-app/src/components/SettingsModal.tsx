@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useAppStore } from '../store/appStore';
+import { PRODUCT_NAME, VENDOR_NAME, VENDOR_SITE, getPackageVersion } from '../services/appInfo';
 
 const SECTIONS = [
   { id: 'general', label: 'General', icon: '⚙' },
@@ -32,7 +33,7 @@ export default function SettingsModal() {
         <div className="w-56 border-r border-ink-800 bg-ink-950/30 flex flex-col">
           <div className="p-4 border-b border-ink-800">
             <h2 className="text-sm font-bold text-ink-100">Preferences</h2>
-            <p className="text-[10px] text-ink-500 mt-0.5">Sentinel Medical AI v1.0.0</p>
+            <p className="text-[10px] text-ink-500 mt-0.5">{PRODUCT_NAME} v{getPackageVersion()}</p>
           </div>
           <div className="flex-1 overflow-y-auto p-2">
             {SECTIONS.map(s => (
@@ -160,7 +161,7 @@ function ConnectionsSection({ settings, update }: any) {
             className="input-medical !py-1 !w-72 !font-mono"
           />
         </Row>
-        <Row label="AI Inference URL" desc="Local FastAPI server for DenseNet121">
+        <Row label="AI Inference URL" desc="Local Sentinel inference server">
           <input
             type="text"
             value={settings.inferenceUrl}
@@ -264,46 +265,70 @@ function LanguageSection({ settings, update }: any) {
 }
 
 function AISection() {
+  const { health, settings } = useAppStore();
+  const models = health?.models ? Object.entries(health.models) : [];
+  const serverLabel = !health || !health.reachable ? 'offline' : health.status;
+  const serverPill = !health || !health.reachable
+    ? 'bg-ink-800 text-ink-400 border border-ink-700'
+    : health.status === 'ok' ? 'severity-normal' : health.status === 'degraded' ? 'severity-moderate' : 'severity-critical';
   return (
     <div>
-      <SectionHeader title="AI Model" desc="Configure the AI analysis pipeline" />
-      <div className="p-6 space-y-1">
-        <div className="p-4 bg-ink-850 rounded-lg border border-ink-800 mb-4">
+      <SectionHeader title="AI Model" desc="Live status reported by the inference server (/health)" />
+      <div className="p-6 space-y-4">
+        <div className="p-4 bg-ink-850 rounded-lg border border-ink-800">
           <div className="flex items-center justify-between mb-3">
             <div>
-              <div className="text-sm font-semibold text-ink-100">DenseNet121 + nnU-Net</div>
-              <div className="text-[10px] text-ink-500 font-mono">models/densenet/best_model.pt</div>
+              <div className="text-sm font-semibold text-ink-100">Inference server</div>
+              <div className="text-[10px] text-ink-500 font-mono">{settings.inferenceUrl}</div>
             </div>
-            <span className="severity-pill severity-normal">Loaded</span>
+            <span className={`severity-pill ${serverPill}`}>{serverLabel}</span>
           </div>
           <div className="grid grid-cols-3 gap-3 text-[10px]">
             <div>
-              <div className="text-ink-500">Architecture</div>
-              <div className="text-ink-200 font-mono">DenseNet121</div>
+              <div className="text-ink-500">Server version</div>
+              <div className="text-ink-200 font-mono">{health?.version || '—'}</div>
             </div>
             <div>
-              <div className="text-ink-500">Version</div>
-              <div className="text-ink-200 font-mono">v1.0.0</div>
+              <div className="text-ink-500">Device</div>
+              <div className="text-ink-200 font-mono">{health?.device || '—'}</div>
             </div>
             <div>
-              <div className="text-ink-500">Classes</div>
-              <div className="text-ink-200 font-mono">14</div>
+              <div className="text-ink-500">Report assistant (LLM)</div>
+              <div className="text-ink-200 font-mono">
+                {health?.llm.backend ? `${health.llm.backend} · ${health.llm.reachable ? 'reachable' : 'unreachable'}` : '—'}
+              </div>
             </div>
           </div>
         </div>
 
-        <Row label="Confidence threshold" desc="Minimum confidence for reporting findings">
-          <input type="number" step="0.01" defaultValue={0.5} min={0} max={1} className="input-medical !py-1 !w-20 !text-center !font-mono" />
-        </Row>
-        <Row label="Enable Grad-CAM heatmaps" desc="Generate visual explanations for AI decisions">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
-        <Row label="Test-time augmentation" desc="Run multiple augmentations, average results (+2-5% accuracy)">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
-        <Row label="Use GPU acceleration" desc="NVIDIA CUDA / Apple MPS">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
+        <div>
+          <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">Models</div>
+          {models.length === 0 ? (
+            <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-400">
+              No model status reported — the server is offline or has not finished loading.
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {models.map(([key, m]) => (
+                <div key={key} className="flex items-center justify-between px-3 py-2 bg-ink-850 rounded-lg border border-ink-800 text-xs">
+                  <div className="min-w-0">
+                    <div className="text-ink-100 font-mono truncate">{key}</div>
+                    {m.reason && <div className="text-[10px] text-ink-500 truncate">{m.reason}</div>}
+                  </div>
+                  <span className={`severity-pill flex-shrink-0 ${m.loaded ? 'severity-normal' : 'severity-critical'}`}>
+                    {m.loaded ? 'Loaded' : 'Not loaded'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-[11px] text-ink-400 leading-relaxed">
+          Model selection, decision thresholds and heat-map generation are fixed on the server for the pilot.
+          The identity of every model (name, SHA-256, validation status) and the threshold used are shown with
+          each result and printed on every report.
+        </div>
       </div>
     </div>
   );
@@ -383,7 +408,7 @@ function ShortcutsSection() {
 function AboutSection() {
   return (
     <div>
-      <SectionHeader title="About Sentinel Medical AI" />
+      <SectionHeader title={`About ${PRODUCT_NAME}`} />
       <div className="p-6">
         <div className="flex items-center gap-4 mb-6">
           <div className="w-16 h-16 bg-gradient-to-br from-accent-400 to-accent-700 rounded-2xl flex items-center justify-center">
@@ -392,29 +417,26 @@ function AboutSection() {
             </svg>
           </div>
           <div>
-            <h3 className="text-xl font-bold text-ink-100">Sentinel Medical AI</h3>
-            <div className="text-xs text-ink-400">Version 1.0.0 (build 20240101)</div>
-            <div className="text-[10px] text-ink-500 mt-1">© 2024 SIA Medical AI · siaa.uz</div>
+            <h3 className="text-xl font-bold text-ink-100">{PRODUCT_NAME}</h3>
+            <div className="text-xs text-ink-400">Version {getPackageVersion()}</div>
+            <div className="text-[10px] text-ink-500 mt-1">© 2026 {VENDOR_NAME} · {VENDOR_SITE}</div>
           </div>
         </div>
         <div className="p-4 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-300 leading-relaxed">
-          Sentinel Medical AI is an on-premise radiology AI assistant built for clinics in Central Asia.
-          It automatically analyzes DICOM medical images using Stanford-validated DenseNet121 architecture,
-          providing radiologists with AI-assisted findings, heatmaps, and structured reports in Russian, Uzbek, and English.
+          {PRODUCT_NAME} is an on-premise radiology AI assistant for clinics in Central Asia. It routes DICOM studies
+          to modality-specific detectors and drafts structured reports in Russian, Uzbek and English. AI output is
+          decision support only: every study is read and signed by a radiologist, and each finding carries the
+          identity and validation status of the model that produced it.
         </div>
         <div className="mt-4 grid grid-cols-2 gap-2 text-[10px]">
           <div className="p-2 bg-ink-850 rounded border border-ink-800">
             <div className="text-ink-500">Built with</div>
-            <div className="text-ink-200 font-mono">PyTorch · Electron · React</div>
+            <div className="text-ink-200 font-mono">PyTorch · FastAPI · Electron · React</div>
           </div>
           <div className="p-2 bg-ink-850 rounded border border-ink-800">
-            <div className="text-ink-500">AI Framework</div>
-            <div className="text-ink-200 font-mono">MONAI · nnU-Net</div>
+            <div className="text-ink-500">Imaging stack</div>
+            <div className="text-ink-200 font-mono">MONAI · TorchXRayVision</div>
           </div>
-        </div>
-        <div className="mt-4 flex gap-2">
-          <button className="btn-secondary flex-1">Check for Updates</button>
-          <button className="btn-secondary flex-1">View License</button>
         </div>
       </div>
     </div>

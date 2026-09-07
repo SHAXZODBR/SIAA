@@ -187,42 +187,164 @@ ipcMain.handle('write-license', async (_, licenseData) => {
 // In a packaged build the desktop app launches the inference server itself so
 // the user doesn't have to start Python/Ollama by hand. In dev we assume the
 // developer ran `python run_server.py` already.
+//
+// - SENTINEL_DATA_DIR points the server's DB / audit log / license / logs at
+//   the per-user app-data folder (writable, survives reinstall).
+// - SENTINEL_REQUIRE_AUTH=1 keeps login mandatory in every packaged build.
+// - stdout/stderr are appended to <userData>/logs/backend.log for IT support.
+// - An unexpected exit is reported to the doctor and the server is restarted
+//   up to MAX_BACKEND_RESTARTS times with exponential backoff.
+const MAX_BACKEND_RESTARTS = 3;
+const BACKEND_STABLE_MS = 120000; // an exit after this long of uptime resets the restart counter
+let backendRestarts = 0;
+let backendStartedAt = 0;
+let backendLog = null;
+let quitting = false;
+
+function backendLogPath() {
+  return path.join(app.getPath('userData'), 'logs', 'backend.log');
+}
+
+function openBackendLog() {
+  try {
+    fs.mkdirSync(path.dirname(backendLogPath()), { recursive: true });
+    return fs.createWriteStream(backendLogPath(), { flags: 'a' });
+  } catch (e) {
+    console.error('Could not open backend log:', e);
+    return null;
+  }
+}
+
+function logBackend(line) {
+  if (!backendLog) backendLog = openBackendLog();
+  if (backendLog) backendLog.write(`[${new Date().toISOString()}] [electron] ${line}\n`);
+}
+
+function backendEnv() {
+  return {
+    ...process.env,
+    SENTINEL_REQUIRE_AUTH: '1',                    // enforce auth in production
+    SENTINEL_DATA_DIR: app.getPath('userData'),    // DB, audit log, license, logs
+  };
+}
+
+function showBackendDialog(type, title, message, detail) {
+  const opts = { type, title, message, detail, buttons: ['OK'] };
+  const p = mainWindow && !mainWindow.isDestroyed()
+    ? dialog.showMessageBox(mainWindow, opts)
+    : dialog.showMessageBox(opts);
+  p.catch(() => {});
+}
+
+function spawnBackend() {
+  const resourcesPath = process.resourcesPath || path.join(__dirname, '..');
+  const backendDir = path.join(resourcesPath, 'backend');
+  const serverScript = path.join(backendDir, 'run_server.py');
+  const candidates = [
+    path.join(backendDir, 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+    process.platform === 'win32' ? 'python.exe' : 'python3',
+  ];
+  const pythonExe = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || candidates[candidates.length - 1];
+
+  if (!fs.existsSync(serverScript)) {
+    logBackend(`server script not found: ${serverScript}`);
+    dialog.showErrorBox('Backend not found',
+      'The Sentinel inference server was not found in this install. ' +
+      'Reinstall the full package, or start the server manually.');
+    return;
+  }
+
+  if (!backendLog) backendLog = openBackendLog();
+
+  try {
+    const child = spawn(pythonExe, [serverScript], {
+      cwd: backendDir,
+      env: backendEnv(),
+      detached: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    inferenceProcess = child;
+    backendStartedAt = Date.now();
+    logBackend(`backend start attempt=${backendRestarts + 1} pid=${child.pid} python=${pythonExe}`);
+
+    if (backendLog) {
+      child.stdout.pipe(backendLog, { end: false });
+      child.stderr.pipe(backendLog, { end: false });
+    } else {
+      child.stdout.resume();
+      child.stderr.resume();
+    }
+
+    child.on('error', (err) => {
+      logBackend(`spawn error: ${err}`);
+      if (!quitting) dialog.showErrorBox('Backend failed to start', String(err));
+    });
+
+    child.on('exit', (code, signal) => {
+      logBackend(`backend exit code=${code} signal=${signal}`);
+      if (inferenceProcess === child) inferenceProcess = null;
+      if (quitting) return;
+      handleBackendExit(code, signal);
+    });
+  } catch (e) {
+    logBackend(`spawn threw: ${e}`);
+    dialog.showErrorBox('Backend failed to start', String(e));
+  }
+}
+
+function handleBackendExit(code, signal) {
+  // A server that ran for a while before dying gets a fresh restart budget.
+  if (Date.now() - backendStartedAt > BACKEND_STABLE_MS) backendRestarts = 0;
+
+  const reason = code !== null && code !== undefined ? `exit code ${code}` : `signal ${signal}`;
+  if (backendRestarts >= MAX_BACKEND_RESTARTS) {
+    logBackend(`giving up after ${MAX_BACKEND_RESTARTS} restarts`);
+    showBackendDialog(
+      'error',
+      'AI server stopped',
+      `The Sentinel inference server stopped ${MAX_BACKEND_RESTARTS} times in a row (${reason}) and will not be restarted automatically.`,
+      `Log file: ${backendLogPath()}\n\nContact IT support. Analysis is unavailable until the server is running again.`,
+    );
+    return;
+  }
+
+  backendRestarts += 1;
+  const delayMs = 2000 * Math.pow(2, backendRestarts - 1); // 2s, 4s, 8s
+  logBackend(`scheduling restart ${backendRestarts}/${MAX_BACKEND_RESTARTS} in ${delayMs}ms`);
+  showBackendDialog(
+    'warning',
+    'AI server restarting',
+    `The Sentinel inference server stopped unexpectedly (${reason}). Restarting in ${delayMs / 1000}s (attempt ${backendRestarts} of ${MAX_BACKEND_RESTARTS}).`,
+    `Log file: ${backendLogPath()}`,
+  );
+  setTimeout(() => {
+    if (!quitting && !inferenceProcess) spawnBackend();
+  }, delayMs);
+}
+
 function startBackend() {
   if (!app.isPackaged) return; // dev: backend run manually
 
   // Already running? (a previous instance, or user started it)
   const http = require('http');
-  const check = http.get('http://127.0.0.1:8000/health', () => { /* up */ });
-  check.on('error', () => {
-    // Not up — spawn it. Look for a bundled python venv or system python.
-    const resourcesPath = process.resourcesPath || path.join(__dirname, '..');
-    const serverScript = path.join(resourcesPath, 'backend', 'run_server.py');
-    const candidates = [
-      path.join(resourcesPath, 'backend', 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
-      process.platform === 'win32' ? 'python.exe' : 'python3',
-    ];
-    let pythonExe = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || candidates[candidates.length - 1];
-
-    if (!fs.existsSync(serverScript)) {
-      dialog.showErrorBox('Backend not found',
-        'The Sentinel inference server was not found in this install. ' +
-        'Reinstall the full package, or start the server manually.');
-      return;
-    }
-    try {
-      inferenceProcess = spawn(pythonExe, [serverScript], {
-        cwd: path.join(resourcesPath, 'backend'),
-        env: { ...process.env, SENTINEL_REQUIRE_AUTH: '1' },  // enforce auth in production
-        detached: false,
-        stdio: 'ignore',
-      });
-      inferenceProcess.on('error', (err) => {
-        dialog.showErrorBox('Backend failed to start', String(err));
-      });
-    } catch (e) {
-      dialog.showErrorBox('Backend failed to start', String(e));
-    }
+  const check = http.get('http://127.0.0.1:8000/health', (res) => {
+    res.resume();
+    logBackend('backend already running on :8000 — not spawning');
   });
+  check.setTimeout(2000, () => check.destroy(new Error('health check timeout')));
+  check.on('error', () => spawnBackend());
+}
+
+function stopBackend() {
+  quitting = true;
+  if (inferenceProcess) {
+    try { inferenceProcess.kill(); } catch {}
+    inferenceProcess = null;
+  }
+  if (backendLog) {
+    try { backendLog.end(); } catch {}
+    backendLog = null;
+  }
 }
 
 // ===== App Lifecycle =====
@@ -232,18 +354,16 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (inferenceProcess) {
-    try { inferenceProcess.kill(); } catch {}
-  }
+  // On macOS the app (and its backend) stays alive until the user quits;
+  // reopening a window via the Dock must not hit a dead server.
   if (process.platform !== 'darwin') {
+    stopBackend();
     app.quit();
   }
 });
 
 app.on('before-quit', () => {
-  if (inferenceProcess) {
-    try { inferenceProcess.kill(); } catch {}
-  }
+  stopBackend();
 });
 
 app.on('activate', () => {

@@ -1,18 +1,29 @@
 import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../store/appStore';
+import { getAppVersion } from '../services/appInfo';
 
 export default function StatusBar() {
-  const { orthancConnected, inferenceConnected, studies, toggleSidebar, sidebarOpen, toggleRightPanel, rightPanelOpen, activeTool } = useAppStore();
+  const { orthancConnected, health, studies, toggleSidebar, sidebarOpen, toggleRightPanel, rightPanelOpen, activeTool } = useAppStore();
   const [time, setTime] = useState(new Date());
+  const [version, setVersion] = useState('');
 
   useEffect(() => {
     const timer = setInterval(() => setTime(new Date()), 1000);
+    getAppVersion().then(setVersion).catch(() => {});
     return () => clearInterval(timer);
   }, []);
 
   const pendingCount = studies.filter(s => s.aiStatus === 'pending').length;
   const processingCount = studies.filter(s => s.aiStatus === 'processing').length;
   const completeCount = studies.filter(s => s.aiStatus === 'complete').length;
+
+  const aiState = !health || !health.reachable
+    ? { label: 'offline', color: 'text-ink-500', dot: 'bg-ink-600' }
+    : health.status === 'ok'
+      ? { label: 'ready', color: 'text-normal', dot: 'bg-normal animate-pulse' }
+      : health.status === 'degraded'
+        ? { label: 'degraded', color: 'text-moderate', dot: 'bg-moderate' }
+        : { label: 'error', color: 'text-critical', dot: 'bg-critical' };
 
   return (
     <div className="h-7 bg-ink-950 border-t border-ink-800 flex items-center px-2 text-[11px] select-none">
@@ -44,11 +55,11 @@ export default function StatusBar() {
         <span className="font-mono">{orthancConnected ? 'online' : 'offline'}</span>
       </div>
 
-      {/* AI status */}
-      <div className={`flex items-center gap-1.5 px-2 ${inferenceConnected ? 'text-normal' : 'text-ink-500'}`}>
-        <div className={`w-1.5 h-1.5 rounded-full ${inferenceConnected ? 'bg-normal animate-pulse' : 'bg-ink-600'}`} />
+      {/* AI server status (from /health) */}
+      <div className={`flex items-center gap-1.5 px-2 ${aiState.color}`}>
+        <div className={`w-1.5 h-1.5 rounded-full ${aiState.dot}`} />
         <span className="text-ink-500">AI:</span>
-        <span className="font-mono">{inferenceConnected ? 'ready' : 'offline'}</span>
+        <span className="font-mono">{aiState.label}</span>
       </div>
 
       <div className="w-px h-4 bg-ink-800 mx-1" />
@@ -68,7 +79,7 @@ export default function StatusBar() {
             </div>
           )}
           <div className="flex items-center gap-1 text-normal">
-            <span className="font-mono">{completeCount}</span> done today
+            <span className="font-mono">{completeCount}</span> analyzed
           </div>
         </div>
       )}
@@ -76,26 +87,27 @@ export default function StatusBar() {
       {/* Spacer */}
       <div className="flex-1" />
 
-      {/* System metrics */}
+      {/* Real server facts from /health */}
       <div className="flex items-center gap-3 text-ink-500">
-        <div className="flex items-center gap-1" title="Storage used">
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
-          </svg>
-          <span className="font-mono">12.4 GB / 500 GB</span>
-        </div>
-        <div className="flex items-center gap-1" title="GPU usage">
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-          </svg>
-          <span className="font-mono">GTX 1650 · 32%</span>
-        </div>
-        <div className="flex items-center gap-1" title="Active users">
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-          </svg>
-          <span className="font-mono">1</span>
-        </div>
+        {health?.device && (
+          <div className="flex items-center gap-1" title="Inference device (from /health)">
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg>
+            <span className="font-mono">{health.device}</span>
+          </div>
+        )}
+        {health?.llm && (
+          <div className={`flex items-center gap-1 ${health.llm.reachable ? '' : 'text-moderate'}`} title="Report assistant (LLM)">
+            <span className="text-ink-600">LLM:</span>
+            <span className="font-mono">{health.llm.reachable ? (health.llm.backend || 'ready') : 'unavailable'}</span>
+          </div>
+        )}
+        {(health?.version || version) && (
+          <div className="flex items-center gap-1 font-mono" title="Server / app version">
+            {health?.version ? `srv ${health.version}` : ''}{health?.version && version ? ' · ' : ''}{version ? `app ${version}` : ''}
+          </div>
+        )}
       </div>
 
       <div className="w-px h-4 bg-ink-800 mx-1" />

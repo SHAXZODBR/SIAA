@@ -1,121 +1,182 @@
 import React, { useState, useMemo } from 'react';
 import { useAppStore } from '../store/appStore';
-import type { Study } from '../types';
-import { analyzeDicom } from '../services/api';
-import { DEMO_STUDIES } from '../services/demoData';
+import type { Study, AIResult, Lang } from '../types';
+import { analyzeStudy, describeApiError } from '../services/api';
+import { DEMO_MODE, DEMO_STUDIES } from '../services/demoData';
+import { L, findingUrgency, translateFinding } from '../services/findingTranslations';
 
 type SortKey = 'time' | 'patient' | 'modality' | 'status';
 
-type ForceModality = 'auto' | 'chest' | 'brain_2d' | 'head_ct' | 'mammography';
+interface UploadProgress {
+  phase: 'idle' | 'collecting' | 'uploading' | 'analyzing';
+  count: number;
+  percent: number;
+}
 
-const MODALITY_LABELS: Record<ForceModality, string> = {
-  auto: 'Auto',
-  chest: 'Chest X-ray',
-  brain_2d: 'Brain MRI',
-  head_ct: 'Head CT',
-  mammography: 'Mammography',
-};
+// ─── File collection helpers ────────────────────────────────────────────────
+
+/** Client-side filter: .dcm / .dicom / extensionless files (skips hidden files and DICOMDIR). */
+export function isDicomCandidate(name: string): boolean {
+  const base = (name || '').split('/').pop() || '';
+  if (!base || base.startsWith('.')) return false;
+  if (base.toUpperCase() === 'DICOMDIR') return false;
+  const dot = base.lastIndexOf('.');
+  if (dot === -1) return true;
+  const ext = base.slice(dot + 1).toLowerCase();
+  return ext === 'dcm' || ext === 'dicom';
+}
+
+function filePath(f: File): string {
+  return (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+}
+
+function filterAndSort(files: File[]): File[] {
+  return files
+    .filter((f) => isDicomCandidate(filePath(f)))
+    .sort((a, b) => filePath(a).localeCompare(filePath(b), undefined, { numeric: true }));
+}
+
+/** Recursively read a dropped FileSystemEntry (folder drops). */
+async function readEntryFiles(entry: any): Promise<File[]> {
+  if (!entry) return [];
+  if (entry.isFile) {
+    return new Promise<File[]>((resolve) => entry.file((f: File) => resolve([f]), () => resolve([])));
+  }
+  if (entry.isDirectory) {
+    const reader = entry.createReader();
+    const out: File[] = [];
+    const readBatch = () => new Promise<any[]>((resolve) => reader.readEntries(resolve, () => resolve([])));
+    let batch = await readBatch();
+    while (batch.length > 0) {
+      for (const child of batch) out.push(...(await readEntryFiles(child)));
+      batch = await readBatch();
+    }
+    return out;
+  }
+  return [];
+}
+
+async function collectDroppedFiles(dt: DataTransfer): Promise<File[]> {
+  const items = dt.items ? Array.from(dt.items) : [];
+  const entries = items
+    .map((it) => (typeof (it as any).webkitGetAsEntry === 'function' ? (it as any).webkitGetAsEntry() : null))
+    .filter(Boolean);
+  if (entries.length > 0) {
+    const nested = await Promise.all(entries.map(readEntryFiles));
+    return nested.flat();
+  }
+  return Array.from(dt.files || []);
+}
+
+/** Placeholder result for a 422 requires_review answer (no study fields are returned). */
+function reviewOnlyResult(studyId: string, reason: string): AIResult {
+  const now = new Date().toISOString();
+  return {
+    id: studyId, studyId, findings: [], inferenceTimeMs: 0, modelVersion: '', isNormal: false,
+    overallImpression: '', createdAt: now, overallAssessment: null, disclaimer: '', modelIdentity: [],
+    threshold: null, requiresReview: true, rejected: true, rejectionReason: reason, appVersion: null,
+  };
+}
 
 export default function Sidebar() {
-  const { studies, selectedStudyId, selectStudy, modalityFilter, setModalityFilter, searchQuery, setSearchQuery, addStudy, setAIResult, setReport, settings } = useAppStore();
+  const {
+    studies, selectedStudyId, selectStudy, modalityFilter, setModalityFilter, searchQuery, setSearchQuery,
+    addStudy, setAIResult, setReport, settings, health, addNotification, aiResults,
+  } = useAppStore();
+  const lang = settings.language;
   const [sortKey, setSortKey] = useState<SortKey>('time');
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
-  const [uploading, setUploading] = useState(false);
-  const [forceModality, setForceModality] = useState<ForceModality>('auto');
+  const [progress, setProgress] = useState<UploadProgress>({ phase: 'idle', count: 0, percent: 0 });
+  const [dragOver, setDragOver] = useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const folderInputRef = React.useRef<HTMLInputElement>(null);
 
-  const handleUploadFile = async (file: File) => {
-    setUploading(true);
+  const uploading = progress.phase !== 'idle';
+  const serverReady = !!health && health.reachable && health.status === 'ok';
+
+  const handleUploadFiles = async (rawFiles: File[]) => {
+    const files = filterAndSort(rawFiles);
+    if (files.length === 0) {
+      addNotification({ type: 'warning', title: L('noDicomFiles', lang) });
+      return;
+    }
+    setProgress({ phase: 'uploading', count: files.length, percent: 0 });
     try {
-      const studyId = `st-${Date.now()}`;
-      const guessedBodyPart =
-        forceModality === 'brain_2d' ? 'BRAIN'
-        : forceModality === 'head_ct' ? 'HEAD'
-        : forceModality === 'mammography' ? 'BREAST'
-        : 'CHEST';
-      const guessedModality =
-        forceModality === 'brain_2d' ? 'MR'
-        : forceModality === 'head_ct' ? 'CT'
-        : forceModality === 'mammography' ? 'MG'
-        : 'CR';
-
-      const study: Study = {
-        id: studyId,
-        patientId: file.name.replace(/\.[^/.]+$/, '').slice(0, 12),
-        modality: guessedModality,
-        bodyPart: guessedBodyPart,
-        studyDate: new Date().toISOString().slice(0, 10),
-        receivedAt: new Date().toISOString(),
-        dicomPath: file.name,
-        aiStatus: 'processing',
-      };
-      addStudy(study);
-      selectStudy(studyId);
-
-      const result = await analyzeDicom(file, file.name, settings.language, {
-        useAutoRouting: true,
-        forceModality: forceModality === 'auto' ? undefined : forceModality,
+      const analysis = await analyzeStudy(files, settings.language, (pct) => {
+        setProgress({ phase: pct >= 100 ? 'analyzing' : 'uploading', count: files.length, percent: pct });
       });
+      setProgress({ phase: 'analyzing', count: files.length, percent: 100 });
 
-      setAIResult(studyId, { ...result, studyId });
-
-      if (result.reportText) {
-        setReport(studyId, {
-          id: `rep-${Date.now()}`,
-          studyId,
+      // The Study is built from the SERVER response — never from the button or filename.
+      const { study, result, reportText, reportLanguage } = analysis;
+      addStudy(study);
+      setAIResult(study.id, result);
+      if (reportText) {
+        const now = new Date().toISOString();
+        setReport(study.id, {
+          id: `rep-${study.id}`,
+          studyId: study.id,
           doctorId: 'ai',
-          reportText: result.reportText,
-          aiDraftText: result.reportText,
-          language: settings.language,
+          reportText,
+          aiDraftText: reportText,
+          language: reportLanguage,
           isSigned: false,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
+          createdAt: now,
+          updatedAt: now,
         });
       }
-
-      const updatedStudies = useAppStore.getState().studies.map(s =>
-        s.id === studyId ? {
-          ...s,
-          aiStatus: 'complete' as const,
-          aiAnalyzedAt: new Date().toISOString(),
-          // Apply the REAL modality/body part detected by the backend
-          // (fixes 'Auto' uploads that were provisionally labelled CR/CHEST)
-          modality: (result as any).modality || s.modality,
-          bodyPart: (result as any).bodyPart || s.bodyPart,
-        } : s
-      );
-      useAppStore.setState({ studies: updatedStudies });
-    } catch (e: any) {
-      console.error('Upload/analysis failed:', e);
-      const detail = e?.response?.data?.detail || e?.message || 'Server unavailable';
-      alert(`Analysis failed: ${detail}\n\nIf the model isn't downloaded, run:\n  python scripts/download_all_models.py`);
+      selectStudy(study.id);
+      if (result.rejected || result.requiresReview) {
+        addNotification({ type: 'warning', title: L('notAnalyzed', lang), message: result.rejectionReason || undefined });
+      }
+    } catch (e) {
+      const info = describeApiError(e);
+      console.error('Upload/analysis failed:', info.code, info.detail, e);
+      if (info.code === 'review') {
+        // Server refused to analyze (wrong modality / body part) — keep the study visible for a full read.
+        const studyId = `review-${Date.now()}`;
+        const now = new Date().toISOString();
+        const study: Study = {
+          id: studyId, patientId: 'UNKNOWN', modality: 'N/A', bodyPart: '—', studyDate: '',
+          receivedAt: now, dicomPath: '', aiStatus: 'complete', numFiles: files.length,
+        };
+        addStudy(study);
+        setAIResult(studyId, reviewOnlyResult(studyId, info.detail));
+        selectStudy(studyId);
+        addNotification({ type: 'warning', title: L('notAnalyzed', lang), message: info.detail });
+      } else if (info.code === 'network') {
+        addNotification({ type: 'error', title: L('aiServerDown', lang) });
+      } else if (info.code === 'auth') {
+        addNotification({ type: 'warning', title: L('sessionExpired', lang) });
+      } else {
+        addNotification({ type: 'error', title: L('analysisFailed', lang), message: info.detail });
+      }
     } finally {
-      setUploading(false);
+      setProgress({ phase: 'idle', count: 0, percent: 0 });
     }
-  };
-
-  const handleUploadClick = () => {
-    fileInputRef.current?.click();
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      handleUploadFile(file);
-    }
-    // Reset input so same file can be re-uploaded
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    const list = e.target.files ? Array.from(e.target.files) : [];
+    if (list.length > 0) handleUploadFiles(list);
+    // Reset input so the same selection can be re-uploaded
+    e.target.value = '';
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
-    const file = e.dataTransfer.files?.[0];
-    if (file) {
-      handleUploadFile(file);
+    setDragOver(false);
+    if (uploading || !serverReady) return;
+    setProgress({ phase: 'collecting', count: 0, percent: 0 });
+    try {
+      const files = await collectDroppedFiles(e.dataTransfer);
+      await handleUploadFiles(files);
+    } finally {
+      setProgress((p) => (p.phase === 'collecting' ? { phase: 'idle', count: 0, percent: 0 } : p));
     }
   };
 
-  const displayStudies = studies.length > 0 ? studies : DEMO_STUDIES;
+  const displayStudies = studies.length > 0 ? studies : (DEMO_MODE ? DEMO_STUDIES : []);
 
   const filtered = useMemo(() => {
     let result = displayStudies.filter(s => {
@@ -123,6 +184,8 @@ export default function Sidebar() {
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
         return s.patientId.toLowerCase().includes(q) ||
+               (s.patientName || '').toLowerCase().includes(q) ||
+               (s.accessionNumber || '').toLowerCase().includes(q) ||
                s.bodyPart.toLowerCase().includes(q) ||
                s.modality.toLowerCase().includes(q);
       }
@@ -144,6 +207,18 @@ export default function Sidebar() {
     complete: displayStudies.filter(s => s.aiStatus === 'complete').length,
     error: displayStudies.filter(s => s.aiStatus === 'error').length,
   }), [displayStudies]);
+
+  const modalities = useMemo(() => {
+    const set = new Set(displayStudies.map((s) => s.modality));
+    return ['all', ...Array.from(set).sort()];
+  }, [displayStudies]);
+
+  const progressLabel = (() => {
+    if (progress.phase === 'collecting') return `${L('uploading', lang)}…`;
+    if (progress.phase === 'uploading') return `${L('uploading', lang)} ${progress.count} ${L('files', lang)} · ${progress.percent}%`;
+    if (progress.phase === 'analyzing') return `${L('analyzingFiles', lang)} ${progress.count} ${L('files', lang)}…`;
+    return '';
+  })();
 
   return (
     <div className="h-full flex flex-col bg-ink-900 border-r border-ink-800">
@@ -190,16 +265,15 @@ export default function Sidebar() {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search patient, modality..."
+            placeholder="Search patient, accession, modality..."
             className="w-full pl-8 pr-3 py-1.5 text-xs bg-ink-950/50 border border-ink-700 rounded-md text-ink-100 placeholder-ink-500 focus:outline-none focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20"
           />
         </div>
 
-        {/* Modality Filter Pills */}
+        {/* Modality Filter Pills (real modalities only) */}
         <div className="flex gap-1 overflow-x-auto">
-          {['all', 'CR', 'DX', 'CT', 'MR', 'US'].map((m) => {
+          {modalities.map((m) => {
             const count = m === 'all' ? displayStudies.length : displayStudies.filter(s => s.modality === m).length;
-            if (count === 0 && m !== 'all') return null;
             return (
               <button
                 key={m}
@@ -243,7 +317,7 @@ export default function Sidebar() {
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
         {filtered.map((study) => (
           viewMode === 'list'
-            ? <StudyCard key={study.id} study={study} selected={study.id === selectedStudyId} onClick={() => selectStudy(study.id)} />
+            ? <StudyCard key={study.id} study={study} result={aiResults[study.id]} lang={lang} selected={study.id === selectedStudyId} onClick={() => selectStudy(study.id)} />
             : <StudyThumb key={study.id} study={study} selected={study.id === selectedStudyId} onClick={() => selectStudy(study.id)} />
         ))}
 
@@ -253,74 +327,81 @@ export default function Sidebar() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
                 d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
             </svg>
-            <p className="text-sm text-ink-400">No studies found</p>
-            <p className="text-xs text-ink-600 mt-1">Try adjusting filters</p>
+            <p className="text-sm text-ink-400">{displayStudies.length === 0 ? L('noStudies', lang) : 'No studies found'}</p>
+            <p className="text-xs text-ink-600 mt-1">{displayStudies.length === 0 ? L('noStudiesHint', lang) : 'Try adjusting filters'}</p>
           </div>
         )}
       </div>
 
-      {/* Upload Section — modality picker + button */}
+      {/* Upload Section — whole study (folder or many files); the SERVER routes by DICOM headers */}
       <div
-        className="p-2 border-t border-ink-800 space-y-2"
-        onDragOver={(e) => e.preventDefault()}
+        className={`p-2 border-t border-ink-800 space-y-2 transition-colors ${dragOver ? 'bg-accent-900/20' : ''}`}
+        onDragOver={(e) => { e.preventDefault(); if (!dragOver) setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
         onDrop={handleDrop}
       >
         <input
           ref={fileInputRef}
           type="file"
+          multiple
           accept=".dcm,.dicom,application/dicom,*/*"
           onChange={handleFileChange}
           style={{ display: 'none' }}
         />
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          onChange={handleFileChange}
+          style={{ display: 'none' }}
+          {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
+        />
 
-        {/* Modality picker — overrides the AI auto-detection */}
-        <div>
-          <div className="text-[9px] uppercase tracking-wider text-ink-500 mb-1">
-            AI Model
-          </div>
-          <div className="grid grid-cols-3 gap-1">
-            {(['auto', 'chest', 'brain_2d', 'head_ct', 'mammography'] as ForceModality[]).map((m) => (
-              <button
-                key={m}
-                onClick={() => setForceModality(m)}
-                className={`px-1.5 py-1 text-[9px] font-medium rounded transition-colors ${
-                  forceModality === m
-                    ? 'bg-accent-600 text-white'
-                    : 'bg-ink-800 text-ink-400 hover:text-ink-200'
-                }`}
-                title={`Force the ${MODALITY_LABELS[m]} model`}
-              >
-                {MODALITY_LABELS[m]}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <button
-          onClick={handleUploadClick}
-          disabled={uploading}
-          className="w-full py-2 bg-accent-600 hover:bg-accent-500 disabled:bg-ink-700 text-white text-xs font-medium rounded-md transition-all flex items-center justify-center gap-2 shadow-sm hover:shadow-glow-accent"
-        >
-          {uploading ? (
-            <>
+        {uploading ? (
+          <div className="w-full py-2 px-3 bg-ink-800 rounded-md text-xs text-accent-300">
+            <div className="flex items-center gap-2 mb-1.5">
               <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
               </svg>
-              Analyzing...
-            </>
-          ) : (
-            <>
+              <span>{progressLabel}</span>
+            </div>
+            <div className="h-1 bg-ink-950 rounded-full overflow-hidden">
+              <div
+                className={`h-full bg-accent-500 transition-all ${progress.phase === 'analyzing' ? 'animate-pulse' : ''}`}
+                style={{ width: `${progress.phase === 'analyzing' ? 100 : progress.percent}%` }}
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-1">
+            <button
+              onClick={() => folderInputRef.current?.click()}
+              disabled={!serverReady}
+              title={serverReady ? L('uploadStudy', lang) : L('aiServerDown', lang)}
+              className="py-2 bg-accent-600 hover:bg-accent-500 disabled:bg-ink-700 disabled:text-ink-500 disabled:cursor-not-allowed text-white text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 shadow-sm"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+              </svg>
+              {L('uploadFolder', lang)}
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!serverReady}
+              title={serverReady ? L('uploadStudy', lang) : L('aiServerDown', lang)}
+              className="py-2 bg-ink-800 hover:bg-ink-700 disabled:bg-ink-800/50 disabled:text-ink-600 disabled:cursor-not-allowed text-ink-100 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 border border-ink-700"
+            >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
               </svg>
-              Upload DICOM ({MODALITY_LABELS[forceModality]})
-            </>
-          )}
-        </button>
+              {L('uploadFiles', lang)}
+            </button>
+          </div>
+        )}
 
         <div className="text-[10px] text-ink-500 text-center">
-          Drag &amp; drop DICOM here, or click above
+          {serverReady ? L('dropHint', lang) : L('aiServerDown', lang)}
         </div>
       </div>
     </div>
@@ -336,7 +417,24 @@ function StatChip({ label, value, color, pulse }: { label: string; value: number
   );
 }
 
-function StudyCard({ study, selected, onClick }: { study: Study; selected: boolean; onClick: () => void }) {
+/** Worklist badge derived from the real AI result — never random. */
+function resultBadge(result: AIResult | undefined, lang: Lang) {
+  if (!result) return null;
+  if (result.rejected || result.requiresReview) {
+    return { label: L('needsReview', lang), cls: 'severity-moderate', top: null as null | { name: string; confidence: number } };
+  }
+  const positives = result.findings.filter((f) => f.positive);
+  if (positives.length === 0) return null;
+  const top = positives.reduce((a, b) => (b.confidence > a.confidence ? b : a));
+  const urgency = findingUrgency(top);
+  return {
+    label: urgency === 'review' ? L('needsReview', lang) : `${L('needsReview', lang)} · ${top.status}`,
+    cls: urgency === 'review' ? 'severity-critical' : 'severity-moderate',
+    top: { name: translateFinding(top.className, lang), confidence: top.confidence },
+  };
+}
+
+function StudyCard({ study, result, lang, selected, onClick }: { study: Study; result?: AIResult; lang: Lang; selected: boolean; onClick: () => void }) {
   const statusConfig = {
     pending: { color: 'bg-ink-500', label: 'Pending', textColor: 'text-ink-400' },
     processing: { color: 'bg-accent-500 animate-pulse', label: 'Analyzing', textColor: 'text-accent-400' },
@@ -350,7 +448,7 @@ function StudyCard({ study, selected, onClick }: { study: Study; selected: boole
     US: 'border-l-yellow-500',
   };
 
-  const severity = study.aiStatus === 'complete' ? (Math.random() > 0.6 ? 'high' : 'low') : null;
+  const badge = resultBadge(result, lang);
 
   return (
     <div
@@ -362,13 +460,13 @@ function StudyCard({ study, selected, onClick }: { study: Study; selected: boole
       }`}
     >
       <div className="flex items-start justify-between mb-1">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <span className="text-[10px] font-bold text-ink-300 bg-ink-800 px-1.5 py-0.5 rounded">{study.modality}</span>
-          {severity === 'high' && (
-            <span className="severity-pill severity-critical">Critical</span>
+          {badge && (
+            <span className={`severity-pill ${badge.cls} truncate`}>{badge.label}</span>
           )}
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 flex-shrink-0">
           <span className={`w-1.5 h-1.5 rounded-full ${statusConfig.color}`} />
           <span className={`text-[9px] font-medium uppercase tracking-wider ${statusConfig.textColor}`}>
             {statusConfig.label}
@@ -376,21 +474,19 @@ function StudyCard({ study, selected, onClick }: { study: Study; selected: boole
         </div>
       </div>
 
-      <div className="text-sm font-semibold text-ink-100 font-mono mb-0.5">{study.patientId}</div>
+      <div className="text-sm font-semibold text-ink-100 font-mono mb-0.5 truncate">{study.patientId}</div>
 
       <div className="flex items-center justify-between text-[10px] text-ink-500">
-        <span className="truncate">{study.bodyPart}</span>
+        <span className="truncate">{study.bodyPart}{study.numFiles ? ` · ${study.numFiles} ${L('files', lang)}` : ''}</span>
         <span className="font-mono flex-shrink-0">
-          {new Date(study.receivedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
+          {study.studyDate || new Date(study.receivedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
         </span>
       </div>
 
-      {study.aiStatus === 'complete' && (
+      {badge?.top && (
         <div className="mt-1.5 flex items-center gap-1.5">
-          <div className="flex-1 h-0.5 bg-ink-800 rounded-full overflow-hidden">
-            <div className="h-full bg-gradient-to-r from-accent-500 to-accent-400" style={{ width: '87%' }} />
-          </div>
-          <span className="text-[9px] text-ink-400 font-mono">87%</span>
+          <span className="text-[9px] text-ink-400 truncate flex-1">{badge.top.name}</span>
+          <span className="text-[9px] text-ink-400 font-mono">{Math.round(badge.top.confidence * 100)}%</span>
         </div>
       )}
     </div>

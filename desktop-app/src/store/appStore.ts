@@ -1,9 +1,18 @@
 import { create } from 'zustand';
-import type { Study, AIResult, Report, User, Finding, AppSettings } from '../types';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import type {
+  Study, AIResult, Report, User, Finding, AppSettings, HealthStatus, SignedReport, Lang,
+} from '../types';
 
 interface AppState {
-  // Current user
+  // Auth (memory only — never persisted)
   currentUser: User | null;
+  authToken: string | null;
+  mustChangePassword: boolean;
+  setAuth: (token: string, user: User, mustChangePassword: boolean) => void;
+  setMustChangePassword: (v: boolean) => void;
+  clearAuth: () => void;
+  /** @deprecated kept for older call sites; prefer setAuth/clearAuth */
   setCurrentUser: (user: User | null) => void;
 
   // Studies
@@ -11,6 +20,7 @@ interface AppState {
   selectedStudyId: string | null;
   setStudies: (studies: Study[]) => void;
   addStudy: (study: Study) => void;
+  updateStudy: (id: string, patch: Partial<Study>) => void;
   updateStudyStatus: (id: string, status: Study['aiStatus']) => void;
   selectStudy: (id: string | null) => void;
 
@@ -21,6 +31,10 @@ interface AppState {
   // Reports
   reports: Record<string, Report>;
   setReport: (studyId: string, report: Report) => void;
+
+  // Server-confirmed signatures, keyed `${studyId}:${language}`
+  signedReports: Record<string, SignedReport>;
+  setSignedReport: (studyId: string, language: Lang, signed: SignedReport) => void;
 
   // Viewer state
   showHeatmap: boolean;
@@ -70,8 +84,10 @@ interface AppState {
   orthancConnected: boolean;
   inferenceConnected: boolean;
   setConnectionStatus: (orthanc: boolean, inference: boolean) => void;
+  health: HealthStatus | null;
+  setHealth: (health: HealthStatus | null) => void;
 
-  // Settings
+  // Settings (persisted to localStorage)
   settings: AppSettings;
   updateSettings: (settings: Partial<AppSettings>) => void;
 }
@@ -86,99 +102,146 @@ export interface Notification {
   action?: { label: string; onClick: () => void };
 }
 
-export const useAppStore = create<AppState>((set) => ({
-  // User
-  currentUser: null,
-  setCurrentUser: (user) => set({ currentUser: user }),
+export const DEFAULT_SETTINGS: AppSettings = {
+  orthancUrl: 'http://localhost:8042',
+  inferenceUrl: 'http://127.0.0.1:8000',
+  language: 'ru',
+  clinicName: '',
+  clinicAddress: '',
+  supportContact: '',
+  theme: 'dark',
+};
 
-  // Studies
-  studies: [],
-  selectedStudyId: null,
-  setStudies: (studies) => set({ studies }),
-  addStudy: (study) => set((s) => ({ studies: [study, ...s.studies] })),
-  updateStudyStatus: (id, status) =>
-    set((s) => ({
-      studies: s.studies.map((st) => (st.id === id ? { ...st, aiStatus: status } : st)),
-    })),
-  selectStudy: (id) => set({ selectedStudyId: id, selectedFinding: null }),
+export const signedKey = (studyId: string, language: Lang) => `${studyId}:${language}`;
 
-  // AI Results
-  aiResults: {},
-  setAIResult: (studyId, result) =>
-    set((s) => ({ aiResults: { ...s.aiResults, [studyId]: result } })),
+export const useAppStore = create<AppState>()(
+  persist(
+    (set) => ({
+      // Auth
+      currentUser: null,
+      authToken: null,
+      mustChangePassword: false,
+      setAuth: (token, user, mustChangePassword) =>
+        set({ authToken: token, currentUser: user, mustChangePassword }),
+      setMustChangePassword: (v) => set({ mustChangePassword: v }),
+      // Logging out also drops every patient-identifying object held in memory.
+      clearAuth: () =>
+        set({
+          authToken: null,
+          currentUser: null,
+          mustChangePassword: false,
+          studies: [],
+          selectedStudyId: null,
+          aiResults: {},
+          reports: {},
+          signedReports: {},
+          selectedFinding: null,
+        }),
+      setCurrentUser: (user) => set({ currentUser: user }),
 
-  // Reports
-  reports: {},
-  setReport: (studyId, report) =>
-    set((s) => ({ reports: { ...s.reports, [studyId]: report } })),
+      // Studies
+      studies: [],
+      selectedStudyId: null,
+      setStudies: (studies) => set({ studies }),
+      addStudy: (study) => set((s) => ({ studies: [study, ...s.studies.filter((st) => st.id !== study.id)] })),
+      updateStudy: (id, patch) =>
+        set((s) => ({
+          studies: s.studies.map((st) => (st.id === id ? { ...st, ...patch } : st)),
+        })),
+      updateStudyStatus: (id, status) =>
+        set((s) => ({
+          studies: s.studies.map((st) => (st.id === id ? { ...st, aiStatus: status } : st)),
+        })),
+      selectStudy: (id) => set({ selectedStudyId: id, selectedFinding: null }),
 
-  // Viewer
-  showHeatmap: true,
-  toggleHeatmap: () => set((s) => ({ showHeatmap: !s.showHeatmap })),
-  selectedFinding: null,
-  selectFinding: (finding) => set({ selectedFinding: finding }),
-  viewerZoom: 1,
-  setViewerZoom: (zoom) => set({ viewerZoom: zoom }),
-  panOffset: { x: 0, y: 0 },
-  setPanOffset: (offset) => set({ panOffset: offset }),
-  rotation: 0,
-  setRotation: (rotation) => set({ rotation }),
-  invert: false,
-  toggleInvert: () => set((s) => ({ invert: !s.invert })),
-  windowLevel: { center: 50, width: 350 },  // Chest preset default
-  setWindowLevel: (wl) => set({ windowLevel: wl }),
-  activeTool: 'pan',
-  setActiveTool: (tool) => set({ activeTool: tool }),
+      // AI Results
+      aiResults: {},
+      setAIResult: (studyId, result) =>
+        set((s) => ({ aiResults: { ...s.aiResults, [studyId]: result } })),
 
-  // UI
-  sidebarOpen: true,
-  toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
-  rightPanelOpen: true,
-  toggleRightPanel: () => set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
-  rightPanelTab: 'findings',
-  setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
-  thumbnailStripOpen: false,
-  toggleThumbnailStrip: () => set((s) => ({ thumbnailStripOpen: !s.thumbnailStripOpen })),
-  modalityFilter: 'all',
-  setModalityFilter: (modality) => set({ modalityFilter: modality }),
-  searchQuery: '',
-  setSearchQuery: (query) => set({ searchQuery: query }),
+      // Reports
+      reports: {},
+      setReport: (studyId, report) =>
+        set((s) => ({ reports: { ...s.reports, [studyId]: report } })),
 
-  // Modals
-  commandPaletteOpen: false,
-  setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
-  settingsOpen: false,
-  openSettings: () => set({ settingsOpen: true }),
-  closeSettings: () => set({ settingsOpen: false }),
+      signedReports: {},
+      setSignedReport: (studyId, language, signed) =>
+        set((s) => ({ signedReports: { ...s.signedReports, [signedKey(studyId, language)]: signed } })),
 
-  // Notifications
-  notifications: [],
-  addNotification: (n) => set((s) => ({
-    notifications: [
-      { ...n, id: Math.random().toString(36).slice(2), timestamp: Date.now() },
-      ...s.notifications,
-    ].slice(0, 50), // Keep last 50
-  })),
-  dismissNotification: (id) => set((s) => ({
-    notifications: s.notifications.filter(n => n.id !== id),
-  })),
+      // Viewer
+      showHeatmap: true,
+      toggleHeatmap: () => set((s) => ({ showHeatmap: !s.showHeatmap })),
+      selectedFinding: null,
+      selectFinding: (finding) => set({ selectedFinding: finding }),
+      viewerZoom: 1,
+      setViewerZoom: (zoom) => set({ viewerZoom: zoom }),
+      panOffset: { x: 0, y: 0 },
+      setPanOffset: (offset) => set({ panOffset: offset }),
+      rotation: 0,
+      setRotation: (rotation) => set({ rotation }),
+      invert: false,
+      toggleInvert: () => set((s) => ({ invert: !s.invert })),
+      windowLevel: { center: 128, width: 256 },  // identity for 8-bit preview PNGs
+      setWindowLevel: (wl) => set({ windowLevel: wl }),
+      activeTool: 'pan',
+      setActiveTool: (tool) => set({ activeTool: tool }),
 
-  // Connection
-  orthancConnected: false,
-  inferenceConnected: false,
-  setConnectionStatus: (orthanc, inference) =>
-    set({ orthancConnected: orthanc, inferenceConnected: inference }),
+      // UI
+      sidebarOpen: true,
+      toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
+      rightPanelOpen: true,
+      toggleRightPanel: () => set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
+      rightPanelTab: 'findings',
+      setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
+      thumbnailStripOpen: false,
+      toggleThumbnailStrip: () => set((s) => ({ thumbnailStripOpen: !s.thumbnailStripOpen })),
+      modalityFilter: 'all',
+      setModalityFilter: (modality) => set({ modalityFilter: modality }),
+      searchQuery: '',
+      setSearchQuery: (query) => set({ searchQuery: query }),
 
-  // Settings
-  settings: {
-    orthancUrl: 'http://localhost:8042',
-    inferenceUrl: 'http://localhost:8000',
-    storagePath: './data',
-    language: 'ru',
-    autoAnalyze: true,
-    refreshInterval: 30,
-    theme: 'dark',
-  },
-  updateSettings: (newSettings) =>
-    set((s) => ({ settings: { ...s.settings, ...newSettings } })),
-}));
+      // Modals
+      commandPaletteOpen: false,
+      setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
+      settingsOpen: false,
+      openSettings: () => set({ settingsOpen: true }),
+      closeSettings: () => set({ settingsOpen: false }),
+
+      // Notifications
+      notifications: [],
+      addNotification: (n) => set((s) => ({
+        notifications: [
+          { ...n, id: Math.random().toString(36).slice(2), timestamp: Date.now() },
+          ...s.notifications,
+        ].slice(0, 50), // Keep last 50
+      })),
+      dismissNotification: (id) => set((s) => ({
+        notifications: s.notifications.filter(n => n.id !== id),
+      })),
+
+      // Connection
+      orthancConnected: false,
+      inferenceConnected: false,
+      setConnectionStatus: (orthanc, inference) =>
+        set({ orthancConnected: orthanc, inferenceConnected: inference }),
+      health: null,
+      setHealth: (health) => set({ health }),
+
+      // Settings
+      settings: { ...DEFAULT_SETTINGS },
+      updateSettings: (newSettings) =>
+        set((s) => ({ settings: { ...s.settings, ...newSettings } })),
+    }),
+    {
+      name: 'sentinel-settings',
+      version: 1,
+      storage: createJSONStorage(() => localStorage),
+      // Only preferences are persisted — never the token, studies or results.
+      partialize: (s) => ({ settings: s.settings }),
+      merge: (persisted, current) => {
+        const p = (persisted as Partial<AppState> | undefined)?.settings || {};
+        return { ...current, settings: { ...DEFAULT_SETTINGS, ...current.settings, ...p } };
+      },
+    },
+  ),
+);

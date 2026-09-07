@@ -47,6 +47,7 @@ fastapi>=0.104
 uvicorn[standard]>=0.24
 python-multipart>=0.0.6
 pydantic>=2.5
+httpx>=0.24            # fastapi.testclient (in-process API verification)
 
 # === Database ===
 aiosqlite>=0.19

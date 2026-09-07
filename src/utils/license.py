@@ -291,7 +291,17 @@ def verify_license(license_data: str, current_machine_id: Optional[str] = None) 
 
 
 def get_license_path() -> Path:
-    """Where the license file lives on this machine."""
+    """Where the license file lives on this machine.
+
+    DATA_DIR/license.dat first (the Electron shell writes there via
+    SENTINEL_DATA_DIR=userData); falls back to the legacy per-platform config
+    location so existing installs keep working."""
+    try:
+        from src.utils.paths import LICENSE_PATH
+        if LICENSE_PATH.exists():
+            return LICENSE_PATH
+    except Exception:
+        pass
     home = Path.home()
     if platform.system() == 'Windows':
         base = Path(os.environ.get('APPDATA', home))

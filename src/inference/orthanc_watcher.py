@@ -150,8 +150,9 @@ class OrthancWatcher:
             )
             resp.raise_for_status()
 
-            # Save to local storage
-            storage_dir = Path("data/dicom") / study_id
+            # Save to the DICOM cache under DATA_DIR (never inside the app bundle)
+            from src.utils.paths import DICOM_CACHE_DIR
+            storage_dir = DICOM_CACHE_DIR / study_id
             storage_dir.mkdir(parents=True, exist_ok=True)
             dicom_path = storage_dir / f"{instance_id}.dcm"
 

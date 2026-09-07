@@ -6,7 +6,12 @@ and returns structured analysis results in under 10 seconds.
 
 import io
 import os
+import json
 import time
+import shutil
+import sqlite3
+import hashlib
+import asyncio
 import threading
 import uuid
 import base64
@@ -19,16 +24,30 @@ import pydicom
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from typing import Optional
 from contextlib import asynccontextmanager
 from loguru import logger
 
-from src.pipeline.dicom_loader import load_dicom
+from src.pipeline.dicom_loader import load_dicom, DicomStudy
 from src.pipeline.preprocessor import preprocess_study
 from src.training.densenet_trainer import DenseNet121Classifier, get_device
 from src.training.gradcam import GradCAM
 from src.utils.config import get_config
+from src.utils.paths import DATA_DIR, LOG_DIR, CORRECTIONS_DIR, ensure_data_dirs
+from src.utils.logger import setup_logger
+from src.utils.auth import DEV_INSECURE, REQUIRE_AUTH
+
+# Server/app version reported in /health and stamped on every analysis
+# (desktop-app/package.json carries the same number for the UI build).
+APP_VERSION = "1.0.0"
+
+# All mutable state (DB, logs, corrections, JWT secret) lives under DATA_DIR.
+# Wire the logger before anything else imports (auth_routes creates the default
+# admin at import time and its one-time password must land in the log file).
+ensure_data_dirs()
+setup_logger(LOG_DIR)
 
 
 # ==================== Response Models ====================
@@ -36,8 +55,14 @@ from src.utils.config import get_config
 class Finding(BaseModel):
     class_name: str
     confidence: float
-    heatmap_base64: str
-    location: str
+    heatmap_base64: str = ''
+    location: str = ''
+    # API contract v1 — per-finding provenance the desktop panel renders
+    finding: Optional[str] = None       # human-readable label (falls back to class_name)
+    positive: bool = True               # False = detector explicitly did NOT flag
+    status: Optional[str] = None        # validated | pending | experimental
+    detector: Optional[str] = None      # registry / panel detector key
+    sequence_used: Optional[str] = None
 
 
 class AnalysisResponse(BaseModel):
@@ -52,6 +77,33 @@ class AnalysisResponse(BaseModel):
     report_language: Optional[str] = None
     gemma_available: bool = False
     preview_base64: Optional[str] = None  # data-URI PNG of the analyzed slice (for the viewer)
+    # API contract v1 additions (all optional so the legacy /analyze keeps validating)
+    body_part: Optional[str] = None
+    overall_assessment: Optional[dict] = None
+    disclaimer: str = ''
+    model_identity: list[dict] = Field(default_factory=list)
+    threshold: Optional[float] = None
+    requires_review: bool = False
+    rejected: bool = False
+    rejection_reason: Optional[str] = None
+    app_version: str = APP_VERSION
+
+
+class SignRequest(BaseModel):
+    """POST /report/sign — the radiologist signs the final report text."""
+    study_id: str
+    report_text: str
+    language: str = 'ru'
+    ai_draft_text: Optional[str] = None
+
+
+class CorrectionRequest(BaseModel):
+    """POST /report/save_correction — JSON body (was query params)."""
+    study_id: str
+    original_report: str
+    corrected_report: str
+    language: str = 'ru'
+    anon_id: Optional[str] = None
 
 
 class ReportRequest(BaseModel):
@@ -69,13 +121,6 @@ class QuestionRequest(BaseModel):
     findings: list[dict]
     report_text: str
     language: str = 'ru'
-
-
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    device: str
-    uptime_seconds: float
 
 
 # ==================== Global State ====================
@@ -133,12 +178,24 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Sentinel Inference Server...")
     state.start_time = time.time()
 
+    # Mutable state root (DB / logs / corrections / JWT secret). Idempotent —
+    # also done at import so the auth bootstrap is logged to the same file.
+    ensure_data_dirs()
+    setup_logger(LOG_DIR)
+    logger.info(f"Data dir: {DATA_DIR}")
+    if DEV_INSECURE:
+        logger.warning("SENTINEL_DEV_INSECURE=1 — auth relaxed, OpenAPI docs exposed. NOT for a clinic.")
+
     # ===== License check =====
-    # In dev mode (env DEV_BYPASS_LICENSE=1) we skip this.
-    # In production, an invalid license blocks all /analyze endpoints.
+    # DEV_BYPASS_LICENSE=1 skips the check, but ONLY together with
+    # SENTINEL_DEV_INSECURE=1 — a production box can never be unlocked by a
+    # stray env var. Otherwise an invalid license drops to demo-limited mode.
+    bypass_license = DEV_INSECURE and os.environ.get('DEV_BYPASS_LICENSE') == '1'
+    if os.environ.get('DEV_BYPASS_LICENSE') == '1' and not DEV_INSECURE:
+        logger.warning("DEV_BYPASS_LICENSE ignored: requires SENTINEL_DEV_INSECURE=1")
     state.license_valid = True
     state.license_info = {'mode': 'dev', 'reason': 'license check bypassed'}
-    if os.environ.get('DEV_BYPASS_LICENSE') != '1':
+    if not bypass_license:
         try:
             from src.utils.license import load_and_verify_local_license
             result = load_and_verify_local_license()
@@ -245,6 +302,22 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(f"No model checkpoint found at {checkpoint_path}. Server running in demo mode.")
 
+    # Warm the brain panel so /health can report real load status (and the
+    # first study of the day is not the one that pays the load cost). The
+    # local triage model is the product's only validated detector — /health
+    # reports 'degraded' without it. SENTINEL_SKIP_WARMUP=1 skips (tests/CLI).
+    if os.environ.get('SENTINEL_SKIP_WARMUP') != '1':
+        from src.inference.model_registry import get_model as _get_model
+        for _key in ('brain_triage', 'brain_tumor_class'):
+            try:
+                _entry = _get_model(_key, device=str(state.device))
+                if _entry and _entry.get('available'):
+                    logger.info(f"Warmed model '{_key}'")
+                else:
+                    logger.warning(f"Model '{_key}' not available: {(_entry or {}).get('reason', '')}")
+            except Exception as e:
+                logger.warning(f"Model '{_key}' warm-up failed: {e}")
+
     # Load Gemma 3 report engine — auto-detects best available backend
     # (ollama → google_ai → templates)
     try:
@@ -299,11 +372,16 @@ async def lifespan(app: FastAPI):
 
 # ==================== FastAPI App ====================
 
+# OpenAPI docs are a reconnaissance aid on a clinic network — only exposed in
+# SENTINEL_DEV_INSECURE=1 development mode.
 app = FastAPI(
     title="Sentinel Medical AI — Inference Server",
     description="Local AI analysis for medical DICOM images",
-    version="1.0.0",
+    version=APP_VERSION,
     lifespan=lifespan,
+    docs_url="/docs" if DEV_INSECURE else None,
+    redoc_url="/redoc" if DEV_INSECURE else None,
+    openapi_url="/openapi.json" if DEV_INSECURE else None,
 )
 
 # CORS: locked down by default. The Electron app uses file:// (Origin: null)
@@ -332,15 +410,59 @@ from fastapi import Depends, Request
 app.include_router(auth_router)
 
 
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Check server health and model status."""
-    return HealthResponse(
-        status="ok",
-        model_loaded=state.model is not None,
-        device=str(state.device),
-        uptime_seconds=round(time.time() - state.start_time, 1),
-    )
+def _probe_llm() -> dict:
+    """{backend, reachable} for /health. Ollama is probed live (1 s timeout) so
+    the status bar reflects the daemon actually being up, not the startup
+    snapshot. 'template' means reports come from deterministic templates —
+    no LLM is reachable, which is what we report."""
+    engine = state.gemma_engine
+    backend = getattr(engine, 'backend', None) if engine is not None else None
+    reachable = False
+    if backend == 'ollama':
+        try:
+            import requests
+            resp = requests.get(f"{engine.ollama_url}/api/tags", timeout=1)
+            reachable = resp.status_code == 200
+        except Exception:
+            reachable = False
+    elif backend == 'google_ai':
+        reachable = True
+    elif backend == 'transformers':
+        reachable = getattr(engine, '_model', None) is not None
+    return {'backend': backend, 'reachable': reachable}
+
+
+@app.get("/health")
+def health_check():
+    """Public health/contract endpoint (API contract v1 — polled by the desktop app).
+
+    status: 'ok' | 'degraded' (validated brain triage model not loaded) | 'error'.
+    Sync (threadpool) on purpose: the Ollama probe must not block the event loop.
+    """
+    from src.inference.model_registry import get_loaded_status
+
+    models = get_loaded_status(['brain_triage', 'brain_tumor_class', 'chest'])
+    # The registry 'chest' model loads lazily on the first chest study; the
+    # legacy DenseNet/XRV checkpoint (POST /analyze) counts as a loaded chest model.
+    if not models['chest']['loaded'] and state.model is not None:
+        models['chest'] = {
+            'loaded': True,
+            'reason': 'legacy checkpoint (' + ('torchxrayvision' if state.is_xrv else 'densenet121') + ')',
+        }
+    status = 'ok' if models['brain_triage']['loaded'] else 'degraded'
+    return {
+        'status': status,
+        'version': APP_VERSION,
+        'device': str(state.device) if state.device is not None else None,
+        'auth_required': REQUIRE_AUTH,
+        'models': models,
+        'llm': _probe_llm(),
+        'license': {'mode': state.license_info.get('mode')},
+        'data_dir': str(DATA_DIR),
+        # legacy fields (scripts/production_smoke_test.py, start.sh)
+        'model_loaded': state.model is not None,
+        'uptime_seconds': round(time.time() - state.start_time, 1),
+    }
 
 
 @app.get("/orthanc/status")
@@ -430,6 +552,17 @@ async def analyze_dicom(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read DICOM file: {e}")
 
+    # The temp file is removed on EVERY exit path (fix: a load/inference error
+    # used to leave a PHI-bearing DICOM behind in the temp dir).
+    try:
+        return await asyncio.to_thread(_analyze_legacy, tmp_path, study_id, start_time, language)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _analyze_legacy(tmp_path: str, study_id: str, start_time: float, language: str) -> AnalysisResponse:
+    """Body of POST /analyze (legacy single-checkpoint DenseNet/XRV path).
+    Blocking — runs in a worker thread so /health keeps answering."""
     # Load DICOM
     study = load_dicom(tmp_path)
     if study is None:
@@ -550,9 +683,6 @@ async def analyze_dicom(
         except Exception as e:
             logger.warning(f"Training data collection failed: {e}")
 
-    # Clean up temp file
-    Path(tmp_path).unlink(missing_ok=True)
-
     return AnalysisResponse(
         study_id=study_id,
         modality=study.modality,
@@ -564,6 +694,8 @@ async def analyze_dicom(
         report_text=report_text,
         report_language=language,
         gemma_available=gemma_available,
+        body_part=study.body_part,
+        disclaimer=_localized_disclaimer(language),
     )
 
 
@@ -635,10 +767,11 @@ async def analyze_brain_panel(
     tmp_dir = Path(tempfile.mkdtemp(prefix=f'sentinel_brain_{study_id}_'))
     try:
         file_paths = []
-        for f in files:
+        for i, f in enumerate(files):
             content = await f.read()
-            fp = tmp_dir / (f.filename or f"slice_{len(file_paths)}.dcm")
-            fp.parent.mkdir(parents=True, exist_ok=True)
+            # Server-chosen name: the client filename is never used on disk
+            # (fix: '../../x.dcm' could escape the temp dir).
+            fp = tmp_dir / f'{i:04d}.dcm'
             with open(fp, 'wb') as out:
                 out.write(content)
             file_paths.append(fp)
@@ -646,6 +779,13 @@ async def analyze_brain_panel(
         with state.inference_lock:
             result = analyze_brain_study(file_paths, device=str(state.device),
                                          include_experimental=include_experimental)
+        # Unreadable input is a client error, not a 200 with an 'error' field
+        # (same contract as /analyze/study).
+        if result.get('error'):
+            raise HTTPException(status_code=400, detail=result['error'])
+        # The panel hands back the routed slice as a numpy array — encode it
+        # for the viewer (it is not JSON-serialisable as-is).
+        result['preview_base64'] = _encode_preview(result.pop('_preview_slice', None))
         result['study_id'] = study_id
         result['inference_time_ms'] = int((time.time() - start_time) * 1000)
         _audit(user, 'analyze_brain', 'study', study_id,
@@ -689,9 +829,10 @@ async def analyze_3d_brain(
     tmp_dir = Path(tempfile.mkdtemp(prefix=f'sentinel_3d_{study_id}_'))
     file_paths = []
     try:
-        for f in files:
+        for i, f in enumerate(files):
             content = await f.read()
-            fp = tmp_dir / f.filename
+            # Server-chosen name — never the client filename (path traversal).
+            fp = tmp_dir / f'{i:04d}.dcm'
             with open(fp, 'wb') as out:
                 out.write(content)
             file_paths.append(fp)
@@ -818,50 +959,62 @@ async def analyze_3d_brain(
 
 
 @app.post("/report/save_correction")
-async def save_doctor_correction(
-    study_id: str,
-    original_report: str,
-    corrected_report: str,
-    language: str = "ru",
-    anon_id: Optional[str] = None,
+def save_doctor_correction(
+    req: CorrectionRequest,
+    request: Request,
     user: dict = Depends(clinical_auth("edit_report")),
 ):
-    """Save doctor's correction — feeds into training data collector + local log.
-    The doctor_id now comes from the AUTHENTICATED user, not a client-supplied
-    string (fix: was non-attributable self-asserted doctor_id)."""
-    doctor_id = user.get("sub", "unknown")
-    from pathlib import Path
-    import json
+    """Save the radiologist's edit of the AI draft (JSON body — API contract v1).
 
-    # Save to local corrections log
-    corrections_dir = Path("data/doctor_corrections")
-    corrections_dir.mkdir(parents=True, exist_ok=True)
-    correction = {
-        "study_id": study_id,
-        "doctor_id": doctor_id,
-        "language": language,
-        "original_report": original_report,
-        "corrected_report": corrected_report,
-        "timestamp": datetime.now().isoformat(),
-    }
-    with open(corrections_dir / f"corrections_{language}.jsonl", "a") as f:
-        f.write(json.dumps(correction, ensure_ascii=False) + "\n")
+    Persisted in the corrections table + an append-only JSONL under DATA_DIR
+    (fine-tuning corpus export). The doctor_id comes from the AUTHENTICATED
+    user, not a client-supplied string."""
+    from src.inference.auth_routes import db
+
+    doctor_id = user.get("sub", "unknown")
+    language = _norm_language(req.language)
+    correction_id = db.save_correction(
+        study_id=req.study_id,
+        doctor_id=doctor_id,
+        original_report=req.original_report,
+        corrected_report=req.corrected_report,
+        language=language,
+    )
+
+    # Local corrections log (DATA_DIR, never the repo checkout)
+    try:
+        CORRECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        correction = {
+            "correction_id": correction_id,
+            "study_id": req.study_id,
+            "doctor_id": doctor_id,
+            "language": language,
+            "original_report": req.original_report,
+            "corrected_report": req.corrected_report,
+            "timestamp": datetime.now().isoformat(),
+        }
+        with open(CORRECTIONS_DIR / f"corrections_{language}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(correction, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Corrections log write failed: {e}")
 
     # Also feed to training corpus
-    if state.data_collector is not None and anon_id:
+    if state.data_collector is not None and req.anon_id:
         try:
             state.data_collector.record_correction(
-                study_id=study_id,
-                anon_id=anon_id,
-                ai_report=original_report,
-                doctor_report=corrected_report,
+                study_id=req.study_id,
+                anon_id=req.anon_id,
+                ai_report=req.original_report,
+                doctor_report=req.corrected_report,
                 language=language,
                 doctor_id=doctor_id,
             )
         except Exception as e:
             logger.warning(f"Training corpus recording failed: {e}")
 
-    return {"status": "saved", "correction_id": study_id}
+    _audit(user, "save_correction", "study", req.study_id,
+           details=f"correction={correction_id}; lang={language}", request=request)
+    return {"status": "saved", "correction_id": correction_id}
 
 
 @app.get("/corpus/stats")
@@ -881,6 +1034,243 @@ async def models_available():
     return {"models": get_availability()}
 
 
+# ==================== Shared routing / inference helpers ====================
+
+_LANGUAGES = ('ru', 'uz', 'en')
+
+# There is NO "normal" model in the product: an empty finding list means the
+# panel did not fire, never that the study is normal.
+_NOT_NORMAL_IMPRESSION = (
+    'No finding flagged by the panel — NOT a normal read; full radiologist review required'
+)
+
+# Class names that are a detector's explicit "did not flag" output.
+_NEGATIVE_CLASSES = {'no_tumor', 'notumor', 'normal', 'no_finding', 'no finding', 'non_demented'}
+
+_BRAIN_BODY_TOKENS = ('BRAIN', 'HEAD', 'SKULL')
+
+_DISCLAIMERS = {
+    'en': (
+        'AI triage assistant. It flags only the listed finding types and CANNOT certify a '
+        'study as normal. Findings marked "pending" are not validated on this clinic\'s '
+        'population; "experimental" findings are screening hints only. Every study is read '
+        'and signed by a radiologist.'
+    ),
+    'ru': (
+        'ИИ-ассистент для триажа. Отмечает только перечисленные типы находок и НЕ МОЖЕТ '
+        'подтвердить норму. Находки со статусом «pending» не валидированы на популяции '
+        'данной клиники; «experimental» — только скрининговые подсказки. Каждое '
+        'исследование описывает и подписывает врач-рентгенолог.'
+    ),
+    'uz': (
+        'Sun’iy intellekt triaj yordamchisi. Faqat ro‘yxatdagi topilma turlarini belgilaydi '
+        'va tekshiruvni NORMA deb tasdiqlay OLMAYDI. «pending» holatidagi topilmalar ushbu '
+        'klinika populyatsiyasida tekshirilmagan; «experimental» — faqat skrining ishorasi. '
+        'Har bir tekshiruvni rentgenolog shifokor o‘qiydi va imzolaydi.'
+    ),
+}
+
+
+class _NeedsReview(Exception):
+    """No honest model match — the study goes to the radiologist without AI (HTTP 422)."""
+
+
+def _norm_language(language: Optional[str]) -> str:
+    return language if language in _LANGUAGES else 'ru'
+
+
+def _localized_disclaimer(language: str) -> str:
+    return _DISCLAIMERS.get(language, _DISCLAIMERS['en'])
+
+
+def _encode_preview(img: Optional[np.ndarray], max_side: int = 512) -> Optional[str]:
+    """Encode a [0,1] float slice as a PNG data-URI for the viewer. This is the
+    ACTUAL image the model saw (or the routed classifier slice), never a
+    placeholder. Downscaled to `max_side` to keep the JSON payload small."""
+    if img is None:
+        return None
+    try:
+        from PIL import Image
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim != 2 or arr.size == 0:
+            return None
+        pil = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8)).convert("L")
+        if max(pil.size) > max_side:
+            pil.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        logger.warning(f"preview encode failed: {e}")
+        return None
+
+
+def _preview_from_file(path: Optional[Path]) -> Optional[str]:
+    """Preview of a single DICOM (fallback when the panel produced no slice)."""
+    if path is None:
+        return None
+    try:
+        study = load_dicom(path)
+        if study is None:
+            return None
+        return _encode_preview(preprocess_study(study, target_size=512))
+    except Exception as e:
+        logger.warning(f"fallback preview failed: {e}")
+        return None
+
+
+def _match_registry_card(modality: str, body_part: str, texts=()) -> Optional[str]:
+    """Strict routing for NON-brain single-file models: a registry card matches
+    only when BOTH its modality tags and its body-part tags hit (BodyPartExamined,
+    or the study/series/protocol description text). Brain cards, 3D models and
+    non-classifier backends are excluded. None = no honest match → HTTP 422.
+    (detect_modality_from_dicom always falls back to 'chest'; a spine X-ray must
+    never be scored by the chest model.)"""
+    from src.inference.model_registry import REGISTRY
+
+    modality_u = (modality or '').upper().strip()
+    body_u = (body_part or '').upper().strip()
+    text_u = ' | '.join(t for t in texts if t).upper()
+    best_key, best_score = None, 0
+    for key, card in REGISTRY.items():
+        if key.startswith('brain_') or card.is_3d or card.backend not in ('xrv', 'huggingface'):
+            continue
+        if not modality_u or not any(m in modality_u for m in card.modality_dicom_tags):
+            continue
+        in_body = any(b in body_u for b in card.body_part_dicom_tags)
+        in_text = any(b in text_u for b in card.body_part_dicom_tags)
+        if not (in_body or in_text):
+            continue
+        score = (3 if in_body else 2) + (1 if card.tier == 'production' else 0)
+        if score > best_score:
+            best_key, best_score = key, score
+    return best_key
+
+
+def _route_single_file(modality: str, body_part: str, texts=()) -> Optional[str]:
+    """Registry key for one DICOM. Brain MR/CT keep the registry's own routing
+    (brain_tumor_class / head_ct); everything else goes through the strict
+    matcher and may return None."""
+    from src.inference.model_registry import detect_modality_from_dicom
+
+    modality_u = (modality or '').upper()
+    body_u = (body_part or '').upper()
+    is_brain = any(b in body_u for b in _BRAIN_BODY_TOKENS)
+    if is_brain and (any(m in modality_u for m in ('MR', 'MRI')) or 'CT' in modality_u):
+        return detect_modality_from_dicom(modality, body_part)
+    return _match_registry_card(modality, body_part, texts)
+
+
+def _generate_report(findings: list[dict], language: str, modality: str,
+                     body_part: str, study_date: str = '') -> tuple[Optional[str], bool]:
+    """(report_text, engine_used). Patient identifiers are never passed to the
+    engine (PHI minimisation — the prompt may reach an Ollama host)."""
+    if state.gemma_engine is None:
+        return None, False
+    try:
+        text = state.gemma_engine.generate(
+            findings=[
+                {'class_name': f.get('class_name'), 'confidence': f.get('confidence'),
+                 'location': f.get('location', ''), 'positive': f.get('positive'),
+                 'status': f.get('status'), 'detector': f.get('detector')}
+                for f in findings
+            ],
+            language=language,
+            patient_info=None,
+            modality=modality,
+            body_part=body_part,
+            study_date=study_date or '',
+        )
+        return (text or None), bool(text)
+    except Exception as e:
+        logger.warning(f"Report generation failed: {e}")
+        return None, False
+
+
+def _run_registry_model(study: DicomStudy, modality_key: str, language: str) -> dict:
+    """Core of the single-file registry path — shared by /analyze/auto and the
+    non-brain branch of /analyze/study. Blocking: call from a worker thread.
+    Never declares a study normal."""
+    from src.inference.model_registry import get_model, get_model_identity
+
+    model_entry = get_model(modality_key, device=str(state.device))
+    if model_entry is None or not model_entry['available']:
+        reason = (model_entry or {}).get('reason', 'model not registered')
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model for '{modality_key}' not available: {reason}",
+        )
+    card = model_entry['card']
+    predictor = model_entry['predictor']
+
+    # Preprocess to the model's input size; the preview is exactly what it saw.
+    processed_image = preprocess_study(study, target_size=card.input_size[0])
+    preview_base64 = _encode_preview(processed_image)
+
+    with state.inference_lock:
+        raw_probs = predictor(processed_image)
+    raw_probs = {str(k): float(v) for k, v in raw_probs.items() if not str(k).startswith('_')}
+
+    threshold = float(state.config.get("inference", {}).get("confidence_threshold", 0.5))
+    # Softmax (HF single-label) models: top-3 above 0.15; multi-label: threshold.
+    is_softmax = abs(sum(raw_probs.values()) - 1.0) < 0.05
+    localized = card.classes_localized or {}
+
+    def _finding(cls: str, prob: float, location: str) -> dict:
+        return {
+            'class_name': cls,
+            'finding': (localized.get(cls) or {}).get(language) or cls,
+            'confidence': round(prob, 4),
+            'positive': cls.lower() not in _NEGATIVE_CLASSES,
+            'status': card.validation_status,
+            'detector': modality_key,
+            'sequence_used': None,
+            'heatmap_base64': '',
+            'location': location,
+        }
+
+    findings = []
+    if is_softmax:
+        for cls, prob in sorted(raw_probs.items(), key=lambda x: -x[1])[:3]:
+            if prob >= 0.15:
+                findings.append(_finding(cls, prob, 'Central region'))
+    else:
+        for cls, prob in raw_probs.items():
+            if prob >= threshold:
+                findings.append(_finding(cls, prob, 'Region of interest'))
+    findings.sort(key=lambda f: (not f['positive'], -f['confidence']))
+
+    positives = [f for f in findings if f['positive']]
+    if positives:
+        impression = "Findings suggestive of: " + ", ".join(
+            f"{f['class_name']} ({f['confidence']:.0%})" for f in positives[:3]
+        )
+    else:
+        impression = _NOT_NORMAL_IMPRESSION
+    overall_assessment = {
+        'abnormal_flagged': bool(positives),
+        'flags': [f['finding'] for f in positives],
+        'text': impression,
+    }
+
+    report_text, engine_used = _generate_report(
+        findings, language, modality=study.modality,
+        body_part=study.body_part or card.display_name, study_date=study.study_date,
+    )
+    identity = get_model_identity(modality_key)
+    return {
+        'findings': findings,
+        'impression': impression,
+        'overall_assessment': overall_assessment,
+        'preview_base64': preview_base64,
+        'report_text': report_text,
+        'gemma_available': engine_used,
+        'card': card,
+        'threshold': threshold,
+        'model_identity': [identity] if identity else [],
+    }
+
+
 @app.post("/analyze/auto", response_model=AnalysisResponse)
 async def analyze_auto(
     file: UploadFile = File(...),
@@ -889,16 +1279,16 @@ async def analyze_auto(
     request: Request = None,
     user: dict = Depends(clinical_auth("analyze")),
 ):
-    """Multi-modality analysis. Auto-detects modality from DICOM tags
-    (chest, brain_2d, head_ct, mammography) and routes to the right model.
-
-    Pass `force_modality=brain_2d` etc. to override auto-detection.
+    """Single-file multi-modality analysis. Routes by DICOM tags (brain MR/CT,
+    chest, head_ct, mammography, …). Pass `force_modality=brain_2d` etc. to
+    override. Returns 422 {requires_review} when no registered model honestly
+    matches the modality + body part — the study then goes to the radiologist
+    without an AI read. Never returns normal=true.
     """
-    from src.inference.model_registry import (
-        detect_modality_from_dicom, get_model, REGISTRY,
-    )
+    from src.inference.model_registry import REGISTRY
 
     _enforce_license_or_demo_limit()
+    language = _norm_language(language)
 
     start_time = time.time()
     study_id = str(uuid.uuid4())[:8]
@@ -912,126 +1302,44 @@ async def analyze_auto(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
 
-    # Load DICOM (handles non-DICOM gracefully)
-    study = load_dicom(tmp_path)
-    if study is None:
-        Path(tmp_path).unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="Invalid or corrupt DICOM file")
-
-    # Decide which model to use
-    if force_modality and force_modality in REGISTRY:
-        modality_key = force_modality
-    else:
-        modality_key = detect_modality_from_dicom(study.modality, study.body_part)
-
-    logger.info(
-        f"Auto-routing study {study_id}: modality={study.modality}, "
-        f"body_part={study.body_part} → model='{modality_key}'"
-    )
-
-    model_entry = get_model(modality_key, device=str(state.device))
-    if model_entry is None or not model_entry['available']:
-        Path(tmp_path).unlink(missing_ok=True)
-        reason = (model_entry or {}).get('reason', 'model not registered')
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model for '{modality_key}' not available: {reason}",
-        )
-
-    card = model_entry['card']
-    predictor = model_entry['predictor']
-
-    # Preprocess to model's input size
-    target_size = card.input_size[0]
-    processed_image = preprocess_study(study, target_size=target_size)
-
-    # Encode the ACTUAL analyzed slice as a PNG data-URI so the viewer shows
-    # the real scan (not a placeholder). This is exactly the image the model saw.
-    preview_base64 = None
     try:
-        import io as _io, base64 as _b64
-        from PIL import Image as _Image
-        _img8 = (np.clip(processed_image, 0, 1) * 255).astype(np.uint8)
-        _buf = _io.BytesIO()
-        _Image.fromarray(_img8).convert("L").save(_buf, format="PNG")
-        preview_base64 = "data:image/png;base64," + _b64.b64encode(_buf.getvalue()).decode()
-    except Exception as _e:
-        logger.warning(f"preview encode failed: {_e}")
+        # Load DICOM (handles non-DICOM gracefully)
+        study = load_dicom(tmp_path)
+        if study is None:
+            raise HTTPException(status_code=400, detail="Invalid or corrupt DICOM file")
 
-    # Run prediction (returns dict[class_name -> prob])
-    raw_probs = predictor(processed_image)
-
-    # Build findings — keep only above-threshold (using card-specific threshold)
-    threshold = state.config.get("inference", {}).get("confidence_threshold", 0.5)
-    # For softmax-based models (HF), keep top-3 instead of thresholding
-    is_softmax = abs(sum(raw_probs.values()) - 1.0) < 0.05
-
-    findings = []
-    if is_softmax:
-        # Single-class prediction — top class with conf >0.4
-        sorted_items = sorted(raw_probs.items(), key=lambda x: -x[1])
-        for cls, prob in sorted_items[:3]:
-            if prob >= 0.15:
-                findings.append(Finding(
-                    class_name=cls,
-                    confidence=round(float(prob), 4),
-                    heatmap_base64='',
-                    location='Central region',
-                ))
-    else:
-        # Multi-label
-        for cls, prob in raw_probs.items():
-            if prob >= threshold:
-                findings.append(Finding(
-                    class_name=cls,
-                    confidence=round(float(prob), 4),
-                    heatmap_base64='',
-                    location='Region of interest',
-                ))
-
-    findings.sort(key=lambda f: f.confidence, reverse=True)
-
-    # Overall impression
-    is_normal = (len(findings) == 0) or any(
-        f.class_name.lower() in ('no_tumor', 'normal', 'no_finding') for f in findings[:1]
-    )
-    if is_normal:
-        impression = "No significant pathological findings detected."
-    else:
-        top = ", ".join(f"{f.class_name} ({f.confidence:.0%})" for f in findings[:3])
-        impression = f"Findings suggestive of: {top}"
-
-    # Generate report via Gemma
-    report_text = None
-    gemma_available = False
-    if state.gemma_engine is not None:
-        try:
-            findings_dicts = [
-                {'class_name': f.class_name, 'confidence': f.confidence, 'location': f.location}
-                for f in findings
-            ]
-            report_text = state.gemma_engine.generate(
-                findings=findings_dicts,
-                language=language,
-                patient_info={
-                    'id': study.patient_id or 'ANON',
-                    'age': study.patient_age or 'N/A',
-                    'sex': study.patient_sex or 'N/A',
-                },
-                modality=study.modality,
-                body_part=study.body_part or card.display_name,
-                study_date=study.study_date,
+        # Decide which model to use
+        if force_modality and force_modality in REGISTRY:
+            modality_key = force_modality
+        else:
+            modality_key = _route_single_file(
+                study.modality, study.body_part,
+                (study.study_description, study.series_description),
             )
-            gemma_available = True
-        except Exception as e:
-            logger.warning(f"Gemma report failed: {e}")
+        if modality_key is None:
+            reason = (
+                f"No registered model for modality '{study.modality}' / body part "
+                f"'{study.body_part}' — study routed to radiologist review without AI analysis"
+            )
+            _audit(user, "analyze", "study", study_id,
+                   details=f"model=none; requires_review; lang={language}", request=request)
+            return JSONResponse(status_code=422, content={
+                'detail': reason, 'requires_review': True, 'reason': reason,
+                'study_id': study_id, 'modality': study.modality, 'body_part': study.body_part,
+            })
+
+        logger.info(
+            f"Auto-routing study {study_id}: modality={study.modality}, "
+            f"body_part={study.body_part} → model='{modality_key}'"
+        )
+        run = await asyncio.to_thread(_run_registry_model, study, modality_key, language)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
     inference_time_ms = int((time.time() - start_time) * 1000)
 
-    Path(tmp_path).unlink(missing_ok=True)
-
     # Audit: who ran which model on which study, and the top finding.
-    top = findings[0].class_name if findings else "none"
+    top = run['findings'][0]['class_name'] if run['findings'] else "none"
     _audit(user, "analyze", "study", study_id,
            details=f"model={modality_key}; top={top}; lang={language}",
            request=request)
@@ -1040,15 +1348,501 @@ async def analyze_auto(
         study_id=study_id,
         modality=f"{study.modality}/{modality_key}",
         inference_time_ms=inference_time_ms,
-        findings=findings,
-        overall_impression=impression,
-        normal=is_normal,
-        model_version=f"{card.display_name}",
-        report_text=report_text,
+        findings=[Finding(**f) for f in run['findings']],
+        overall_impression=run['impression'],
+        normal=False,
+        model_version=f"{run['card'].display_name}",
+        report_text=run['report_text'],
         report_language=language,
-        gemma_available=gemma_available,
-        preview_base64=preview_base64,
+        gemma_available=run['gemma_available'],
+        preview_base64=run['preview_base64'],
+        body_part=study.body_part,
+        overall_assessment=run['overall_assessment'],
+        disclaimer=_localized_disclaimer(language),
+        model_identity=run['model_identity'],
+        threshold=run['threshold'],
     )
+
+
+# ==================== Whole-study analysis (API contract v1) ====================
+
+_HEADER_FIELDS = (
+    ('PatientID', 'patient_id'),
+    ('PatientName', 'patient_name'),
+    ('PatientSex', 'patient_sex'),
+    ('PatientAge', 'patient_age'),
+    ('PatientBirthDate', 'patient_birth_date'),
+    ('StudyDate', 'study_date'),
+    ('StudyDescription', 'study_description'),
+    ('AccessionNumber', 'accession_number'),
+    ('StudyInstanceUID', 'study_instance_uid'),
+    ('Modality', 'modality'),
+    ('BodyPartExamined', 'body_part'),
+    ('Manufacturer', 'manufacturer'),
+    ('ManufacturerModelName', 'scanner_model'),
+)
+
+_STUDY_HEADER_KEYS = (
+    'study_instance_uid', 'accession_number', 'patient_id', 'patient_name', 'patient_sex',
+    'patient_age', 'patient_birth_date', 'study_date', 'study_description',
+    'manufacturer', 'scanner_model',
+)
+
+
+def _tag(ds, name: str) -> str:
+    try:
+        v = ds.get(name)
+    except Exception:
+        return ''
+    return '' if v is None else str(v).strip()
+
+
+def _read_study_headers(file_paths: list[Path]) -> Optional[dict]:
+    """Header-only pass (stop_before_pixels) over the uploaded files.
+
+    Patient/study fields come from the first readable DICOM; SeriesDescription
+    and ProtocolName are collected unique across all files (upload order).
+    'best_path' is the largest image (Rows×Columns) — the single-file fallback.
+    Returns None when nothing parses as DICOM."""
+    hdr = None
+    series, protocols = [], []
+    best_path, best_px = None, -1
+    for p in file_paths:
+        try:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
+        except Exception:
+            continue
+        # force=True parses almost anything — require a real DICOM signal
+        if not (_tag(ds, 'SOPClassUID') or _tag(ds, 'Modality')):
+            continue
+        if hdr is None:
+            hdr = {out: _tag(ds, tag) for tag, out in _HEADER_FIELDS}
+            hdr['readable'] = 0
+        hdr['readable'] += 1
+        sd = _tag(ds, 'SeriesDescription')
+        if sd and sd not in series:
+            series.append(sd)
+        pn = _tag(ds, 'ProtocolName')
+        if pn and pn not in protocols:
+            protocols.append(pn)
+        try:
+            px = int(ds.get('Rows') or 0) * int(ds.get('Columns') or 0)
+        except Exception:
+            px = 0
+        if px > best_px:
+            best_path, best_px = p, px
+    if hdr is None:
+        return None
+    hdr['series_descriptions'] = series
+    hdr['protocol_names'] = protocols
+    hdr['best_path'] = best_path
+    return hdr
+
+
+def _is_brain_mr(hdr: dict) -> bool:
+    """MR + brain by BodyPartExamined, else by brain/non-brain tokens in the
+    study, series and protocol descriptions (the panel gates again per series)."""
+    from src.pipeline.brain_mri_preprocessor import is_brain_text
+
+    modality_u = (hdr.get('modality') or '').upper()
+    if not any(m in modality_u for m in ('MR', 'MRI')):
+        return False
+    if any(b in (hdr.get('body_part') or '').upper() for b in _BRAIN_BODY_TOKENS):
+        return True
+    study_verdict = is_brain_text(hdr.get('study_description') or '')
+    if study_verdict is True:
+        return True
+    if study_verdict is False:
+        return False
+    texts = list(hdr.get('series_descriptions') or []) + list(hdr.get('protocol_names') or [])
+    return any(is_brain_text(t) is True for t in texts)
+
+
+def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
+                        study_id: str) -> dict:
+    """Blocking core of POST /analyze/study (runs in a worker thread).
+
+    Brain MR → the detector panel (validated triage + pending tumor class).
+    Anything else → strict single-file registry routing, or _NeedsReview."""
+    from src.inference.brain_analysis import analyze_brain_study, DETECTORS
+    from src.inference.model_registry import get_model_identity
+
+    resp = {
+        'study_id': study_id,
+        **{k: (hdr.get(k) or None) for k in _STUDY_HEADER_KEYS},
+        'modality': hdr.get('modality') or 'UNKNOWN',
+        'body_part': hdr.get('body_part') or '',
+        'num_files': len(file_paths),
+        'series_descriptions': list(hdr.get('series_descriptions') or []),
+        'rejected': False,
+        'requires_review': False,
+        'rejection_reason': None,
+        'findings': [],
+        'detectors_run': [],
+        'model_identity': [],
+        'overall_assessment': None,
+        'overall_impression': '',
+        'normal': False,                       # the product never certifies normal
+        'disclaimer': _localized_disclaimer(language),
+        'threshold': 0.5,
+        'preview_base64': None,
+        'report_text': None,
+        'report_language': language,
+        'gemma_available': False,
+        'app_version': APP_VERSION,
+    }
+
+    if _is_brain_mr(hdr):
+        with state.inference_lock:
+            result = analyze_brain_study(file_paths, device=str(state.device),
+                                         include_experimental=False)
+        preview_slice = result.pop('_preview_slice', None)
+        if result.get('error'):
+            raise HTTPException(status_code=400, detail=result['error'])
+
+        resp['route'] = 'brain_panel'
+        resp['body_part'] = 'BRAIN'
+        resp['sequences_present'] = result.get('sequences_present', [])
+        if result.get('rejected'):
+            reason = result.get('non_brain_reason') or 'not a brain study'
+            note = result.get('note') or f'Not analyzed by the brain panel: {reason}.'
+            resp.update({
+                'rejected': True,
+                'requires_review': True,
+                'rejection_reason': reason,
+                'overall_assessment': {'abnormal_flagged': False, 'flags': [], 'text': note},
+                'overall_impression': note,
+                'preview_base64': _preview_from_file(hdr.get('best_path')),
+            })
+            return resp
+
+        model_keys = {d.key: d.model_key for d in DETECTORS}
+        # Panel findings already carry status/detector/positive/sequence_used.
+        # The panel does not localise a lesion — location stays empty rather
+        # than a made-up region.
+        findings = [{**f, 'heatmap_base64': '', 'location': ''} for f in result.get('findings', [])]
+        detectors_run = list(result.get('detectors_run', []))
+        identities = [get_model_identity(model_keys[d]) for d in detectors_run if d in model_keys]
+        overall = result.get('overall_assessment') or {
+            'abnormal_flagged': False, 'flags': [], 'text': _NOT_NORMAL_IMPRESSION,
+        }
+        preview = _encode_preview(preview_slice) if preview_slice is not None \
+            else _preview_from_file(hdr.get('best_path'))
+        report_text, engine_used = _generate_report(
+            findings, language, modality='MR', body_part='BRAIN',
+            study_date=hdr.get('study_date') or '',
+        )
+        resp.update({
+            'findings': findings,
+            'detectors_run': detectors_run,
+            'model_identity': [i for i in identities if i],
+            'overall_assessment': overall,
+            'overall_impression': overall.get('text', ''),
+            'preview_base64': preview,
+            'report_text': report_text,
+            'gemma_available': engine_used,
+            'has_brats_quartet': bool(result.get('has_brats_quartet')),
+            'coverage': result.get('coverage', []),
+        })
+        return resp
+
+    # ---- non-brain: strict single-file routing on the best file ----
+    texts = [hdr.get('study_description') or ''] + list(hdr.get('series_descriptions') or []) \
+        + list(hdr.get('protocol_names') or [])
+    modality_key = _match_registry_card(hdr.get('modality'), hdr.get('body_part'), texts)
+    if modality_key is None:
+        raise _NeedsReview(
+            f"No registered model for modality '{hdr.get('modality') or '?'}' / body part "
+            f"'{hdr.get('body_part') or '?'}' — study routed to radiologist review without AI analysis"
+        )
+    study = load_dicom(hdr['best_path']) if hdr.get('best_path') else None
+    if study is None:
+        raise HTTPException(status_code=400, detail='Could not decode pixel data from the uploaded DICOM files')
+
+    run = _run_registry_model(study, modality_key, language)
+    card = run['card']
+    resp.update({
+        'route': modality_key,
+        'body_part': hdr.get('body_part') or (card.body_part_dicom_tags[0] if card.body_part_dicom_tags else ''),
+        'findings': run['findings'],
+        'detectors_run': [modality_key],
+        'model_identity': run['model_identity'],
+        'overall_assessment': run['overall_assessment'],
+        'overall_impression': run['impression'],
+        'preview_base64': run['preview_base64'],
+        'report_text': run['report_text'],
+        'gemma_available': run['gemma_available'],
+        'threshold': run['threshold'],
+    })
+    return resp
+
+
+def _persist_analysis(resp: dict, hdr: dict, user: dict, inference_time_ms: int) -> bool:
+    """studies + ai_results rows for the worklist / GET /study. The preview and
+    heatmaps are not persisted (findings carry heatmap_base64='')."""
+    from src.inference.auth_routes import db
+
+    try:
+        db.create_study(
+            patient_id=hdr.get('patient_id') or '',
+            modality=resp['modality'],
+            body_part=resp.get('body_part') or '',
+            dicom_path='',
+            study_date=hdr.get('study_date') or None,
+            study_id=resp['study_id'],
+            created_by=user.get('sub'),
+            study_instance_uid=hdr.get('study_instance_uid') or None,
+            accession_number=hdr.get('accession_number') or None,
+            patient_name=hdr.get('patient_name') or None,
+            patient_sex=hdr.get('patient_sex') or None,
+            patient_age=hdr.get('patient_age') or None,
+            patient_birth_date=hdr.get('patient_birth_date') or None,
+            study_description=hdr.get('study_description') or None,
+            manufacturer=hdr.get('manufacturer') or None,
+            scanner_model=hdr.get('scanner_model') or None,
+            num_files=resp.get('num_files'),
+            series_descriptions=resp.get('series_descriptions') or [],
+            rejected=resp.get('rejected', False),
+            requires_review=resp.get('requires_review', False),
+        )
+        model_version = ', '.join(
+            m.get('display_name') or m.get('key') or '' for m in resp.get('model_identity') or []
+        ) or str(resp.get('route') or '')
+        db.save_ai_result(
+            study_id=resp['study_id'],
+            findings_json=json.dumps(resp.get('findings') or [], ensure_ascii=False),
+            inference_time_ms=inference_time_ms,
+            model_version=model_version,
+            is_normal=False,
+            overall_impression=resp.get('overall_impression') or '',
+            model_identity_json=json.dumps(resp.get('model_identity') or [], ensure_ascii=False),
+            overall_json=json.dumps(resp.get('overall_assessment'), ensure_ascii=False),
+            threshold=resp.get('threshold'),
+            report_text=resp.get('report_text'),
+            report_language=resp.get('report_language'),
+            app_version=APP_VERSION,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Persisting study {resp['study_id']} failed: {e}")
+        return False
+
+
+@app.post("/analyze/study")
+async def analyze_study(
+    files: list[UploadFile] = File(...),
+    language: str = "ru",
+    request: Request = None,
+    user: dict = Depends(clinical_auth("analyze")),
+):
+    """Whole-study analysis — API contract v1 (POST multipart, repeated `files`).
+
+    The server reads the DICOM headers and routes: brain MR → the detector
+    panel (local validated triage + pending tumor classifier); other
+    modalities → the matching single-file registry model, or 422
+    {requires_review} when no model honestly applies. The response carries the
+    real header fields, per-finding validation status, model provenance
+    (model_identity), a localized disclaimer and the actual analyzed slice.
+    Persisted to the studies/ai_results tables. `normal` is ALWAYS false.
+    """
+    _enforce_license_or_demo_limit()
+    if not files:
+        raise HTTPException(status_code=400, detail="No DICOM files provided")
+    language = _norm_language(language)
+
+    start_time = time.time()
+    study_id = str(uuid.uuid4())
+    tmp_dir = Path(tempfile.mkdtemp(prefix='sentinel_study_'))
+    try:
+        file_paths = []
+        for i, f in enumerate(files):
+            content = await f.read()
+            if not content:
+                continue
+            # Server-chosen name — the client filename never touches the disk.
+            fp = tmp_dir / f'{i:04d}.dcm'
+            fp.write_bytes(content)
+            file_paths.append(fp)
+        if not file_paths:
+            raise HTTPException(status_code=400, detail="Uploaded files are empty")
+
+        hdr = _read_study_headers(file_paths)
+        if hdr is None:
+            raise HTTPException(status_code=400, detail="No readable DICOM file in the upload")
+
+        try:
+            resp = await asyncio.to_thread(_analyze_study_sync, file_paths, hdr, language, study_id)
+        except _NeedsReview as nr:
+            _audit(user, 'analyze_study', 'study', study_id,
+                   details=(f"route=none; requires_review; files={len(file_paths)}; "
+                            f"modality={hdr.get('modality')}; body_part={hdr.get('body_part')}"),
+                   request=request)
+            return JSONResponse(status_code=422, content={
+                'detail': str(nr), 'requires_review': True, 'reason': str(nr),
+                'study_id': study_id, 'modality': hdr.get('modality'),
+                'body_part': hdr.get('body_part'), 'num_files': len(file_paths),
+            })
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    inference_time_ms = int((time.time() - start_time) * 1000)
+    resp['inference_time_ms'] = inference_time_ms
+    resp['persisted'] = _persist_analysis(resp, hdr, user, inference_time_ms)
+
+    _audit(user, 'analyze_study', 'study', study_id,
+           details=(f"route={resp.get('route')}; detectors={resp.get('detectors_run')}; "
+                    f"rejected={resp['rejected']}; files={resp['num_files']}; "
+                    f"lang={language}; {inference_time_ms}ms"),
+           request=request)
+    logger.info(
+        f"Study analysis complete: study={study_id} | route={resp.get('route')} | "
+        f"{len(resp['findings'])} findings | rejected={resp['rejected']} | {inference_time_ms}ms"
+    )
+    return resp
+
+
+# ==================== Signed reports + worklist (API contract v1) ====================
+
+def _study_out(row: dict) -> dict:
+    """DB study row → API row (adds the study_id alias the desktop reads).
+    SQLite's DATE affinity turns a DICOM 'YYYYMMDD' into an integer — keep the
+    contract type-stable (string, DICOM DA form)."""
+    out = dict(row)
+    out['study_id'] = row.get('id')
+    if isinstance(out.get('study_date'), (int, float)):
+        out['study_date'] = str(int(out['study_date']))
+    return out
+
+
+@app.post("/report/sign")
+def sign_report(
+    req: SignRequest,
+    request: Request,
+    user: dict = Depends(clinical_auth("sign_report")),
+):
+    """Sign the final report for (study, language). The signer is the
+    authenticated user; the report text is hashed (sha256) and stored together
+    with the findings + model provenance it was based on. One signed report per
+    study+language — a second attempt returns 409."""
+    from src.inference.auth_routes import db
+    from src.utils.database import ReportAlreadySignedError
+
+    if not (req.report_text or '').strip():
+        raise HTTPException(status_code=400, detail="Report text is empty")
+    language = _norm_language(req.language)
+
+    study = db.get_study(req.study_id)
+    if study is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown study_id — analyze the study on this server before signing",
+        )
+    ai = db.get_ai_result(req.study_id) or {}
+    model_identity = ai.get('model_identity') or []
+    sha = hashlib.sha256(req.report_text.encode('utf-8')).hexdigest()
+
+    try:
+        row = db.create_signed_report(
+            study_id=req.study_id,
+            signer_id=user.get('sub'),
+            report_text=req.report_text,
+            language=language,
+            ai_draft_text=req.ai_draft_text,
+            findings_json=ai.get('findings_json'),
+            model_identity_json=json.dumps(model_identity, ensure_ascii=False),
+            sha256=sha,
+        )
+    except ReportAlreadySignedError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A signed {language.upper()} report already exists for this study (report {e})",
+        )
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=404, detail=f"Cannot sign: {e}")
+
+    signer_row = db.get_user(user.get('sub')) or {}
+    signer = {
+        'id': user.get('sub'),
+        'username': signer_row.get('username') or user.get('username') or '',
+        'full_name': signer_row.get('full_name') or user.get('username') or '',
+    }
+    _audit(user, 'sign_report', 'report', row['report_id'],
+           details=f"study={req.study_id}; lang={language}; sha256={sha[:12]}", request=request)
+    return {
+        'study_id': req.study_id,
+        'report_id': row['report_id'],
+        'language': language,
+        'signed_at': row['signed_at'],
+        'signer': signer,
+        'sha256': sha,
+        'model_identity': model_identity,
+    }
+
+
+@app.get("/study/{study_id}")
+def get_study_detail(
+    study_id: str,
+    request: Request,
+    user: dict = Depends(clinical_auth("view")),
+):
+    """{study, ai_result, reports[]} for one persisted study (worklist restore)."""
+    from src.inference.auth_routes import db
+
+    study = db.get_study(study_id)
+    if study is None:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    ai_row = db.get_ai_result(study_id)
+    ai_result = None
+    if ai_row:
+        overall = ai_row.get('overall_assessment')
+        ai_result = {
+            'result_id': ai_row.get('id'),
+            'study_id': study_id,
+            'findings': ai_row.get('findings') or [],
+            'model_identity': ai_row.get('model_identity') or [],
+            'overall': overall,
+            'overall_assessment': overall,
+            'overall_impression': ai_row.get('overall_impression') or '',
+            'inference_time_ms': ai_row.get('inference_time_ms'),
+            'model_version': ai_row.get('model_version'),
+            'is_normal': False,
+            'threshold': ai_row.get('threshold'),
+            'report_text': ai_row.get('report_text'),
+            'report_language': ai_row.get('report_language'),
+            'disclaimer': _localized_disclaimer(ai_row.get('report_language') or 'ru'),
+            'requires_review': bool(study.get('requires_review')),
+            'rejected': bool(study.get('rejected')),
+            'rejection_reason': (ai_row.get('overall_impression') or None) if study.get('rejected') else None,
+            'app_version': ai_row.get('app_version'),
+            'created_at': ai_row.get('created_at'),
+        }
+
+    reports = []
+    for r in db.get_reports_for_study(study_id):
+        r.pop('findings_json', None)
+        r.pop('model_identity_json', None)
+        r['report_id'] = r.get('id')
+        signer_id = r.get('signer_id') or r.get('doctor_id')
+        r['signer'] = {
+            'id': signer_id,
+            'username': r.get('signer_username') or '',
+            'full_name': r.get('signer_full_name') or r.get('signer_username') or signer_id or '',
+        } if signer_id else None
+        reports.append(r)
+
+    _audit(user, 'view_study', 'study', study_id, request=request)
+    return {'study': _study_out(study), 'ai_result': ai_result, 'reports': reports}
+
+
+@app.get("/studies")
+def list_studies(limit: int = 100, user: dict = Depends(clinical_auth("view"))):
+    """Newest-first persisted studies with a compact AI summary + signed
+    languages — what the desktop worklist restores after a restart."""
+    from src.inference.auth_routes import db
+
+    limit = max(1, min(int(limit), 500))
+    return [_study_out(s) for s in db.list_studies(limit=limit)]
 
 
 def _estimate_location(heatmap: np.ndarray) -> str:

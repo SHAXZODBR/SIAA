@@ -7,13 +7,14 @@ from pydantic import BaseModel
 from typing import Optional
 from loguru import logger
 
-from src.utils.auth import AuthManager, verify_token, check_permission
+from src.utils.auth import (
+    AuthManager, verify_token, check_permission, REQUIRE_AUTH, DEV_INSECURE,
+)
 from src.utils.database import SentinelDB
 
-# When SENTINEL_REQUIRE_AUTH=1 (production), all clinical endpoints enforce a
-# valid Bearer token + role permission. In dev/demo it's permissive so the
-# desktop app works without login wiring. PRODUCTION MUST SET THIS TO 1.
-REQUIRE_AUTH = os.environ.get("SENTINEL_REQUIRE_AUTH") == "1"
+# Auth is REQUIRED BY DEFAULT (REQUIRE_AUTH=True). Only SENTINEL_DEV_INSECURE=1
+# relaxes it for local development; SENTINEL_REQUIRE_AUTH=1 forces it back on.
+# The flags live in src.utils.auth so server.py can gate docs/license on them.
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
@@ -58,18 +59,19 @@ def require_admin(user: dict = Depends(get_current_user)) -> dict:
 
 
 def clinical_auth(action: str = "analyze"):
-    """Endpoint guard for clinical routes. Enforces auth+RBAC in production
-    (SENTINEL_REQUIRE_AUTH=1); permissive (returns an anonymous principal) in
-    dev so the demo keeps working. Returns the user dict either way."""
+    """Endpoint guard for clinical routes. Enforces auth+RBAC by default;
+    permissive (returns an anonymous admin principal) ONLY when
+    SENTINEL_DEV_INSECURE=1 and SENTINEL_REQUIRE_AUTH is not forcing it on.
+    Returns the user dict either way."""
     def _dep(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> dict:
-        if not REQUIRE_AUTH:
-            # Dev/demo mode — allow, but tag the principal so audit logs show it.
+        if not REQUIRE_AUTH and DEV_INSECURE:
+            # Dev-insecure mode — allow, but tag the principal so audit logs show it.
             if creds and creds.credentials:
                 payload = verify_token(creds.credentials)
                 if payload:
                     return payload
             return {"sub": "anonymous-dev", "username": "anonymous", "role": "admin"}
-        # Production — strict.
+        # Default — strict.
         if creds is None or not creds.credentials:
             raise HTTPException(status_code=401, detail="Authentication required")
         payload = verify_token(creds.credentials)
@@ -100,15 +102,25 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class LoginUser(BaseModel):
+    id: str
+    username: str
+    full_name: str
+    role: str
+
+
 class LoginResponse(BaseModel):
-    token: str
-    user: dict
+    """API contract v1: {access_token, token_type, user, must_change_password}."""
+    access_token: str
+    token_type: str = "bearer"
+    user: LoginUser
+    must_change_password: bool = False
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 @router.post("/login", response_model=LoginResponse)
 async def login(req: LoginRequest, request: Request):
-    """Authenticate user and return JWT token."""
+    """Authenticate user and return a JWT bearer token."""
     result = auth.login(req.username, req.password)
     if result is None:
         raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -145,7 +157,14 @@ async def change_password(req: ChangePasswordRequest, user: dict = Depends(get_c
 @router.get("/me")
 async def whoami(user: dict = Depends(get_current_user)):
     """Return the current authenticated user."""
-    return {"id": user.get("sub"), "username": user.get("username"), "role": user.get("role")}
+    row = db.get_user(user.get("sub")) or {}
+    return {
+        "id": user.get("sub"),
+        "username": user.get("username"),
+        "full_name": row.get("full_name"),
+        "role": user.get("role"),
+        "must_change_password": bool(row.get("must_change_password") or 0),
+    }
 
 
 @router.get("/users")

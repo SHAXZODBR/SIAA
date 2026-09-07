@@ -1,28 +1,61 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { useAppStore } from '../store/appStore';
-import type { Finding, AIResult, Study } from '../types';
+import React, { useState, useEffect, useMemo } from 'react';
+import { useAppStore, signedKey } from '../store/appStore';
+import type { Finding, AIResult, Study, Lang, ModelIdentity, SignedReport } from '../types';
 import { generateReport, formatFullReport } from '../services/reportGenerator';
-import { downloadPDF, downloadMultiLanguagePDF } from '../services/pdfExport';
-import { regenerateReport } from '../services/api';
-import { DEMO_STUDIES, getDemoResultForStudy } from '../services/demoData';
-import { translateFinding, translateLocation, severityWord, L, UI_LABELS } from '../services/findingTranslations';
+import { downloadPDF, downloadMultiLanguagePDF, sanitizeFilePart } from '../services/pdfExport';
+import type { PDFBaseData, PDFLanguageSection } from '../services/pdfExport';
+import { regenerateReport, signReport, saveReportCorrection, describeApiError } from '../services/api';
+import { DEMO_MODE, DEMO_STUDIES, getDemoResultForStudy } from '../services/demoData';
+import {
+  translateFinding, translateLocation, findingUrgency, urgencyWord, statusWord, L,
+} from '../services/findingTranslations';
+import type { FindingUrgency } from '../services/findingTranslations';
+import { getAppVersion } from '../services/appInfo';
 import AIChat from './AIChat';
+
+const LANGS: Lang[] = ['ru', 'uz', 'en'];
+const LANG_SHORT: Record<Lang, string> = { ru: 'РУС', uz: "O'ZB", en: 'ENG' };
+const LOCALES: Record<Lang, string> = { ru: 'ru-RU', uz: 'uz-UZ', en: 'en-US' };
+
+function formatDateTime(iso: string | null | undefined, lang: Lang): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? String(iso) : d.toLocaleString(LOCALES[lang]);
+}
+
+/** Validation-status badge: validated = green, pending = amber, experimental = grey. */
+function statusPillClass(status: string): string {
+  if (status === 'validated') return 'severity-normal';
+  if (status === 'pending') return 'severity-moderate';
+  return 'bg-ink-800 text-ink-400 border border-ink-700';
+}
+
+/** Urgency badge — derived from positive + validation status, never from the score. */
+function urgencyPillClass(urgency: FindingUrgency): string {
+  if (urgency === 'review') return 'severity-critical';
+  if (urgency === 'unvalidated') return 'severity-moderate';
+  return 'bg-ink-800 text-ink-500 border border-ink-700';
+}
+
+function isSameFinding(a: Finding | null, b: Finding): boolean {
+  return !!a && a.className === b.className && (a.detector || null) === (b.detector || null);
+}
 
 export default function RightPanel() {
   const { rightPanelTab, setRightPanelTab, selectedStudyId, aiResults, studies, settings, updateSettings } = useAppStore();
   const lang = settings.language;
-  const allStudies: Study[] = studies.length > 0 ? studies : DEMO_STUDIES;
-  const selectedStudy = allStudies.find((s) => s.id === selectedStudyId) || null;
-  const result = selectedStudyId
-    ? (aiResults[selectedStudyId] || getDemoResultForStudy(selectedStudy))
+  const allStudies: Study[] = studies.length > 0 ? studies : (DEMO_MODE ? DEMO_STUDIES : []);
+  const study = allStudies.find((s) => s.id === selectedStudyId) || null;
+  const result: AIResult | null = selectedStudyId
+    ? (aiResults[selectedStudyId] || getDemoResultForStudy(study))
     : null;
 
+  // The Compare tab has no real data source in this build (no PACS prior lookup), so it is not offered.
   const tabs = [
-    { id: 'findings', label: L('findings', lang), count: result?.findings.length || 0 },
+    { id: 'findings', label: L('findings', lang), count: result ? result.findings.filter((f) => f.positive).length : 0 },
     { id: 'report',   label: L('report', lang),   count: null },
     { id: 'chat',     label: L('askAI', lang),    count: null },
     { id: 'info',     label: L('details', lang),  count: null },
-    { id: 'compare',  label: L('compare', lang),  count: null },
   ] as const;
 
   return (
@@ -30,7 +63,7 @@ export default function RightPanel() {
       {/* Language switcher */}
       <div className="flex items-center justify-end gap-1 px-2 py-1 border-b border-ink-800 bg-ink-950/40">
         <span className="text-[9px] uppercase tracking-wider text-ink-500 mr-1">Язык / Til / Lang:</span>
-        {(['ru', 'uz', 'en'] as const).map((l) => (
+        {LANGS.map((l) => (
           <button
             key={l}
             onClick={() => updateSettings({ language: l })}
@@ -39,7 +72,7 @@ export default function RightPanel() {
             }`}
             title={`Switch to ${l.toUpperCase()}`}
           >
-            {l === 'ru' ? 'РУС' : l === 'uz' ? "O'ZB" : 'ENG'}
+            {LANG_SHORT[l]}
           </button>
         ))}
       </div>
@@ -49,7 +82,7 @@ export default function RightPanel() {
         {tabs.map(tab => (
           <button
             key={tab.id}
-            onClick={() => setRightPanelTab(tab.id as any)}
+            onClick={() => setRightPanelTab(tab.id)}
             className={`tab ${rightPanelTab === tab.id ? 'active' : ''}`}
           >
             {tab.label}
@@ -64,22 +97,27 @@ export default function RightPanel() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        {rightPanelTab === 'findings' && <FindingsTab result={result} />}
-        {rightPanelTab === 'report' && <ReportTab result={result} />}
+        {rightPanelTab === 'findings' && <FindingsTab result={result} lang={lang} />}
+        {rightPanelTab === 'report' && <ReportTab result={result} study={study} lang={lang} />}
         {rightPanelTab === 'chat' && <AIChat />}
-        {rightPanelTab === 'info' && <InfoTab />}
-        {rightPanelTab === 'compare' && <CompareTab />}
+        {rightPanelTab === 'info' && <InfoTab study={study} result={result} lang={lang} />}
+        {rightPanelTab === 'compare' && <CompareTab lang={lang} />}
       </div>
     </div>
   );
 }
 
 // ========================================================================
-// FINDINGS TAB — Deep AI Analysis Display
+// FINDINGS TAB — server result, status + urgency badges, model identity
 // ========================================================================
-function FindingsTab({ result }: { result: AIResult | null }) {
-  const { selectFinding, selectedFinding, settings } = useAppStore();
-  const lang = settings.language;
+function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) {
+  const { selectFinding, selectedFinding } = useAppStore();
+
+  // Flagged findings first, then by confidence. Presentation order only — urgency never comes from the score.
+  const ordered = useMemo(() => {
+    if (!result) return [] as Finding[];
+    return [...result.findings].sort((a, b) => (Number(b.positive) - Number(a.positive)) || (b.confidence - a.confidence));
+  }, [result]);
 
   if (!result) {
     return (
@@ -91,140 +129,91 @@ function FindingsTab({ result }: { result: AIResult | null }) {
     );
   }
 
-  // Normal study, OR empty findings (pending/error/no-data demo) — show a friendly state
-  if (result.isNormal || !result.findings || result.findings.length === 0) {
-    const isPending = result.modelVersion?.includes('Analyzing') || result.modelVersion?.includes('progress');
-    const isError = result.modelVersion?.toLowerCase().includes('error');
-    const isUnsupported = result.modelVersion?.includes('V1.1') || result.modelVersion?.includes('roadmap');
-    return (
-      <div className="p-6">
-        <div className="text-center py-8">
-          <div className="relative inline-block mb-4">
-            <div className={`w-20 h-20 rounded-full flex items-center justify-center mx-auto ${
-              isError ? 'bg-critical/10' : isPending ? 'bg-accent-500/10' : 'bg-normal/10'
-            }`}>
-              {isPending ? (
-                <svg className="w-10 h-10 text-accent-400 animate-spin" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-              ) : isError ? (
-                <svg className="w-10 h-10 text-critical" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              ) : (
-                <svg className="w-10 h-10 text-normal" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-              )}
-            </div>
-            {!isError && <div className="absolute inset-0 rounded-full animate-pulse-ring bg-normal/30" />}
-          </div>
-          <h3 className={`text-lg font-semibold mb-1 ${
-            isError ? 'text-critical' : isPending ? 'text-accent-400' : 'text-normal'
-          }`}>
-            {isPending ? L('analyzing', lang)
-              : isError ? L('failed', lang)
-              : isUnsupported ? L('notSupported', lang)
-              : L('noPathology', lang)}
-          </h3>
-          <p className="text-xs text-ink-500 mb-4 max-w-xs mx-auto">
-            {result.overallImpression || 'The AI model found no significant findings.'}
-          </p>
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-ink-800/50 rounded-full text-[10px]">
-            <span className="text-ink-500">Model</span>
-            <span className="font-mono font-bold text-ink-200">{result.modelVersion}</span>
-          </div>
-        </div>
-      </div>
-    );
+  if (result.rejected || result.requiresReview) {
+    return <NotAnalyzedState result={result} lang={lang} />;
   }
 
-  const topFinding = result.findings[0];
-  const severity = topFinding.confidence >= 0.8 ? 'critical' : topFinding.confidence >= 0.6 ? 'urgent' : topFinding.confidence >= 0.4 ? 'moderate' : 'mild';
+  const overall = result.overallAssessment;
+  const flagged = overall ? overall.abnormalFlagged : ordered.some((f) => f.positive);
+  const overallText = overall?.text || result.overallImpression || '';
+  const flaggedCount = ordered.filter((f) => f.positive).length;
 
   return (
-    <div className="p-3">
-      {/* Top severity banner */}
-      <div className={`p-3 rounded-lg mb-3 border severity-${severity === 'critical' ? 'critical' : severity === 'urgent' ? 'urgent' : severity === 'moderate' ? 'moderate' : 'mild'}`}>
-        <div className="flex items-start gap-3">
-          <div className={`w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0 ${
-            severity === 'critical' ? 'bg-critical/30' :
-            severity === 'urgent' ? 'bg-urgent/30' :
-            severity === 'moderate' ? 'bg-moderate/30' : 'bg-mild/30'
-          }`}>
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-0.5">
-              <span className={`severity-pill text-[9px] ${
-                severity === 'critical' ? 'severity-critical' :
-                severity === 'urgent' ? 'severity-urgent' :
-                severity === 'moderate' ? 'severity-moderate' : 'severity-mild'
-              }`}>
-                {severityWord(topFinding.confidence, lang)}
-              </span>
-              <span className="text-[10px] text-ink-500 font-mono">
-                AI: {result.modelVersion}
-              </span>
-            </div>
-            <h3 className="text-sm font-semibold text-ink-100 leading-tight">
-              {result.overallImpression}
-            </h3>
-          </div>
+    <div className="p-3 space-y-3">
+      <DisclaimerBanner text={result.disclaimer} lang={lang} />
+
+      {/* Overall assessment — the server's rule; never a "normal" certificate */}
+      <div className={`p-3 rounded-lg border ${flagged ? 'severity-critical' : 'border-ink-700 bg-ink-850/60 text-ink-200'}`}>
+        <div className="text-[10px] font-bold uppercase tracking-wider mb-1 opacity-80">{L('overallAssessment', lang)}</div>
+        <div className="text-sm font-semibold leading-tight">
+          {flagged ? L('abnormalFlagged', lang) : L('noFindingFlagged', lang)}
         </div>
+        {overallText && <p className="text-xs mt-1 opacity-90">{overallText}</p>}
       </div>
 
-      {/* Stats grid */}
-      <div className="grid grid-cols-3 gap-2 mb-3">
-        <StatCard label={UI_LABELS.findings[lang]} value={result.findings.length.toString()} icon="⚕" />
-        <StatCard label={lang === 'ru' ? 'Время' : lang === 'uz' ? 'Vaqt' : 'Time'} value={`${result.inferenceTimeMs}ms`} icon="⚡" />
-        <StatCard label={lang === 'ru' ? 'Модель' : lang === 'uz' ? 'Model' : 'Model'} value="v1.0" icon="🧠" />
+      {/* Stats grid — real numbers from the result only */}
+      <div className="grid grid-cols-3 gap-2">
+        <StatCard label={L('flagged', lang)} value={`${flaggedCount} / ${ordered.length}`} />
+        <StatCard label={L('time', lang)} value={result.inferenceTimeMs ? `${result.inferenceTimeMs} ms` : '—'} />
+        <StatCard label={L('threshold', lang)} value={result.threshold != null ? result.threshold.toFixed(2) : '—'} />
       </div>
 
       {/* Findings list */}
       <div className="space-y-2">
-        <div className="flex items-center justify-between px-1 mb-1">
-          <span className="text-[10px] font-semibold text-ink-500 uppercase tracking-wider">
-            {L('detectedPath', lang)}
-          </span>
-          <button className="text-[10px] text-accent-400 hover:text-accent-300">
-            {L('sortConfidence', lang)}
-          </button>
+        <div className="px-1 text-[10px] font-semibold text-ink-500 uppercase tracking-wider">
+          {L('detectedPath', lang)}
         </div>
-
-        {result.findings.map((finding, idx) => (
+        {ordered.length === 0 && (
+          <div className="p-3 rounded-lg border border-ink-800 bg-ink-850/50 text-xs text-ink-400">
+            {L('noFindingFlagged', lang)}
+          </div>
+        )}
+        {ordered.map((finding, idx) => (
           <FindingCard
-            key={idx}
+            key={`${finding.detector || ''}:${finding.className}:${idx}`}
             finding={finding}
             rank={idx + 1}
             lang={lang}
-            isSelected={selectedFinding?.className === finding.className}
-            onClick={() => selectFinding(selectedFinding?.className === finding.className ? null : finding)}
+            threshold={result.threshold}
+            isSelected={isSameFinding(selectedFinding, finding)}
+            onClick={() => selectFinding(isSameFinding(selectedFinding, finding) ? null : finding)}
           />
         ))}
       </div>
 
-      {/* Action bar */}
-      <div className="mt-4 pt-3 border-t border-ink-800 space-y-2">
-        <button className="w-full btn-primary py-2 justify-center flex items-center gap-2">
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-          </svg>
-          {L('rerunAI', lang)}
-        </button>
-        <div className="grid grid-cols-2 gap-2">
-          <button className="btn-secondary py-1.5">{L('comparePrior', lang)}</button>
-          <button className="btn-secondary py-1.5">{L('submitFeedback', lang)}</button>
-        </div>
-      </div>
+      <ModelIdentityList
+        models={result.modelIdentity}
+        fallback={result.modelVersion}
+        appVersion={result.appVersion}
+        lang={lang}
+      />
     </div>
   );
 }
 
-function StatCard({ label, value, icon }: { label: string; value: string; icon: string }) {
+function NotAnalyzedState({ result, lang }: { result: AIResult; lang: Lang }) {
+  const reason = result.rejectionReason || '';
+  return (
+    <div className="p-4 space-y-3">
+      <div className="p-4 rounded-lg border severity-moderate">
+        <div className="text-sm font-semibold leading-snug">
+          {L('notAnalyzed', lang)}{reason ? `: ${reason}` : ''}
+        </div>
+      </div>
+      <DisclaimerBanner text={result.disclaimer} lang={lang} />
+    </div>
+  );
+}
+
+function DisclaimerBanner({ text, lang }: { text: string; lang: Lang }) {
+  return (
+    <div className="px-3 py-2 rounded-lg border border-moderate/40 bg-moderate/10 text-[11px] text-ink-200 leading-snug">
+      {text || L('intendedUse', lang)}
+    </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="p-2 bg-ink-850 rounded-lg border border-ink-800">
       <div className="text-[9px] text-ink-500 uppercase tracking-wider mb-0.5">{label}</div>
@@ -233,351 +222,408 @@ function StatCard({ label, value, icon }: { label: string; value: string; icon: 
   );
 }
 
-function FindingCard({ finding, rank, lang, isSelected, onClick }: { finding: Finding; rank: number; lang: 'ru'|'uz'|'en'; isSelected: boolean; onClick: () => void }) {
-  const confidence = Math.round(finding.confidence * 100);
-  const severity = confidence >= 80 ? 'critical' : confidence >= 50 ? 'urgent' : confidence >= 30 ? 'moderate' : 'mild';
-  const translatedName = translateFinding(finding.className, lang);
-  const translatedLocation = translateLocation(finding.location, lang);
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-ink-500 mb-0.5">{label}</div>
+      <div className="font-mono text-ink-200 break-all">{value}</div>
+    </div>
+  );
+}
 
-  const severityColors = {
-    critical: { bg: 'bg-critical', text: 'text-critical', border: 'border-critical/40', pill: 'severity-critical' },
-    urgent: { bg: 'bg-urgent', text: 'text-urgent', border: 'border-urgent/40', pill: 'severity-urgent' },
-    moderate: { bg: 'bg-moderate', text: 'text-moderate', border: 'border-moderate/40', pill: 'severity-moderate' },
-    mild: { bg: 'bg-mild', text: 'text-mild', border: 'border-mild/40', pill: 'severity-mild' },
-  }[severity];
+function FindingCard({ finding, rank, lang, threshold, isSelected, onClick }: {
+  finding: Finding; rank: number; lang: Lang; threshold: number | null; isSelected: boolean; onClick: () => void;
+}) {
+  const confidence = Math.round(finding.confidence * 100);
+  const urgency = findingUrgency(finding);
+  const name = translateFinding(finding.className, lang);
+  const location = translateLocation(finding.location || '', lang);
+  const barColor = urgency === 'review' ? 'bg-critical' : urgency === 'unvalidated' ? 'bg-moderate' : 'bg-ink-500';
+  const thresholdPct = threshold != null ? Math.round(threshold * 100) : null;
 
   return (
     <div
       onClick={onClick}
       className={`p-3 rounded-lg border cursor-pointer transition-all ${
         isSelected
-          ? `${severityColors.border} bg-gradient-to-r from-ink-800/80 to-ink-850`
+          ? 'border-accent-500/40 bg-gradient-to-r from-ink-800/80 to-ink-850'
           : 'border-ink-800 bg-ink-850/50 hover:bg-ink-800/70 hover:border-ink-700'
       }`}
     >
       {/* Header */}
       <div className="flex items-start justify-between mb-2">
         <div className="flex items-center gap-2 flex-1 min-w-0">
-          <span className={`flex-shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-bold font-mono ${severityColors.bg} bg-opacity-20 ${severityColors.text}`}>
+          <span className="flex-shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-bold font-mono bg-ink-800 text-ink-300">
             {rank}
           </span>
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-semibold text-ink-100 truncate" title={finding.className}>{translatedName}</div>
-            <div className="text-[10px] text-ink-500 flex items-center gap-1">
-              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
-              </svg>
-              {translatedLocation}
-            </div>
+            <div className="text-sm font-semibold text-ink-100 truncate" title={finding.className}>{name}</div>
+            {location && <div className="text-[10px] text-ink-500 truncate">{location}</div>}
           </div>
         </div>
-        <div className={`text-right ml-2`}>
-          <div className={`text-base font-bold font-mono ${severityColors.text}`}>{confidence}%</div>
-          <div className="text-[9px] text-ink-500 uppercase tracking-wider">{UI_LABELS.conf[lang]}</div>
+        <div className="text-right ml-2 flex-shrink-0">
+          <div className={`text-base font-bold font-mono ${finding.positive ? 'text-ink-100' : 'text-ink-500'}`}>{confidence}%</div>
+          <div className="text-[9px] text-ink-500 uppercase tracking-wider">{L('conf', lang)}</div>
         </div>
       </div>
 
-      {/* Confidence visualization */}
+      {/* Badges: urgency (rule-based) + validation status of the detector */}
+      <div className="flex flex-wrap items-center gap-1 mb-2">
+        <span className={`severity-pill text-[9px] ${urgencyPillClass(urgency)}`}>{urgencyWord(urgency, lang)}</span>
+        <span className={`severity-pill text-[9px] ${statusPillClass(finding.status)}`}>{statusWord(finding.status, lang)}</span>
+      </div>
+
+      {/* Confidence visualization with the real decision threshold */}
       <div className="relative w-full h-1.5 bg-ink-950 rounded-full overflow-hidden">
         <div
-          className={`absolute inset-y-0 left-0 ${severityColors.bg} transition-all duration-700`}
+          className={`absolute inset-y-0 left-0 ${barColor} transition-all duration-700`}
           style={{ width: `${confidence}%` }}
         />
-        {/* Threshold marker */}
-        <div className="absolute inset-y-0 left-1/2 w-px bg-ink-600" />
+        {thresholdPct != null && (
+          <div
+            className="absolute inset-y-0 w-px bg-ink-300"
+            style={{ left: `${thresholdPct}%` }}
+            title={`${L('threshold', lang)} ${thresholdPct}%`}
+          />
+        )}
       </div>
 
-      {/* Metadata */}
+      {/* Metadata — only what the server reported */}
       {isSelected && (
         <div className="mt-3 pt-3 border-t border-ink-800 grid grid-cols-2 gap-2 text-[10px] animate-fade-in">
-          <div>
-            <div className="text-ink-500 mb-0.5">Sensitivity</div>
-            <div className="font-mono text-ink-200">0.{85 + rank}</div>
-          </div>
-          <div>
-            <div className="text-ink-500 mb-0.5">Specificity</div>
-            <div className="font-mono text-ink-200">0.{81 + rank}</div>
-          </div>
-          <div>
-            <div className="text-ink-500 mb-0.5">Area</div>
-            <div className="font-mono text-ink-200">18.4 cm²</div>
-          </div>
-          <div>
-            <div className="text-ink-500 mb-0.5">Severity</div>
-            <div className="font-mono text-ink-200">{severity.toUpperCase()}</div>
-          </div>
+          <Meta label={L('detector', lang)} value={finding.detector || '—'} />
+          <Meta label={L('sequence', lang)} value={finding.sequenceUsed || '—'} />
+          <Meta label={L('status', lang)} value={statusWord(finding.status, lang)} />
+          <Meta label="Class" value={finding.className} />
+          {thresholdPct != null && <Meta label={L('threshold', lang)} value={`${thresholdPct}%`} />}
         </div>
       )}
     </div>
   );
 }
 
-// ========================================================================
-// REPORT TAB
-// ========================================================================
-function ReportTab({ result }: { result: AIResult | null }) {
-  const { currentUser, settings, selectedStudyId, reports } = useAppStore();
+function ModelIdentityList({ models, fallback, appVersion, lang }: {
+  models: ModelIdentity[]; fallback: string; appVersion: string | null; lang: Lang;
+}) {
+  return (
+    <div className="pt-3 border-t border-ink-800">
+      <div className="px-1 text-[10px] font-semibold text-ink-500 uppercase tracking-wider mb-2">{L('models', lang)}</div>
+      {models.length === 0 ? (
+        <div className="px-1 text-[10px] text-ink-500 font-mono">{fallback || '—'}</div>
+      ) : (
+        <div className="space-y-1">
+          {models.map((m) => (
+            <div key={m.key || m.displayName} className="px-2 py-1.5 rounded-md bg-ink-850/60 border border-ink-800 flex items-center gap-2">
+              <div className="flex-1 min-w-0">
+                <div className="text-[11px] text-ink-200 truncate" title={m.source || undefined}>{m.displayName}</div>
+                <div className="text-[9px] text-ink-500 font-mono">{m.sha256_12 || '—'}</div>
+                {m.validationNote && <div className="text-[9px] text-ink-500 mt-0.5 leading-snug">{m.validationNote}</div>}
+              </div>
+              <span className={`severity-pill text-[9px] flex-shrink-0 ${statusPillClass(m.status)}`}>{statusWord(m.status, lang)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {appVersion && (
+        <div className="px-1 mt-2 text-[9px] text-ink-600 font-mono">{L('aiServer', lang)} · {L('version', lang)}: {appVersion}</div>
+      )}
+    </div>
+  );
+}
 
-  // Cache report text per language so switching back is instant
-  const [reportsByLang, setReportsByLang] = useState<{ ru?: string; uz?: string; en?: string }>({});
-  const [language, setLanguage] = useState<'ru' | 'uz' | 'en'>(settings.language);
+// ========================================================================
+// REPORT TAB — real patient fields, server-side signing, honest exports
+// ========================================================================
+interface ReportCache {
+  studyId: string;
+  /** Current (possibly doctor-edited) text per language */
+  texts: Partial<Record<Lang, string>>;
+  /** Untouched AI draft per language — sent to /report/sign as ai_draft_text */
+  drafts: Partial<Record<Lang, string>>;
+}
+const EMPTY_CACHE: ReportCache = { studyId: '', texts: {}, drafts: {} };
+
+function ReportTab({ result, study, lang }: { result: AIResult | null; study: Study | null; lang: Lang }) {
+  const { currentUser, settings, reports, signedReports, setSignedReport, addNotification } = useAppStore();
+  const studyId = study?.id || '';
+  const storedReport = reports[studyId];
+
+  // Cache is keyed by study so switching studies never shows another patient's text.
+  const [cache, setCache] = useState<ReportCache>(EMPTY_CACHE);
+  const texts = cache.studyId === studyId ? cache.texts : {};
+  const drafts = cache.studyId === studyId ? cache.drafts : {};
+
+  const [language, setLanguage] = useState<Lang>(settings.language);
   // Follow the global language switcher (top of right panel) when it changes.
   useEffect(() => { setLanguage(settings.language); }, [settings.language]);
-  const [isSigned, setIsSigned] = useState(false);
-  const [signedAt, setSignedAt] = useState('');
   const [editMode, setEditMode] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
   const [regenError, setRegenError] = useState<string | null>(null);
-  const [exportMode, setExportMode] = useState<'current' | 'all3'>('current');
+  const [exportMode, setExportMode] = useState<'current' | 'opened'>('current');
   const [exporting, setExporting] = useState(false);
+  const [signing, setSigning] = useState(false);
 
-  // Reset when study changes
-  const studyKey = selectedStudyId || 'demo';
-  const lastStudyKey = useRef<string>(studyKey);
+  useEffect(() => { setEditMode(false); setRegenError(null); }, [studyId]);
+
+  const signedFor = (l: Lang): SignedReport | undefined => signedReports[signedKey(studyId, l)];
+  const signed = signedFor(language);
+
+  // The language the report was originally produced in; every other language is an auto-translation.
+  const originalLang: Lang = storedReport?.language || result?.reportLanguage || settings.language;
+
+  const setText = (l: Lang, text: string) => setCache((c) => {
+    const base = c.studyId === studyId ? c : { studyId, texts: {}, drafts: {} };
+    return { studyId, texts: { ...base.texts, [l]: text }, drafts: base.drafts };
+  });
+  const seedText = (l: Lang, text: string, draft: string) => setCache((c) => {
+    const base = c.studyId === studyId ? c : { studyId, texts: {}, drafts: {} };
+    if (base.texts[l]) return base;
+    return { studyId, texts: { ...base.texts, [l]: text }, drafts: { ...base.drafts, [l]: draft } };
+  });
+
+  // Seed from the server-side report (received with /analyze/study or restored via GET /study/{id})
+  // and from any server-confirmed signatures.
   useEffect(() => {
-    if (lastStudyKey.current !== studyKey) {
-      setReportsByLang({});
-      setIsSigned(false);
-      setSignedAt('');
-      setEditMode(false);
-      lastStudyKey.current = studyKey;
+    if (!studyId) return;
+    if (storedReport?.reportText) {
+      seedText(storedReport.language, storedReport.reportText, storedReport.aiDraftText || storedReport.reportText);
     }
-  }, [studyKey]);
-
-  // Seed initial report from server-side report (received with /analyze)
-  // for the language it was generated in.
-  useEffect(() => {
-    if (!result) return;
-    const serverReport = reports[selectedStudyId || '']?.reportText;
-    const serverLang = (reports[selectedStudyId || '']?.language as 'ru' | 'uz' | 'en') || 'ru';
-    if (serverReport && !reportsByLang[serverLang]) {
-      setReportsByLang((prev) => ({ ...prev, [serverLang]: serverReport }));
+    for (const l of LANGS) {
+      const s = signedReports[signedKey(studyId, l)];
+      if (s?.reportText) seedText(l, s.reportText, s.reportText);
     }
-  }, [result, selectedStudyId]);
+  }, [studyId, storedReport, signedReports]);
 
-  // Generate / fetch report when language changes (or study loads)
+  // Generate the report for the selected language when it has not been opened yet.
+  const cachedText = texts[language];
   useEffect(() => {
-    if (!result) return;
-
-    // Already have a cached version → use it
-    if (reportsByLang[language]) return;
+    if (!result || !study || !studyId) return;
+    if (result.rejected || result.requiresReview) return;
+    if (signed || cachedText) return;
+    if (storedReport?.reportText && storedReport.language === language) return; // seeded above
 
     let cancelled = false;
     setRegenError(null);
+    setRegenerating(true);
+    const modality = result.modality || study.modality;
+    const bodyPart = result.bodyPart || study.bodyPart;
 
-    const tryServerThenFallback = async () => {
-      setRegenerating(true);
+    (async () => {
       try {
         const findingsForApi = result.findings.map((f) => ({
           class_name: f.className,
           confidence: f.confidence,
           location: f.location,
+          positive: f.positive,
+          status: f.status,
+          detector: f.detector,
         }));
+        // The server strips PHI from LLM prompts; the id is only used for its own bookkeeping.
         const text = await regenerateReport(
           findingsForApi,
           language,
-          { id: 'P-20241001' },
-          result.modality || 'CR',
-          result.bodyPart || 'CHEST',
+          { id: study.patientId, age: study.patientAge ?? undefined, sex: study.patientSex ?? undefined, study_date: study.studyDate },
+          modality,
+          bodyPart,
         );
         if (cancelled) return;
-        if (text && text.trim()) {
-          setReportsByLang((prev) => ({ ...prev, [language]: text }));
-        } else {
-          throw new Error('Empty server response');
-        }
-      } catch (e: any) {
-        // Fallback to local templates when server is unavailable
+        if (!text || !text.trim()) throw new Error('Empty report from server');
+        seedText(language, text, text);
+      } catch (e) {
         if (cancelled) return;
-        const template = generateReport(result, language);
-        const fullText = formatFullReport(
-          template,
-          'P-20241001',
-          '2024-10-01',
-          currentUser?.fullName || 'Doctor',
-          language,
-        );
-        setReportsByLang((prev) => ({ ...prev, [language]: fullText }));
-        setRegenError(
-          language === 'ru'
-            ? 'AI недоступен — показан шаблон'
-            : language === 'uz'
-              ? 'AI mavjud emas — shablon ko\'rsatilmoqda'
-              : 'AI unavailable — showing template',
-        );
+        const info = describeApiError(e);
+        console.warn('Report generation failed — using local template:', info.code, info.detail);
+        const template = generateReport(result, language, modality, bodyPart);
+        const fullText = formatFullReport(template, study.patientId, study.studyDate || '—', currentUser?.fullName || '', language);
+        seedText(language, fullText, fullText);
+        setRegenError(L('llmUnavailable', lang));
       } finally {
         if (!cancelled) setRegenerating(false);
       }
-    };
+    })();
 
-    tryServerThenFallback();
-    return () => {
-      cancelled = true;
-    };
-  }, [result, language, currentUser?.fullName]);
+    return () => { cancelled = true; setRegenerating(false); };
+  }, [result, studyId, language, cachedText, signed, storedReport]);
 
-  const reportText = reportsByLang[language] || '';
-  const setReportText = (text: string) =>
-    setReportsByLang((prev) => ({ ...prev, [language]: text }));
+  const reportText = signed ? signed.reportText : (cachedText || '');
+  const draftText = drafts[language] || '';
+  const edited = !signed && !!draftText && reportText !== draftText;
+  const notAnalyzed = !!result && (result.rejected || result.requiresReview);
 
   if (!result) {
-    return <EmptyState icon="📄" title="No report yet" description="Select a study to generate a report" />;
+    return <EmptyState icon="📄" title={L('noReportYet', lang)} description={L('selectStudyForReport', lang)} />;
+  }
+  if (notAnalyzed || !study) {
+    return <NotAnalyzedState result={result} lang={lang} />;
   }
 
-  const handleSign = () => {
-    setIsSigned(true);
-    const localeMap = { ru: 'ru-RU', uz: 'uz-UZ', en: 'en-US' } as const;
-    setSignedAt(new Date().toLocaleString(localeMap[language]));
-  };
-
-  const handleExportCurrent = async () => {
-    if (!reportText) return;
-    setExporting(true);
-    try {
-      await downloadPDF({
-        patientId: 'P-20241001',
-        studyDate: '2024-10-01',
-        modality: result.modality || 'CR',
-        bodyPart: result.bodyPart || 'CHEST',
-        reportText,
-        doctorName: currentUser?.fullName || 'Doctor',
-        clinicName: 'SIA Medical AI',
-        clinicAddress: 'Tashkent, Uzbekistan',
-        signedAt: isSigned ? signedAt : undefined,
-        findings: result.findings,
-        language,
+  const handleToggleEdit = () => {
+    // Leaving edit mode with changes: keep the correction for the fine-tuning set (best effort).
+    if (editMode && edited && studyId) {
+      saveReportCorrection(studyId, draftText, reportText, language).catch((e) => {
+        console.warn('save_correction failed:', describeApiError(e).detail);
       });
-    } finally {
-      setExporting(false);
     }
+    setEditMode(!editMode);
   };
 
-  const handleExportAllLanguages = async () => {
-    setExporting(true);
-    setRegenError(null);
+  const handleSign = async () => {
+    if (!reportText || signing) return;
+    setSigning(true);
     try {
-      // Make sure all 3 languages are generated first
-      const allLangs: Array<'ru' | 'uz' | 'en'> = ['ru', 'uz', 'en'];
-      const collected: { ru?: string; uz?: string; en?: string } = { ...reportsByLang };
+      const s = await signReport(study.id, reportText, language, draftText || reportText);
+      setSignedReport(study.id, language, s);
+      setEditMode(false);
+      addNotification({
+        type: 'success',
+        title: L('signedLocked', lang),
+        message: `${s.signer.fullName || s.signer.username} · ${s.sha256.slice(0, 12)}`,
+      });
+    } catch (e) {
+      const info = describeApiError(e);
+      console.error('Sign failed:', info.code, info.detail);
+      if (info.code === 'conflict') addNotification({ type: 'warning', title: L('alreadySigned', lang) });
+      else if (info.code === 'forbidden') addNotification({ type: 'warning', title: L('noPermissionSign', lang) });
+      else if (info.code === 'network') addNotification({ type: 'error', title: L('aiServerDown', lang) });
+      else if (info.code === 'auth') addNotification({ type: 'warning', title: L('sessionExpired', lang) });
+      else addNotification({ type: 'error', title: L('signFailed', lang), message: info.detail });
+    } finally {
+      setSigning(false);
+    }
+  };
 
-      const findingsForApi = result.findings.map((f) => ({
-        class_name: f.className,
-        confidence: f.confidence,
-        location: f.location,
-      }));
+  // ----- PDF export ----------------------------------------------------------
+  const sectionFor = (l: Lang): PDFLanguageSection | null => {
+    const s = signedFor(l);
+    const text = s ? s.reportText : texts[l];
+    if (!text) return null;
+    return {
+      reportText: text,
+      doctorName: s ? (s.signer.fullName || s.signer.username) : (currentUser?.fullName || ''),
+      signedAt: s?.signedAt,
+      sha256: s?.sha256,
+      // A signed translation was reviewed by the signer; only unsigned ones carry the tag.
+      autoTranslated: !s && l !== originalLang,
+    };
+  };
+  const openedLangs = LANGS.filter((l) => !!sectionFor(l));
+  const allOpenedSigned = openedLangs.length > 0 && openedLangs.every((l) => !!signedFor(l));
 
-      for (const lang of allLangs) {
-        if (collected[lang]) continue;
-        try {
-          const text = await regenerateReport(
-            findingsForApi,
-            lang,
-            { id: 'P-20241001' },
-            result.modality || 'CR',
-            result.bodyPart || 'CHEST',
-          );
-          if (text && text.trim()) collected[lang] = text;
-        } catch {
-          const template = generateReport(result, lang);
-          collected[lang] = formatFullReport(
-            template,
-            'P-20241001',
-            '2024-10-01',
-            currentUser?.fullName || 'Doctor',
-            lang,
-          );
-        }
+  const buildPdfBase = async (): Promise<PDFBaseData> => ({
+    patientId: study.patientId,
+    patientName: study.patientName,
+    studyDate: study.studyDate || '—',
+    accessionNumber: study.accessionNumber,
+    studyInstanceUid: study.studyInstanceUid,
+    modality: result.modality || study.modality,
+    bodyPart: result.bodyPart || study.bodyPart,
+    clinicName: settings.clinicName || L('clinicPlaceholder', lang),
+    clinicAddress: settings.clinicAddress || '',
+    findings: result.findings,
+    modelIdentity: result.modelIdentity,
+    threshold: result.threshold,
+    appVersion: await getAppVersion(),
+    disclaimer: result.disclaimer,
+  });
+
+  // <studyInstanceUid last 12 chars | patientId>_<studyDate>_<lang>[_DRAFT].pdf
+  const pdfFilename = (langPart: string, draft: boolean) => {
+    const uid = study.studyInstanceUid || '';
+    const idPart = uid ? uid.slice(-12) : study.patientId;
+    return `${sanitizeFilePart(idPart)}_${sanitizeFilePart(study.studyDate || 'nodate')}_${langPart}${draft ? '_DRAFT' : ''}.pdf`;
+  };
+
+  const handleExport = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const base = await buildPdfBase();
+      let res;
+      if (exportMode === 'opened') {
+        const sections: Partial<Record<Lang, PDFLanguageSection>> = {};
+        for (const l of openedLangs) sections[l] = sectionFor(l)!;
+        res = await downloadMultiLanguagePDF(base, sections, pdfFilename(openedLangs.join('-'), !allOpenedSigned));
+      } else {
+        const section = sectionFor(language);
+        if (!section) return;
+        res = await downloadPDF({ ...base, ...section, language }, pdfFilename(language, !signed));
       }
-      setReportsByLang(collected);
-
-      await downloadMultiLanguagePDF(
-        {
-          patientId: 'P-20241001',
-          studyDate: '2024-10-01',
-          modality: result.modality || 'CR',
-          bodyPart: result.bodyPart || 'CHEST',
-          doctorName: currentUser?.fullName || 'Doctor',
-          clinicName: 'SIA Medical AI',
-          clinicAddress: 'Tashkent, Uzbekistan',
-          signedAt: isSigned ? signedAt : undefined,
-          findings: result.findings,
-        },
-        collected,
-      );
+      if (res.success) addNotification({ type: 'success', title: L('pdfSaved', lang), message: res.filePath });
+      else if (!res.canceled) addNotification({ type: 'error', title: L('exportFailed', lang), message: res.error });
+    } catch (e) {
+      console.error('PDF export failed:', e);
+      addNotification({ type: 'error', title: L('exportFailed', lang) });
     } finally {
       setExporting(false);
     }
   };
 
-  const handleExport = () =>
-    exportMode === 'all3' ? handleExportAllLanguages() : handleExportCurrent();
+  const exportLabel = exportMode === 'opened'
+    ? `${allOpenedSigned ? L('exportSignedPdf', lang) : L('exportDraftPdf', lang)} (${openedLangs.length})`
+    : (signed ? L('exportSignedPdf', lang) : L('exportDraftPdf', lang));
+  const canExport = exportMode === 'opened' ? openedLangs.length > 0 : !!reportText;
 
   return (
     <div className="flex flex-col h-full">
       {/* Language + edit toolbar */}
       <div className="p-2 border-b border-ink-800 flex items-center justify-between bg-ink-950/30">
         <div className="flex items-center gap-1">
-          {(['ru', 'uz', 'en'] as const).map(lang => (
+          {LANGS.map((l) => (
             <button
-              key={lang}
-              onClick={() => setLanguage(lang)}
+              key={l}
+              onClick={() => setLanguage(l)}
               disabled={regenerating}
               className={`px-2.5 py-1 text-[10px] font-bold rounded transition-colors disabled:opacity-50 ${
-                language === lang ? 'bg-accent-600 text-white' : 'bg-ink-800 text-ink-400 hover:text-ink-200'
+                language === l ? 'bg-accent-600 text-white' : 'bg-ink-800 text-ink-400 hover:text-ink-200'
               }`}
+              title={signedFor(l) ? L('signedLocked', lang) : (texts[l] ? L('draft', lang) : '')}
             >
-              {lang === 'ru' ? 'РУС' : lang === 'uz' ? "O'ZB" : 'ENG'}
-              {reportsByLang[lang] && (
+              {LANG_SHORT[l]}
+              {signedFor(l) ? (
+                <span className="ml-1 text-[8px] text-normal">✓</span>
+              ) : texts[l] ? (
                 <span className="ml-1 text-[8px] opacity-70">●</span>
-              )}
+              ) : null}
             </button>
           ))}
         </div>
-        <div className="flex items-center gap-1">
-          {!isSigned && (
-            <button
-              onClick={() => setEditMode(!editMode)}
-              className={`p-1 rounded transition-colors ${editMode ? 'bg-accent-600 text-white' : 'text-ink-500 hover:text-ink-200'}`}
-              title="Toggle edit mode"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-              </svg>
-            </button>
-          )}
-          <button className="p-1 rounded text-ink-500 hover:text-ink-200 transition-colors" title="Auto-save enabled">
+        {!signed && (
+          <button
+            onClick={handleToggleEdit}
+            className={`p-1 rounded transition-colors ${editMode ? 'bg-accent-600 text-white' : 'text-ink-500 hover:text-ink-200'}`}
+            title={L('editReport', lang)}
+          >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
             </svg>
           </button>
-        </div>
+        )}
       </div>
 
-      {/* Status / regen indicator */}
-      {(regenerating || regenError) && (
-        <div className={`px-3 py-1.5 text-[10px] flex items-center gap-2 ${
-          regenError ? 'bg-yellow-900/20 text-yellow-300' : 'bg-accent-900/20 text-accent-300'
-        }`}>
-          {regenerating ? (
-            <>
+      {/* Status strip */}
+      {(regenerating || regenError || edited || (!signed && reportText && language !== originalLang)) && (
+        <div className="px-3 py-1.5 text-[10px] flex flex-col gap-0.5 bg-ink-950/40 border-b border-ink-800">
+          {regenerating && (
+            <span className="flex items-center gap-2 text-accent-300">
               <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              {language === 'ru' ? 'Генерация отчёта на РУС…' :
-               language === 'uz' ? "O'ZB tilida hisobot yaratilmoqda…" :
-               'Generating report in ENG…'}
-            </>
-          ) : (
-            <span>⚠ {regenError}</span>
+              {L('generatingReport', lang)} · {LANG_SHORT[language]}…
+            </span>
           )}
+          {regenError && <span className="text-yellow-300">⚠ {regenError}</span>}
+          {!signed && reportText && language !== originalLang && (
+            <span className="text-moderate">⚠ {L('autoTranslated', lang)}</span>
+          )}
+          {edited && <span className="text-ink-400">{L('draftEdited', lang)}</span>}
         </div>
       )}
 
       {/* Report content */}
       <div className="flex-1 overflow-hidden p-3">
         <div className={`h-full rounded-lg border transition-colors ${
-          isSigned
+          signed
             ? 'border-normal/40 bg-normal/5'
             : editMode
               ? 'border-accent-500/40 bg-ink-900'
@@ -585,8 +631,8 @@ function ReportTab({ result }: { result: AIResult | null }) {
         }`}>
           <textarea
             value={reportText}
-            onChange={(e) => editMode && !isSigned && setReportText(e.target.value)}
-            readOnly={!editMode || isSigned}
+            onChange={(e) => editMode && !signed && setText(language, e.target.value)}
+            readOnly={!editMode || !!signed}
             placeholder={regenerating ? '…' : ''}
             className="w-full h-full p-3 text-xs leading-relaxed font-mono bg-transparent resize-none focus:outline-none text-ink-200"
           />
@@ -595,7 +641,7 @@ function ReportTab({ result }: { result: AIResult | null }) {
 
       {/* Footer actions */}
       <div className="p-3 border-t border-ink-800 space-y-2 bg-ink-950/30">
-        {/* Export mode selector */}
+        {/* Export scope: this language, or every language the doctor opened */}
         <div className="flex items-center gap-1 p-1 bg-ink-950 rounded-md">
           <button
             onClick={() => setExportMode('current')}
@@ -603,42 +649,53 @@ function ReportTab({ result }: { result: AIResult | null }) {
               exportMode === 'current' ? 'bg-ink-700 text-white' : 'text-ink-500 hover:text-ink-300'
             }`}
           >
-            {language === 'ru' ? 'Текущий язык' : language === 'uz' ? 'Joriy til' : 'Current language'}
+            {L('currentLanguage', lang)}
           </button>
           <button
-            onClick={() => setExportMode('all3')}
+            onClick={() => setExportMode('opened')}
             className={`flex-1 py-1 text-[10px] font-medium rounded transition-colors ${
-              exportMode === 'all3' ? 'bg-ink-700 text-white' : 'text-ink-500 hover:text-ink-300'
+              exportMode === 'opened' ? 'bg-ink-700 text-white' : 'text-ink-500 hover:text-ink-300'
             }`}
           >
-            {language === 'ru' ? 'Все 3 языка' : language === 'uz' ? "3 ta til" : 'All 3 languages'}
+            {L('exportOpened', lang)} ({openedLangs.length})
           </button>
         </div>
 
-        {isSigned ? (
+        {signed ? (
           <>
-            <div className="p-2.5 bg-normal/10 border border-normal/30 rounded-lg flex items-center gap-2">
-              <div className="w-8 h-8 rounded-full bg-normal/20 flex items-center justify-center">
+            <div className="p-2.5 bg-normal/10 border border-normal/30 rounded-lg flex items-start gap-2">
+              <div className="w-8 h-8 rounded-full bg-normal/20 flex items-center justify-center flex-shrink-0">
                 <svg className="w-4 h-4 text-normal" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                 </svg>
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-xs font-semibold text-normal">Signed & Locked</div>
-                <div className="text-[10px] text-ink-400">{signedAt}</div>
+                <div className="text-xs font-semibold text-normal">{L('signedLocked', lang)}</div>
+                <div className="text-[10px] text-ink-300 truncate">
+                  {L('signedBy', lang)}: {signed.signer.fullName || signed.signer.username} · {formatDateTime(signed.signedAt, lang)}
+                </div>
+                <div className="text-[9px] text-ink-500 font-mono break-all" title={signed.sha256}>SHA-256: {signed.sha256}</div>
               </div>
             </div>
-            <button onClick={handleExport} disabled={exporting} className="w-full btn-primary py-2 disabled:opacity-50">
-              {exporting ? '…' : (exportMode === 'all3' ? 'Export Signed PDF (3 lang)' : 'Export Signed PDF')}
+            <button onClick={handleExport} disabled={exporting || !canExport} className="w-full btn-primary py-2 disabled:opacity-50">
+              {exporting ? L('exporting', lang) : exportLabel}
             </button>
           </>
         ) : (
           <div className="grid grid-cols-2 gap-2">
-            <button onClick={handleSign} disabled={!reportText || regenerating} className="btn-primary py-2 disabled:opacity-50">
-              ✓ Sign Report
+            <button
+              onClick={handleSign}
+              disabled={!reportText || regenerating || signing}
+              className="btn-primary py-2 disabled:opacity-50"
+            >
+              {signing ? L('signing', lang) : `✓ ${L('signReport', lang)}`}
             </button>
-            <button onClick={handleExport} disabled={!reportText || regenerating || exporting} className="btn-secondary py-2 disabled:opacity-50">
-              {exporting ? '…' : (exportMode === 'all3' ? 'Export PDF (3 lang)' : 'Export PDF')}
+            <button
+              onClick={handleExport}
+              disabled={!canExport || regenerating || exporting}
+              className="btn-secondary py-2 disabled:opacity-50"
+            >
+              {exporting ? L('exporting', lang) : exportLabel}
             </button>
           </div>
         )}
@@ -648,71 +705,63 @@ function ReportTab({ result }: { result: AIResult | null }) {
 }
 
 // ========================================================================
-// INFO TAB — Rich DICOM Metadata
+// INFO TAB — real DICOM header fields from the Study (nulls hidden)
 // ========================================================================
-function InfoTab() {
-  const { selectedStudyId } = useAppStore();
+function InfoTab({ study, result, lang }: { study: Study | null; result: AIResult | null; lang: Lang }) {
+  const { health } = useAppStore();
 
-  if (!selectedStudyId) {
-    return <EmptyState icon="ⓘ" title="No study selected" description="Select a study to view details" />;
+  if (!study) {
+    return <EmptyState icon="ⓘ" title={L('noStudySelected', lang)} description={L('selectStudyForDetails', lang)} />;
   }
+
+  type Row = [string, string];
+  const row = (label: string, value: unknown): Row | null =>
+    value === null || value === undefined || value === '' ? null : [label, String(value)];
+  const compact = (rows: (Row | null)[]): Row[] => rows.filter((r): r is Row => !!r);
 
   const sections = [
     {
-      title: 'Patient',
-      items: [
-        ['Patient ID', 'P-20241001'],
-        ['Name', 'Anonymized'],
-        ['DOB', '1975-03-15'],
-        ['Age', '49 yrs'],
-        ['Sex', 'Male'],
-      ],
+      title: L('patient', lang),
+      items: compact([
+        row(L('patientId', lang), study.patientId),
+        row(L('patientName', lang), study.patientName),
+        row(L('sex', lang), study.patientSex),
+        row(L('age', lang), study.patientAge),
+        row(L('birthDate', lang), study.patientBirthDate),
+      ]),
     },
     {
-      title: 'Study',
-      items: [
-        ['Study UID', '1.2.840.113619.2.55'],
-        ['Accession', 'ACC-20241001'],
-        ['Date', '2024-10-01 14:23:05'],
-        ['Modality', 'CR (Computed Radiography)'],
-        ['Body Part', 'CHEST'],
-        ['View Position', 'PA (Posterior-Anterior)'],
-      ],
+      title: L('study', lang),
+      items: compact([
+        row(L('studyUid', lang), study.studyInstanceUid),
+        row(L('accession', lang), study.accessionNumber),
+        row(L('studyDate', lang), study.studyDate),
+        row(L('modality', lang), study.modality !== 'N/A' ? study.modality : null),
+        row(L('bodyPart', lang), study.bodyPart !== '—' ? study.bodyPart : null),
+        row(L('description', lang), study.studyDescription),
+        row(L('filesCount', lang), study.numFiles),
+        row(L('series', lang), study.seriesDescriptions?.length ? study.seriesDescriptions.join(', ') : null),
+      ]),
     },
     {
-      title: 'Acquisition',
-      items: [
-        ['Rows × Columns', '2048 × 2048'],
-        ['Pixel Spacing', '0.143 / 0.143 mm'],
-        ['Bits Stored', '12'],
-        ['Photometric', 'MONOCHROME2'],
-        ['kVp', '120'],
-        ['mAs', '2.0'],
-        ['Exposure Time', '0.016 s'],
-        ['Dose (DAP)', '0.32 mGy·m²'],
-      ],
+      title: L('equipment', lang),
+      items: compact([
+        row(L('manufacturer', lang), study.manufacturer),
+        row(L('scannerModel', lang), study.scannerModel),
+      ]),
     },
     {
-      title: 'Equipment',
-      items: [
-        ['Manufacturer', 'Siemens'],
-        ['Model', 'YSIO Max'],
-        ['Software', 'syngo VXX.XX'],
-        ['Station AE', 'CLINIC_XRAY01'],
-      ],
+      title: L('aiPipeline', lang),
+      items: compact([
+        ...(result?.modelIdentity || []).map((m) => row(m.displayName, `${m.sha256_12 || '—'} · ${statusWord(m.status, lang)}`)),
+        row(L('threshold', lang), result?.threshold != null ? result.threshold.toFixed(2) : null),
+        row(L('inferenceTime', lang), result?.inferenceTimeMs ? `${result.inferenceTimeMs} ms` : null),
+        row(L('analyzedAt', lang), formatDateTime(result?.createdAt || study.aiAnalyzedAt, lang) || null),
+        row(L('device', lang), health?.device),
+        row(`${L('aiServer', lang)} · ${L('version', lang)}`, result?.appVersion || health?.version),
+      ]),
     },
-    {
-      title: 'AI Pipeline',
-      items: [
-        ['Model', 'DenseNet121 + GeM Pool'],
-        ['Version', 'v1.0.0'],
-        ['Training Data', 'NIH + RSNA (138K)'],
-        ['Inference Device', 'NVIDIA GTX 1650'],
-        ['Inference Time', '4200 ms'],
-        ['Preprocessing', 'MONAI v1.3'],
-      ],
-    },
-  ];
+  ].filter((s) => s.items.length > 0);
 
   return (
     <div className="p-3 space-y-4">
@@ -723,9 +772,9 @@ function InfoTab() {
           </div>
           <div className="space-y-1 bg-ink-850/50 rounded-lg border border-ink-800 overflow-hidden">
             {section.items.map(([k, v], idx) => (
-              <div key={k} className={`flex items-start justify-between px-3 py-2 text-[11px] ${idx > 0 ? 'border-t border-ink-800' : ''}`}>
+              <div key={`${k}-${idx}`} className={`flex items-start justify-between px-3 py-2 text-[11px] ${idx > 0 ? 'border-t border-ink-800' : ''}`}>
                 <span className="text-ink-500 flex-shrink-0">{k}</span>
-                <span className="text-ink-100 font-mono text-right ml-2 truncate">{v}</span>
+                <span className="text-ink-100 font-mono text-right ml-2 break-all">{v}</span>
               </div>
             ))}
           </div>
@@ -736,41 +785,10 @@ function InfoTab() {
 }
 
 // ========================================================================
-// COMPARE TAB
+// COMPARE TAB — no prior-study / similar-case data source exists in this build
 // ========================================================================
-function CompareTab() {
-  return (
-    <div className="p-4">
-      <div className="mb-3">
-        <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">
-          Compare with Prior Study
-        </div>
-        <div className="p-3 bg-ink-850 rounded-lg border border-ink-800">
-          <div className="text-xs text-ink-400 mb-2">No prior studies found for this patient.</div>
-          <button className="btn-secondary text-[10px]">Search PACS Archive</button>
-        </div>
-      </div>
-
-      <div className="mb-3">
-        <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">
-          Similar Cases (AI Retrieval)
-        </div>
-        <div className="space-y-2">
-          {[1, 2, 3].map(i => (
-            <div key={i} className="p-2.5 bg-ink-850 rounded-lg border border-ink-800 hover:border-ink-700 cursor-pointer transition-colors">
-              <div className="flex items-center gap-2 mb-1">
-                <span className="text-[9px] text-ink-400 font-mono">P-2024090{i}</span>
-                <span className="severity-pill severity-urgent text-[9px]">Similar</span>
-                <span className="ml-auto text-[10px] font-mono text-accent-400">{92 - i}%</span>
-              </div>
-              <div className="text-xs text-ink-200">Right lower lobe pneumonia</div>
-              <div className="text-[10px] text-ink-500 mt-0.5">3 days ago · Resolved</div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
+function CompareTab({ lang }: { lang: Lang }) {
+  return <EmptyState icon="⇄" title={L('compare', lang)} description={L('compareUnavailable', lang)} />;
 }
 
 // ========================================================================
