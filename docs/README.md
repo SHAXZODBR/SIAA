@@ -21,6 +21,8 @@ All hospital-facing documents exist in three languages: Russian (`_ru`), Uzbek i
 - **Deployment:** everything on one clinic PC, no internet; AI server on `127.0.0.1:8000`, Ollama on `localhost:11434`; authentication on by default; data in the server's data directory (`/health` → `data_dir`).
 - The software is not certified as a medical device by any regulator.
 
-Source of truth for these statements: `src/inference/brain_analysis.py`, `src/inference/model_registry.py`, `src/inference/server.py`, `src/utils/license.py`, `src/utils/paths.py`, `scripts/eval_study_level.py`, `models/brain_triage_finetuned/MANIFEST.json` and `study_level_eval.json`, `desktop-app/src`.
+Source of truth for these statements: `src/inference/brain_analysis.py`, `src/inference/model_registry.py`, `src/inference/server.py`, `src/inference/auth_routes.py`, `src/utils/auth.py`, `src/utils/database.py` (audit hash chain), `src/utils/license.py`, `src/utils/offline.py`, `src/utils/model_crypto.py`, `src/utils/paths.py`, `scripts/eval_study_level.py`, `scripts/download_all_models.py`, `models/brain_triage_finetuned/MANIFEST.json` and `study_level_eval.json`, `desktop-app/electron/main.js`, `desktop-app/src` (UI strings quoted in the manuals come from `desktop-app/src/i18n/{ru,uz,en}.ts`).
+
+Drift guard: `python -m pytest -q docs/test_docs_consistency.py` checks that every file linked from this index exists, that the three language versions of each document have the same section structure, and that the routes, environment variables, CLI commands, detector statuses and validated figures quoted in the documents still match the code. It is not collected by the default `pytest -q` (whose `testpaths` is `tests/`), so run it explicitly after editing the docs.
 
 Screenshots are marked as placeholders (`[Screenshot: …]`, `[Скриншот: …]`, `[Skrinshot: …]`) and should be captured from the final build before printing.

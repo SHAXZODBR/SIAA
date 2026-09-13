@@ -53,6 +53,8 @@ def test_clinical_routes_401_without_token(probe):
     assert probe["study_no_token"] == 401
     assert probe["sign_no_token"] == 401
     assert probe["correction_no_token"] == 401
+    assert probe["pacs_status_no_token"] == 401
+    assert probe["report_pdf_no_token"] == 401
 
 
 def test_wrong_password_401(probe):

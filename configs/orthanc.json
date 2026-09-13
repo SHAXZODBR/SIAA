@@ -1,3 +1,19 @@
+// Orthanc configuration for the Sentinel on-premise PACS.
+// Orthanc's JSON parser accepts // comments in this file (Python's json module does not).
+//
+// SECURITY
+//   * No credentials live in this file. Provide the REST user through the
+//     environment of the Orthanc process/container instead, e.g. for the
+//     osimis/orthanc image:  ORTHANC__REGISTERED_USERS={"sentinel": "<strong password>"}
+//     and give the SAME values to the watcher / inference server as
+//     ORTHANC_USER / ORTHANC_PASSWORD.
+//   * RemoteAccessAllowed=false keeps the REST API (port 8042) on localhost
+//     only: the watcher and the signed-report push run on the same host.
+//     Set it to true ONLY if another machine on the hospital LAN must reach
+//     the REST API, and then front it with TLS (SslEnabled) + a firewall.
+//     This does not affect the DICOM port (4242) - scanners still C-STORE.
+//   * DicomModalities lists the scanners allowed to query/retrieve; adjust the
+//     AE titles / IPs to the hospital network before go-live.
 {
   "Name": "SentinelPACS",
   "StorageDirectory": "/var/lib/orthanc/db",
@@ -5,16 +21,15 @@
   "DicomAet": "SENTINEL",
   "DicomPort": 4242,
   "HttpPort": 8042,
-  "RemoteAccessAllowed": true,
+  "RemoteAccessAllowed": false,
   "AuthenticationEnabled": true,
-  "RegisteredUsers": {
-    "sentinel": "sentinel2024"
-  },
   "DicomModalities": {
     "clinic_mri": ["CLINIC_MRI", "192.168.1.100", 104],
     "clinic_ct": ["CLINIC_CT", "192.168.1.101", 104],
     "clinic_xray": ["CLINIC_XRAY", "192.168.1.102", 104]
   },
+  // Seconds without new instances before a study is reported as StableStudy
+  // in /changes - the event the Sentinel watcher acts on.
   "StableAge": 10,
   "DicomCheckCalledAet": false,
   "UnknownSopClassAccepted": true,

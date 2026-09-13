@@ -12,8 +12,9 @@ import axios, { AxiosError } from 'axios';
 import { useAppStore } from '../store/appStore';
 import type {
   AIResult, Study, Finding, FindingStatus, ModelIdentity, OverallAssessment,
-  HealthStatus, SignedReport, User, Lang,
+  HealthStatus, SignedReport, User, Lang, LicenseStatus, AvailableModel,
 } from '../types';
+import type { I18nKey } from '../i18n/en';
 
 // ===== Inference Server API =====
 
@@ -49,8 +50,27 @@ inferenceAPI.interceptors.response.use(
   },
 );
 
-/** Human-readable, doctor-facing message for a failed request (technical detail stays in console). */
-export function describeApiError(e: unknown): { code: 'network' | 'auth' | 'forbidden' | 'conflict' | 'review' | 'server'; detail: string } {
+export type ApiErrorCode = 'network' | 'auth' | 'forbidden' | 'conflict' | 'review' | 'server';
+
+export interface ApiErrorInfo {
+  code: ApiErrorCode;
+  /** Technical detail from the server (stays in the console / toast body). */
+  detail: string;
+  /** Localized doctor-facing message key — render with t(info.messageKey). */
+  messageKey: I18nKey;
+}
+
+const ERROR_MESSAGE_KEYS: Record<ApiErrorCode, I18nKey> = {
+  network: 'health.aiServerDown',
+  auth: 'health.sessionExpired',
+  forbidden: 'error.forbidden',
+  conflict: 'error.conflict',
+  review: 'worklist.notAnalyzed',
+  server: 'error.server',
+};
+
+/** Doctor-facing classification of a failed request (technical detail stays in console). */
+export function describeApiError(e: unknown): ApiErrorInfo {
   const err = e as AxiosError<any>;
   const status = err?.response?.status;
   const data = err?.response?.data;
@@ -58,12 +78,13 @@ export function describeApiError(e: unknown): { code: 'network' | 'auth' | 'forb
     (typeof data?.detail === 'string' && data.detail) ||
     (typeof data?.reason === 'string' && data.reason) ||
     err?.message || 'Unknown error';
-  if (!err?.response) return { code: 'network', detail };
-  if (status === 401) return { code: 'auth', detail };
-  if (status === 403) return { code: 'forbidden', detail };
-  if (status === 409) return { code: 'conflict', detail };
-  if (status === 422 && data?.requires_review) return { code: 'review', detail: data?.reason || detail };
-  return { code: 'server', detail };
+  const build = (code: ApiErrorCode, d = detail): ApiErrorInfo => ({ code, detail: d, messageKey: ERROR_MESSAGE_KEYS[code] });
+  if (!err?.response) return build('network');
+  if (status === 401) return build('auth');
+  if (status === 403) return build('forbidden');
+  if (status === 409) return build('conflict');
+  if (status === 422 && data?.requires_review) return build('review', data?.reason || detail);
+  return build('server');
 }
 
 // ----- Auth -----------------------------------------------------------------
@@ -484,15 +505,70 @@ export async function getStudy(studyId: string): Promise<StudyDetail> {
 }
 
 /**
- * List which pretrained models are available (and which need downloading).
- * Used in Settings to show modality status.
+ * Every detector the server knows about (GET /models/available) — shown in
+ * Settings → AI models. Returns [] when the server is unreachable.
  */
-export async function listAvailableModels(): Promise<any[]> {
+export async function listAvailableModels(): Promise<AvailableModel[]> {
   try {
-    const res = await inferenceAPI.get('/models/available');
-    return res.data.models || [];
+    const res = await inferenceAPI.get('/models/available', { timeout: 8000 });
+    const rows: any[] = Array.isArray(res.data?.models) ? res.data.models : [];
+    return rows.map((m) => ({
+      key: String(m?.key ?? ''),
+      name: String(m?.name ?? m?.key ?? ''),
+      tier: m?.tier ?? null,
+      validationStatus: m?.validation_status ?? null,
+      license: m?.license ?? null,
+      is3d: !!m?.is_3d,
+      depsOk: m?.deps_ok !== false,
+      depsReason: m?.deps_reason || null,
+      downloadMb: typeof m?.download_mb === 'number' ? m.download_mb : null,
+      classes: Array.isArray(m?.classes) ? m.classes.map(String) : [],
+    })).filter((m) => m.key);
   } catch {
     return [];
+  }
+}
+
+export function unreachableLicense(): LicenseStatus {
+  return {
+    reachable: false, valid: false, mode: null, customer: null, tier: null,
+    expiresAt: null, features: [], reason: null, demoCallsToday: null, demoLimit: null,
+  };
+}
+
+/** GET /license/status — public route; never throws. */
+export async function getLicenseStatus(): Promise<LicenseStatus> {
+  try {
+    const res = await inferenceAPI.get('/license/status', { timeout: 5000 });
+    const d = res.data || {};
+    const info = d.info && typeof d.info === 'object' ? d.info : {};
+    return {
+      reachable: true,
+      valid: !!d.valid,
+      mode: info.mode ?? null,
+      customer: info.customer ?? null,
+      tier: info.tier ?? null,
+      expiresAt: info.expires_at ?? null,
+      features: Array.isArray(info.features) ? info.features.map(String) : [],
+      reason: info.reason ?? null,
+      demoCallsToday: typeof d.demo_calls_today === 'number' ? d.demo_calls_today : null,
+      demoLimit: typeof d.demo_limit === 'number' ? d.demo_limit : null,
+    };
+  } catch {
+    return unreachableLicense();
+  }
+}
+
+/**
+ * Probe an arbitrary base URL (Setup wizard "Test connection") without
+ * touching settings.inferenceUrl. Never throws.
+ */
+export async function probeHealth(baseUrl: string): Promise<HealthStatus> {
+  try {
+    const res = await axios.get(`${normalizeBaseUrl(baseUrl)}/health`, { timeout: 5000 });
+    return mapHealth(res.data);
+  } catch {
+    return unreachableHealth();
   }
 }
 

@@ -138,8 +138,40 @@ export interface AppSettings {
   language: Lang;
   clinicName: string;
   clinicAddress: string;
+  /** Printed on the PDF letterhead next to the address. */
+  clinicPhone: string;
   supportContact: string;
   theme: 'dark' | 'light';
+  /** true once the first-run wizard has been completed on this workstation. */
+  setupComplete: boolean;
+}
+
+/** GET /license/status */
+export interface LicenseStatus {
+  reachable: boolean;
+  valid: boolean;
+  mode: string | null;
+  customer: string | null;
+  tier: string | null;
+  expiresAt: string | null;
+  features: string[];
+  reason: string | null;
+  demoCallsToday: number | null;
+  demoLimit: number | null;
+}
+
+/** One entry of GET /models/available */
+export interface AvailableModel {
+  key: string;
+  name: string;
+  tier: string | null;
+  validationStatus: string | null;
+  license: string | null;
+  is3d: boolean;
+  depsOk: boolean;
+  depsReason: string | null;
+  downloadMb: number | null;
+  classes: string[];
 }
 
 // Modality icon mapping

@@ -127,6 +127,7 @@ Contents:
 | `logs\sentinel_YYYY-MM-DD.log` | Server log, rotated at 10 MB, zipped, kept 30 days. Patient identifiers are redacted (§7). | Redacted |
 | `logs\backend.log` | Raw console output of the server captured by the desktop shell | Redacted |
 | `doctor_corrections\` | Append-only JSONL of radiologist edits to AI drafts (report text, study ID, user ID) | Report text |
+| `training_corpus\` | **Anonymised** thumbnails and labels written by the training-data collector (no names, IDs or birth dates) | Anonymised |
 | `dicom_cache\` | Temporary DICOM cache | Yes |
 | `license.dat` | The machine-bound licence | No |
 | `jwt_secret.key` | Secret that signs login tokens (mode 0600). Deleting it logs everyone out. | No |
@@ -134,7 +135,7 @@ Contents:
 
 Uploaded DICOM files are written to a temporary folder with server-chosen names during analysis and deleted immediately afterwards; the server keeps header fields and a small preview image, not the study itself.
 
-The training-data collector additionally writes **anonymised** thumbnails and labels under `data\training_corpus\` in the backend working directory (no names, IDs or birth dates).
+The training-data collector writes **anonymised** thumbnails and labels under `training_corpus\` inside the same data directory (`TRAINING_CORPUS_DIR` in `src/utils/paths.py`) — no names, IDs or birth dates.
 
 ### 6.1 Backup
 
@@ -156,6 +157,7 @@ The Windows uninstaller asks whether to delete the data folder. Answer **No** un
 
 - The server log (`logs\sentinel_*.log`) records study IDs (server-generated UUIDs), routes, timings, model load status, login attempts by username and errors. A global filter replaces obvious patient identifiers (`PatientID=…`, `PatientName=…`, birth dates and DICOM `Last^First` person names) with `<redacted>` before any line is written. Client file names are never logged.
 - The **audit log** (database table, also `GET /audit/log` for admins, last 200 entries) records who did what and when: `login`, `analyze_study`, `view_study`, `sign_report`, `change_password`, `register`, with the client IP and details such as the report hash.
+- The audit log is a **hash chain**: every row stores the hash of the previous row (`prev_hash`) and its own (`row_hash`), so a deleted or edited row breaks the chain. `GET /audit/verify` (admin only) walks the chain end to end and returns `{ok, rows, checked, head_hash, first_broken}`. Run it after a restore from backup and before handing the database to anyone; if `ok` is `false`, record the row id in `first_broken` and report it to the vendor.
 - The desktop app itself logs only to its own console (developer tools are open only in development builds).
 
 When sending logs to the vendor, send `sentinel_*.log` / `backend.log` only; never the database.
@@ -188,6 +190,14 @@ To install a model update:
 
 Never edit or rename files inside a model folder: the server would load a model whose identity no longer matches what was validated.
 
+### 8.3 Encrypted model weights (if the release ships them)
+
+The locally trained detector is the vendor's intellectual property; a release may ship it **encrypted at rest** (AES-256-GCM). Such a folder contains `model.safetensors.enc` and `model.safetensors.enc.meta.json` instead of `model.safetensors`. The server decrypts the weights straight into memory at load time; plaintext is never written to the install disk.
+
+- **The key** is either derived from `model_key.bin` in the data directory (created on first use, mode 0600) plus the machine fingerprint, or supplied via `SENTINEL_MODEL_KEY_HEX` as provisioned by the vendor for this install. If `model_key.bin` is lost or the fingerprint changes, the weights can no longer be decrypted — `/health` reports `degraded`; contact the vendor.
+- **Hash verification** differs from step 3 in §8.2: `MANIFEST.json` pins the **plaintext** SHA-256 (entry `model.safetensors` — the fingerprint the app shows) and the **ciphertext** SHA-256 (entry `model.safetensors.enc`). Compare `certutil -hashfile model.safetensors.enc SHA256` (macOS: `shasum -a 256 model.safetensors.enc`) with the `.enc` entry, and `plaintext_sha256` inside `model.safetensors.enc.meta.json` with the `model.safetensors` entry.
+- Command-line tool (from the backend folder): `python -m src.utils.model_crypto encrypt <model_dir>` (weights → `.enc`, plaintext removed), `python -m src.utils.model_crypto decrypt <model_dir>` (the reverse) and `python -m src.utils.model_crypto keyinfo` (key source and key fingerprint; never the key itself). `encrypt`/`decrypt` are the vendor's release-preparation steps; never run them on the live `models\` tree, only on a copy. On a clinic PC only `keyinfo` is normally needed — when the vendor asks for it.
+
 ---
 
 ## 9. Environment variables
@@ -202,7 +212,7 @@ Set these for the server process (in a packaged build the desktop shell already 
 | `SENTINEL_REQUIRE_AUTH` | on by default | `1` forces authentication on even in a developer run |
 | `SENTINEL_DEV_INSECURE` | unset | `1` = **developer mode only**: relaxes auth, exposes `/docs`, allows online model fetches. Never on a clinic PC. |
 | `DEV_BYPASS_LICENSE` | unset | `1` skips the licence check — honoured **only** together with `SENTINEL_DEV_INSECURE=1` |
-| `SENTINEL_HOSPITAL_BUILD` | unset | `1` marks a hospital build: offline posture is forced on |
+| `SENTINEL_HOSPITAL_BUILD` | unset | `1` marks a hospital build: offline posture becomes the default even in a developer run (only an explicit `SENTINEL_OFFLINE=0` overrides it) |
 | `SENTINEL_OFFLINE` | `1` unless developer mode | `0` allows model downloads (developer machines only) |
 | `SENTINEL_JWT_SECRET` | generated into `jwt_secret.key` | Override the token-signing secret |
 | `SENTINEL_SKIP_WARMUP` | unset | `1` skips loading the brain models at start-up (tests); `/health` then shows them as not loaded until first use |
@@ -211,7 +221,7 @@ Set these for the server process (in a packaged build the desktop shell already 
 | `SENTINEL_CORS_ORIGINS` / `SENTINEL_CORS_ALLOW_ALL` | localhost + Electron origins / off | Extra browser origins; `ALLOW_ALL=1` is not for production |
 | `SENTINEL_TLS_CERT`, `SENTINEL_TLS_KEY` | unset | Serve HTTPS — required if you ever expose the server beyond localhost |
 | `SENTINEL_WORKERS` | `1` | Uvicorn worker processes |
-| `SENTINEL_MODEL_KEY_HEX` | derived from `model_key.bin` + machine fingerprint | Raw AES key for encrypted model weights (release builds that ship `.enc` weights) |
+| `SENTINEL_MODEL_KEY_HEX` | derived from `model_key.bin` + machine fingerprint | Raw AES key for encrypted model weights (release builds that ship `.enc` weights; §8.3) |
 | `SENTINEL_MODEL_DIR_OVERRIDE_<KEY>` | unset | Point one detector at another folder (vendor A/B tests only) |
 | `SENTINEL_DEFAULT_LANG` | `ru` | Report language for the optional folder watcher |
 | `OLLAMA_KEEP_ALIVE` (Ollama's own) | — | e.g. `24h` keeps Gemma loaded in RAM so the first report of the day is not slow |
@@ -224,7 +234,7 @@ Start with **`GET http://127.0.0.1:8000/health`** (open it in a browser on the P
 
 ```json
 { "status": "ok" | "degraded" | "error", "version": "1.0.0", "device": "cpu",
-  "auth_required": true,
+  "auth_required": true, "offline": true,
   "models": { "brain_triage": {"loaded": true, "reason": "…"},
               "brain_tumor_class": {"loaded": true, "reason": "…"},
               "chest": {"loaded": false, "reason": "not loaded"} },
@@ -269,6 +279,9 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/auth/register -Headers $h -
 # 3. list users / read the audit log
 Invoke-RestMethod http://127.0.0.1:8000/auth/users -Headers $h
 Invoke-RestMethod "http://127.0.0.1:8000/audit/log?limit=200" -Headers $h
+
+# 4. verify the audit-log hash chain (expect ok: true)
+Invoke-RestMethod http://127.0.0.1:8000/audit/verify -Headers $h
 ```
 
 Give each doctor a personal account — the signature on a report is the account that signed it. Passwords are stored as bcrypt hashes; the API cannot show them back.
@@ -282,6 +295,6 @@ Give each doctor a personal account — the signature on a report is the account
 - **Ports are bound to localhost** (`127.0.0.1:8000`, `localhost:11434`). Do not change the host to `0.0.0.0` or add firewall exceptions. If a multi-PC deployment is ever required, use TLS (`SENTINEL_TLS_*`) and a network design agreed with the vendor.
 - The API documentation pages (`/docs`, `/redoc`) are disabled in production builds.
 - **Encrypt the disk** (BitLocker / FileVault): the SQLite database and logs are not encrypted by the application.
-- Signed reports are tamper-evident (SHA-256 of the text, signer, time, model identity, audit entry) but the database file itself can be edited by anyone with disk access — protect the account and the disk.
+- Signed reports are tamper-evident (SHA-256 of the text, signer, time, model identity, audit entry) and the audit log is a hash chain verifiable with `GET /audit/verify` (§7), but the database file itself can be edited by anyone with disk access — protect the account and the disk.
 - Uploaded files never keep their client file names on disk; temporary files are removed after analysis.
 - Give every user a personal account, remove accounts when staff leave, and keep the one-time admin password out of shared documents.

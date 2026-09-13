@@ -1,11 +1,20 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useAppStore } from '../store/appStore';
 import type { Study, AIResult, Lang } from '../types';
 import { analyzeStudy, describeApiError } from '../services/api';
 import { DEMO_MODE, DEMO_STUDIES } from '../services/demoData';
-import { L, findingUrgency, translateFinding } from '../services/findingTranslations';
+import { findingUrgency, translateFinding, statusWord } from '../services/findingTranslations';
+import { useT, formatDate, formatTime } from '../i18n';
+import type { TFn, I18nKey } from '../i18n';
 
 type SortKey = 'time' | 'patient' | 'modality' | 'status';
+
+const SORT_KEYS: Record<SortKey, I18nKey> = {
+  time: 'worklist.sortTime',
+  patient: 'worklist.sortPatient',
+  modality: 'worklist.sortModality',
+  status: 'worklist.sortStatus',
+};
 
 interface UploadProgress {
   phase: 'idle' | 'collecting' | 'uploading' | 'analyzing';
@@ -81,8 +90,9 @@ function reviewOnlyResult(studyId: string, reason: string): AIResult {
 export default function Sidebar() {
   const {
     studies, selectedStudyId, selectStudy, modalityFilter, setModalityFilter, searchQuery, setSearchQuery,
-    addStudy, setAIResult, setReport, settings, health, addNotification, aiResults,
+    addStudy, setAIResult, setReport, settings, health, addNotification, aiResults, uploadRequest,
   } = useAppStore();
+  const t = useT();
   const lang = settings.language;
   const [sortKey, setSortKey] = useState<SortKey>('time');
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
@@ -94,10 +104,17 @@ export default function Sidebar() {
   const uploading = progress.phase !== 'idle';
   const serverReady = !!health && health.reachable && health.status === 'ok';
 
+  // Menu / palette / ⌘O requests open the same hidden inputs as the buttons.
+  useEffect(() => {
+    if (!uploadRequest || uploading) return;
+    if (!serverReady) { addNotification({ type: 'error', title: t('health.aiServerDown') }); return; }
+    (uploadRequest.kind === 'folder' ? folderInputRef : fileInputRef).current?.click();
+  }, [uploadRequest?.nonce]);
+
   const handleUploadFiles = async (rawFiles: File[]) => {
     const files = filterAndSort(rawFiles);
     if (files.length === 0) {
-      addNotification({ type: 'warning', title: L('noDicomFiles', lang) });
+      addNotification({ type: 'warning', title: t('worklist.noDicomFiles') });
       return;
     }
     setProgress({ phase: 'uploading', count: files.length, percent: 0 });
@@ -127,7 +144,7 @@ export default function Sidebar() {
       }
       selectStudy(study.id);
       if (result.rejected || result.requiresReview) {
-        addNotification({ type: 'warning', title: L('notAnalyzed', lang), message: result.rejectionReason || undefined });
+        addNotification({ type: 'warning', title: t('worklist.notAnalyzed'), message: result.rejectionReason || undefined });
       }
     } catch (e) {
       const info = describeApiError(e);
@@ -143,13 +160,13 @@ export default function Sidebar() {
         addStudy(study);
         setAIResult(studyId, reviewOnlyResult(studyId, info.detail));
         selectStudy(studyId);
-        addNotification({ type: 'warning', title: L('notAnalyzed', lang), message: info.detail });
+        addNotification({ type: 'warning', title: t('worklist.notAnalyzed'), message: info.detail });
       } else if (info.code === 'network') {
-        addNotification({ type: 'error', title: L('aiServerDown', lang) });
+        addNotification({ type: 'error', title: t('health.aiServerDown') });
       } else if (info.code === 'auth') {
-        addNotification({ type: 'warning', title: L('sessionExpired', lang) });
+        addNotification({ type: 'warning', title: t('health.sessionExpired') });
       } else {
-        addNotification({ type: 'error', title: L('analysisFailed', lang), message: info.detail });
+        addNotification({ type: 'error', title: t('health.analysisFailed'), message: info.detail });
       }
     } finally {
       setProgress({ phase: 'idle', count: 0, percent: 0 });
@@ -179,7 +196,7 @@ export default function Sidebar() {
   const displayStudies = studies.length > 0 ? studies : (DEMO_MODE ? DEMO_STUDIES : []);
 
   const filtered = useMemo(() => {
-    let result = displayStudies.filter(s => {
+    const result = displayStudies.filter((s) => {
       if (modalityFilter !== 'all' && s.modality !== modalityFilter) return false;
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
@@ -202,10 +219,10 @@ export default function Sidebar() {
 
   const stats = useMemo(() => ({
     total: displayStudies.length,
-    pending: displayStudies.filter(s => s.aiStatus === 'pending').length,
-    processing: displayStudies.filter(s => s.aiStatus === 'processing').length,
-    complete: displayStudies.filter(s => s.aiStatus === 'complete').length,
-    error: displayStudies.filter(s => s.aiStatus === 'error').length,
+    pending: displayStudies.filter((s) => s.aiStatus === 'pending').length,
+    processing: displayStudies.filter((s) => s.aiStatus === 'processing').length,
+    complete: displayStudies.filter((s) => s.aiStatus === 'complete').length,
+    error: displayStudies.filter((s) => s.aiStatus === 'error').length,
   }), [displayStudies]);
 
   const modalities = useMemo(() => {
@@ -214,9 +231,9 @@ export default function Sidebar() {
   }, [displayStudies]);
 
   const progressLabel = (() => {
-    if (progress.phase === 'collecting') return `${L('uploading', lang)}…`;
-    if (progress.phase === 'uploading') return `${L('uploading', lang)} ${progress.count} ${L('files', lang)} · ${progress.percent}%`;
-    if (progress.phase === 'analyzing') return `${L('analyzingFiles', lang)} ${progress.count} ${L('files', lang)}…`;
+    if (progress.phase === 'collecting') return t('worklist.collecting');
+    if (progress.phase === 'uploading') return t('worklist.uploadingCount', { count: progress.count, percent: progress.percent });
+    if (progress.phase === 'analyzing') return t('worklist.analyzingCount', { count: progress.count });
     return '';
   })();
 
@@ -230,7 +247,7 @@ export default function Sidebar() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                 d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
             </svg>
-            Worklist
+            {t('worklist.title')}
           </h2>
 
           {/* View mode toggle */}
@@ -238,7 +255,7 @@ export default function Sidebar() {
             <button
               onClick={() => setViewMode('list')}
               className={`p-1 rounded transition-colors ${viewMode === 'list' ? 'bg-ink-700 text-accent-400' : 'text-ink-500 hover:text-ink-200'}`}
-              title="List view"
+              title={t('worklist.listView')}
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
@@ -247,7 +264,7 @@ export default function Sidebar() {
             <button
               onClick={() => setViewMode('grid')}
               className={`p-1 rounded transition-colors ${viewMode === 'grid' ? 'bg-ink-700 text-accent-400' : 'text-ink-500 hover:text-ink-200'}`}
-              title="Grid view"
+              title={t('worklist.gridView')}
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
@@ -265,7 +282,7 @@ export default function Sidebar() {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search patient, accession, modality..."
+            placeholder={t('worklist.searchPlaceholder')}
             className="w-full pl-8 pr-3 py-1.5 text-xs bg-ink-950/50 border border-ink-700 rounded-md text-ink-100 placeholder-ink-500 focus:outline-none focus:border-accent-500 focus:ring-2 focus:ring-accent-500/20"
           />
         </div>
@@ -273,7 +290,7 @@ export default function Sidebar() {
         {/* Modality Filter Pills (real modalities only) */}
         <div className="flex gap-1 overflow-x-auto">
           {modalities.map((m) => {
-            const count = m === 'all' ? displayStudies.length : displayStudies.filter(s => s.modality === m).length;
+            const count = m === 'all' ? displayStudies.length : displayStudies.filter((s) => s.modality === m).length;
             return (
               <button
                 key={m}
@@ -284,7 +301,7 @@ export default function Sidebar() {
                     : 'bg-ink-800 text-ink-400 hover:text-ink-200 hover:bg-ink-700'
                 }`}
               >
-                {m === 'all' ? 'All' : m} <span className="opacity-60">{count}</span>
+                {m === 'all' ? t('worklist.all') : m} <span className="opacity-60">{count}</span>
               </button>
             );
           })}
@@ -293,22 +310,22 @@ export default function Sidebar() {
 
       {/* Stats strip */}
       <div className="px-3 py-2 border-b border-ink-800 grid grid-cols-4 gap-1">
-        <StatChip label="Total" value={stats.total} color="text-ink-300" />
-        <StatChip label="Pending" value={stats.pending} color="text-ink-400" />
-        <StatChip label="Analyzing" value={stats.processing} color="text-accent-400" pulse={stats.processing > 0} />
-        <StatChip label="Done" value={stats.complete} color="text-normal" />
+        <StatChip label={t('worklist.total')} value={stats.total} color="text-ink-300" />
+        <StatChip label={t('worklist.pending')} value={stats.pending} color="text-ink-400" />
+        <StatChip label={t('worklist.analyzing')} value={stats.processing} color="text-accent-400" pulse={stats.processing > 0} />
+        <StatChip label={t('worklist.done')} value={stats.complete} color="text-normal" />
       </div>
 
       {/* Sort bar */}
       <div className="px-3 py-1.5 border-b border-ink-800 flex items-center gap-2 text-[10px] text-ink-500">
-        <span className="uppercase tracking-wider">Sort:</span>
-        {(['time', 'patient', 'modality', 'status'] as SortKey[]).map(k => (
+        <span className="uppercase tracking-wider">{t('worklist.sort')}</span>
+        {(['time', 'patient', 'modality', 'status'] as SortKey[]).map((k) => (
           <button
             key={k}
             onClick={() => setSortKey(k)}
             className={`capitalize ${sortKey === k ? 'text-accent-400 font-medium' : 'text-ink-500 hover:text-ink-300'}`}
           >
-            {k}
+            {t(SORT_KEYS[k])}
           </button>
         ))}
       </div>
@@ -317,7 +334,7 @@ export default function Sidebar() {
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
         {filtered.map((study) => (
           viewMode === 'list'
-            ? <StudyCard key={study.id} study={study} result={aiResults[study.id]} lang={lang} selected={study.id === selectedStudyId} onClick={() => selectStudy(study.id)} />
+            ? <StudyCard key={study.id} study={study} result={aiResults[study.id]} lang={lang} t={t} selected={study.id === selectedStudyId} onClick={() => selectStudy(study.id)} />
             : <StudyThumb key={study.id} study={study} selected={study.id === selectedStudyId} onClick={() => selectStudy(study.id)} />
         ))}
 
@@ -327,8 +344,8 @@ export default function Sidebar() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
                 d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
             </svg>
-            <p className="text-sm text-ink-400">{displayStudies.length === 0 ? L('noStudies', lang) : 'No studies found'}</p>
-            <p className="text-xs text-ink-600 mt-1">{displayStudies.length === 0 ? L('noStudiesHint', lang) : 'Try adjusting filters'}</p>
+            <p className="text-sm text-ink-400">{displayStudies.length === 0 ? t('worklist.noStudies') : t('worklist.noMatch')}</p>
+            <p className="text-xs text-ink-600 mt-1">{displayStudies.length === 0 ? t('worklist.noStudiesHint') : t('worklist.noMatchHint')}</p>
           </div>
         )}
       </div>
@@ -378,30 +395,30 @@ export default function Sidebar() {
             <button
               onClick={() => folderInputRef.current?.click()}
               disabled={!serverReady}
-              title={serverReady ? L('uploadStudy', lang) : L('aiServerDown', lang)}
+              title={serverReady ? t('worklist.uploadStudy') : t('health.aiServerDown')}
               className="py-2 bg-accent-600 hover:bg-accent-500 disabled:bg-ink-700 disabled:text-ink-500 disabled:cursor-not-allowed text-white text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 shadow-sm"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
               </svg>
-              {L('uploadFolder', lang)}
+              {t('worklist.uploadFolder')}
             </button>
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={!serverReady}
-              title={serverReady ? L('uploadStudy', lang) : L('aiServerDown', lang)}
+              title={serverReady ? t('worklist.uploadStudy') : t('health.aiServerDown')}
               className="py-2 bg-ink-800 hover:bg-ink-700 disabled:bg-ink-800/50 disabled:text-ink-600 disabled:cursor-not-allowed text-ink-100 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 border border-ink-700"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
               </svg>
-              {L('uploadFiles', lang)}
+              {t('worklist.uploadFiles')}
             </button>
           </div>
         )}
 
         <div className="text-[10px] text-ink-500 text-center">
-          {serverReady ? L('dropHint', lang) : L('aiServerDown', lang)}
+          {serverReady ? t('worklist.dropHint') : t('health.aiServerDown')}
         </div>
       </div>
     </div>
@@ -418,28 +435,35 @@ function StatChip({ label, value, color, pulse }: { label: string; value: number
 }
 
 /** Worklist badge derived from the real AI result — never random. */
-function resultBadge(result: AIResult | undefined, lang: Lang) {
+function resultBadge(result: AIResult | undefined, lang: Lang, t: TFn) {
   if (!result) return null;
   if (result.rejected || result.requiresReview) {
-    return { label: L('needsReview', lang), cls: 'severity-moderate', top: null as null | { name: string; confidence: number } };
+    return { label: t('worklist.needsReview'), cls: 'severity-moderate', top: null as null | { name: string; confidence: number } };
   }
   const positives = result.findings.filter((f) => f.positive);
   if (positives.length === 0) return null;
   const top = positives.reduce((a, b) => (b.confidence > a.confidence ? b : a));
   const urgency = findingUrgency(top);
   return {
-    label: urgency === 'review' ? L('needsReview', lang) : `${L('needsReview', lang)} · ${top.status}`,
+    label: urgency === 'review' ? t('worklist.needsReview') : `${t('worklist.needsReview')} · ${statusWord(top.status, lang)}`,
     cls: urgency === 'review' ? 'severity-critical' : 'severity-moderate',
     top: { name: translateFinding(top.className, lang), confidence: top.confidence },
   };
 }
 
-function StudyCard({ study, result, lang, selected, onClick }: { study: Study; result?: AIResult; lang: Lang; selected: boolean; onClick: () => void }) {
+const STATUS_KEYS: Record<Study['aiStatus'], I18nKey> = {
+  pending: 'worklist.status.pending',
+  processing: 'worklist.status.processing',
+  complete: 'worklist.status.complete',
+  error: 'worklist.status.error',
+};
+
+function StudyCard({ study, result, lang, t, selected, onClick }: { study: Study; result?: AIResult; lang: Lang; t: TFn; selected: boolean; onClick: () => void }) {
   const statusConfig = {
-    pending: { color: 'bg-ink-500', label: 'Pending', textColor: 'text-ink-400' },
-    processing: { color: 'bg-accent-500 animate-pulse', label: 'Analyzing', textColor: 'text-accent-400' },
-    complete: { color: 'bg-normal', label: 'Complete', textColor: 'text-normal' },
-    error: { color: 'bg-critical', label: 'Error', textColor: 'text-critical' },
+    pending: { color: 'bg-ink-500', textColor: 'text-ink-400' },
+    processing: { color: 'bg-accent-500 animate-pulse', textColor: 'text-accent-400' },
+    complete: { color: 'bg-normal', textColor: 'text-normal' },
+    error: { color: 'bg-critical', textColor: 'text-critical' },
   }[study.aiStatus];
 
   const modalityColors: Record<string, string> = {
@@ -448,7 +472,7 @@ function StudyCard({ study, result, lang, selected, onClick }: { study: Study; r
     US: 'border-l-yellow-500',
   };
 
-  const badge = resultBadge(result, lang);
+  const badge = resultBadge(result, lang, t);
 
   return (
     <div
@@ -469,7 +493,7 @@ function StudyCard({ study, result, lang, selected, onClick }: { study: Study; r
         <div className="flex items-center gap-1 flex-shrink-0">
           <span className={`w-1.5 h-1.5 rounded-full ${statusConfig.color}`} />
           <span className={`text-[9px] font-medium uppercase tracking-wider ${statusConfig.textColor}`}>
-            {statusConfig.label}
+            {t(STATUS_KEYS[study.aiStatus])}
           </span>
         </div>
       </div>
@@ -477,9 +501,9 @@ function StudyCard({ study, result, lang, selected, onClick }: { study: Study; r
       <div className="text-sm font-semibold text-ink-100 font-mono mb-0.5 truncate">{study.patientId}</div>
 
       <div className="flex items-center justify-between text-[10px] text-ink-500">
-        <span className="truncate">{study.bodyPart}{study.numFiles ? ` · ${study.numFiles} ${L('files', lang)}` : ''}</span>
+        <span className="truncate">{study.bodyPart}{study.numFiles ? ` · ${study.numFiles} ${t('common.files')}` : ''}</span>
         <span className="font-mono flex-shrink-0">
-          {study.studyDate || new Date(study.receivedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
+          {study.studyDate ? formatDate(study.studyDate, lang) : formatTime(study.receivedAt, lang)}
         </span>
       </div>
 

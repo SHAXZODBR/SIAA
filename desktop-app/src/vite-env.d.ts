@@ -22,6 +22,10 @@ interface ElectronAPI {
   getMachineId: () => Promise<string>;
   readLicense: () => Promise<string | null>;
   writeLicense: (data: string) => Promise<{ success: boolean; error?: string }>;
+  /** Fingerprint from the Python server's own CLI — the value licenses are bound to. */
+  getServerFingerprint?: () => Promise<{ fingerprint: string | null; error: string | null }>;
+  /** Opens the bundled docs/ folder in the OS file manager; opened=false when none is bundled. */
+  openDocs?: () => Promise<{ opened: boolean; path: string | null; error?: string }>;
 }
 
 interface Window {

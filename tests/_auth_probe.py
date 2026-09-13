@@ -38,6 +38,9 @@ def main() -> None:
         out["sign_no_token"] = c.post("/report/sign", json={"study_id": "x", "report_text": "t"}).status_code
         out["correction_no_token"] = c.post("/report/save_correction", json={
             "study_id": "x", "original_report": "a", "corrected_report": "b"}).status_code
+        out["pacs_status_no_token"] = c.get("/pacs/status").status_code
+        out["report_pdf_no_token"] = c.post(
+            "/report/x/pdf", files=[("pdf", ("r.pdf", b"%PDF-1.4\n", "application/pdf"))]).status_code
 
         out["login_wrong"] = c.post("/auth/login", json={"username": "admin", "password": "wrong-pw"}).status_code
         out["login_unknown_user"] = c.post("/auth/login", json={"username": "nobody", "password": "x"}).status_code

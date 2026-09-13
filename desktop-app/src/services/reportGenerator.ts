@@ -7,6 +7,7 @@
 
 import type { Finding, AIResult } from '../types';
 import { translateFinding, findingUrgency } from './findingTranslations';
+import { formatDate } from '../i18n';
 
 interface ReportTemplate {
   clinicalIndication: string;
@@ -368,12 +369,7 @@ export function formatFullReport(
   doctorName: string,
   language: Lang = 'ru',
 ): string {
-  const dateStr =
-    language === 'ru'
-      ? new Date().toLocaleDateString('ru-RU')
-      : language === 'uz'
-        ? new Date().toLocaleDateString('en-GB')
-        : new Date().toLocaleDateString('en-US');
+  const dateStr = formatDate(new Date(), language);
 
   if (language === 'ru') {
     return `ПРОТОКОЛ РЕНТГЕНОЛОГИЧЕСКОГО ИССЛЕДОВАНИЯ

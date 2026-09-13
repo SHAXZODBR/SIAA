@@ -72,8 +72,21 @@ interface AppState {
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
   settingsOpen: boolean;
-  openSettings: () => void;
+  settingsSection: string;
+  openSettings: (section?: string) => void;
   closeSettings: () => void;
+  /** First-run wizard forced open from Settings ("Run setup again"). */
+  setupOpen: boolean;
+  openSetup: () => void;
+  closeSetup: () => void;
+  helpOpen: boolean;
+  openHelp: () => void;
+  closeHelp: () => void;
+  /** Cross-component requests (menu / palette → Sidebar upload inputs, → ReportTab export). */
+  uploadRequest: { kind: 'folder' | 'files'; nonce: number } | null;
+  requestUpload: (kind: 'folder' | 'files') => void;
+  exportRequest: number;
+  requestExport: () => void;
 
   // Notifications
   notifications: Notification[];
@@ -108,8 +121,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   language: 'ru',
   clinicName: '',
   clinicAddress: '',
+  clinicPhone: '',
   supportContact: '',
   theme: 'dark',
+  setupComplete: false,
 };
 
 export const signedKey = (studyId: string, language: Lang) => `${studyId}:${language}`;
@@ -204,8 +219,19 @@ export const useAppStore = create<AppState>()(
       commandPaletteOpen: false,
       setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
       settingsOpen: false,
-      openSettings: () => set({ settingsOpen: true }),
+      settingsSection: 'general',
+      openSettings: (section) => set((s) => ({ settingsOpen: true, settingsSection: section || s.settingsSection })),
       closeSettings: () => set({ settingsOpen: false }),
+      setupOpen: false,
+      openSetup: () => set({ setupOpen: true, settingsOpen: false, commandPaletteOpen: false }),
+      closeSetup: () => set({ setupOpen: false }),
+      helpOpen: false,
+      openHelp: () => set({ helpOpen: true, commandPaletteOpen: false }),
+      closeHelp: () => set({ helpOpen: false }),
+      uploadRequest: null,
+      requestUpload: (kind) => set({ uploadRequest: { kind, nonce: Date.now() } }),
+      exportRequest: 0,
+      requestExport: () => set((s) => ({ exportRequest: s.exportRequest + 1, rightPanelOpen: true, rightPanelTab: 'report' })),
 
       // Notifications
       notifications: [],

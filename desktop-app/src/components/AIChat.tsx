@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useAppStore } from '../store/appStore';
-import { askAIQuestion } from '../services/api';
+import { askAIQuestion, describeApiError } from '../services/api';
+import { useT, useLang, formatTime, langShort } from '../i18n';
+import type { I18nKey } from '../i18n';
 
 interface ChatMessage {
   id: string;
@@ -9,17 +11,18 @@ interface ChatMessage {
   timestamp: number;
 }
 
+const STUDY_SUGGESTIONS: I18nKey[] = ['chat.s1', 'chat.s2', 'chat.s3', 'chat.s4', 'chat.s5'];
+const GENERAL_SUGGESTIONS: I18nKey[] = ['chat.g1', 'chat.g2', 'chat.g3', 'chat.g4', 'chat.g5'];
+
 /**
- * AI Chat Panel — doctor asks follow-up questions about analysis.
- * Uses Gemma 3 locally via Ollama.
- *
- * Example questions:
- *   "Could this be tuberculosis instead of pneumonia?"
- *   "What's the differential diagnosis?"
- *   "Recommend next steps"
+ * Ask-AI panel — the doctor asks follow-up questions about the analysis.
+ * Answered by the local report-assistant LLM (POST /report/ask); the backend
+ * name comes from /health, nothing is hard-coded here.
  */
 export default function AIChat() {
-  const { selectedStudyId, aiResults, settings } = useAppStore();
+  const { selectedStudyId, aiResults, settings, health } = useAppStore();
+  const t = useT();
+  const lang = useLang();
   const result = selectedStudyId ? aiResults[selectedStudyId] : null;
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -28,58 +31,9 @@ export default function AIChat() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Suggested questions per language — different sets for study vs no-study
-  const studySuggestions: Record<string, string[]> = {
-    ru: [
-      'Может ли это быть туберкулезом?',
-      'Какие дополнительные исследования рекомендуешь?',
-      'Какой дифференциальный диагноз?',
-      'Объясни находку простыми словами для пациента',
-      'Насколько срочно это нужно лечить?',
-    ],
-    uz: [
-      'Bu tuberkulyoz bo\'lishi mumkinmi?',
-      'Qanday qo\'shimcha tekshiruvlarni tavsiya qilasiz?',
-      'Differensial tashxis qanday?',
-      'Topilmani bemor uchun oddiy so\'zlar bilan tushuntiring',
-      'Buni qanchalik shoshilinch davolash kerak?',
-    ],
-    en: [
-      'Could this be tuberculosis?',
-      'What additional tests do you recommend?',
-      'What\'s the differential diagnosis?',
-      'Explain the finding in simple terms for the patient',
-      'How urgent is treatment needed?',
-    ],
-  };
-
-  const generalSuggestions: Record<string, string[]> = {
-    ru: [
-      'Что такое пневмония и как её диагностировать?',
-      'Какие признаки кардиомегалии на рентгене?',
-      'Различия между глиомой и менингиомой',
-      'Что такое плевральный выпот?',
-      'Признаки COVID-19 на КТ грудной клетки',
-    ],
-    uz: [
-      'Pnevmoniya nima va uni qanday tashxis qilish mumkin?',
-      'Rentgenda kardiomegaliya belgilari qanday?',
-      'Glioma va meningioma o\'rtasidagi farq',
-      'Plevral vypot nima?',
-      'KT da COVID-19 belgilari',
-    ],
-    en: [
-      'What is pneumonia and how to diagnose it?',
-      'What are signs of cardiomegaly on X-ray?',
-      'Differences between glioma and meningioma',
-      'What is pleural effusion?',
-      'Signs of COVID-19 on chest CT',
-    ],
-  };
-
-  const currentSuggestions = result
-    ? (studySuggestions[settings.language] || studySuggestions.en)
-    : (generalSuggestions[settings.language] || generalSuggestions.en);
+  const currentSuggestions = (result ? STUDY_SUGGESTIONS : GENERAL_SUGGESTIONS).map((k) => t(k));
+  const llmReady = !!health?.reachable && !!health.llm.reachable;
+  const llmName = health?.llm.backend || 'LLM';
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -99,19 +53,21 @@ export default function AIChat() {
       text: text.trim(),
       timestamp: Date.now(),
     };
-    setMessages(prev => [...prev, userMsg]);
+    setMessages((prev) => [...prev, userMsg]);
     setInput('');
     setLoading(true);
 
     try {
       // If a study is selected, include findings as context. Otherwise, general Q&A.
-      const findings = result?.findings.map(f => ({
+      const findings = result?.findings.map((f) => ({
         class_name: f.className,
         confidence: f.confidence,
         location: f.location,
+        positive: f.positive,
+        status: f.status,
       })) || [];
 
-      const context = result?.overallImpression || 'No specific study selected. General medical question.';
+      const context = result?.overallImpression || t('chat.noStudyContext');
 
       const answer = await askAIQuestion(
         text.trim(),
@@ -126,12 +82,14 @@ export default function AIChat() {
         text: answer,
         timestamp: Date.now(),
       };
-      setMessages(prev => [...prev, aiMsg]);
-    } catch (e: any) {
-      setMessages(prev => [...prev, {
+      setMessages((prev) => [...prev, aiMsg]);
+    } catch (e) {
+      const info = describeApiError(e);
+      console.warn('Ask AI failed:', info.code, info.detail);
+      setMessages((prev) => [...prev, {
         id: Math.random().toString(36).slice(2),
         role: 'ai',
-        text: `Error: ${e.message || 'Gemma not available. Make sure Ollama is running.'}`,
+        text: info.code === 'network' ? t('health.aiServerDown') : info.code === 'auth' ? t('health.sessionExpired') : t('chat.error'),
         timestamp: Date.now(),
       }]);
     } finally {
@@ -147,8 +105,6 @@ export default function AIChat() {
     }
   };
 
-  // Allow chat even without study — for general medical questions
-
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -160,27 +116,34 @@ export default function AIChat() {
             </svg>
           </div>
           <div className="flex-1 min-w-0">
-            <div className="text-xs font-semibold text-ink-100">Ask Gemma 3</div>
-            <div className="text-[10px] text-ink-500">
-              Medical AI assistant · {settings.language.toUpperCase()} · 100% local
+            <div className="text-xs font-semibold text-ink-100">{t('chat.title')}</div>
+            <div className="text-[10px] text-ink-500 truncate">
+              {t('chat.subtitle', { lang: langShort(lang) })}
+              {health?.reachable ? ` · ${llmName}` : ''}
             </div>
           </div>
           <button
             onClick={() => setMessages([])}
             className="text-[10px] text-ink-500 hover:text-ink-300"
-            title="Clear chat"
+            title={t('chat.clear')}
           >
-            Clear
+            {t('chat.clear')}
           </button>
         </div>
       </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
+        {!llmReady && (
+          <div className="px-3 py-2 rounded-lg border border-moderate/40 bg-moderate/10 text-[11px] text-ink-200 leading-snug">
+            {health?.reachable ? t('chat.error') : t('health.aiServerDown')}
+          </div>
+        )}
+
         {messages.length === 0 && (
           <div className="space-y-3">
             <div className="text-[10px] font-semibold text-ink-500 uppercase tracking-wider px-1">
-              Suggested Questions
+              {t('chat.suggested')}
             </div>
             {currentSuggestions.map((q, i) => (
               <button
@@ -192,12 +155,12 @@ export default function AIChat() {
               </button>
             ))}
             <div className="text-[10px] text-ink-500 px-1 pt-2">
-              💡 Gemma sees the AI findings + report for this study and answers based on that context.
+              {t('chat.hint')}
             </div>
           </div>
         )}
 
-        {messages.map(msg => (
+        {messages.map((msg) => (
           <div
             key={msg.id}
             className={`flex gap-2 animate-fade-in ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
@@ -216,12 +179,12 @@ export default function AIChat() {
             >
               {msg.text}
               <div className="text-[9px] opacity-60 mt-1">
-                {new Date(msg.timestamp).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}
+                {formatTime(msg.timestamp, lang)}
               </div>
             </div>
             {msg.role === 'user' && (
               <div className="w-7 h-7 flex-shrink-0 bg-ink-700 rounded-full flex items-center justify-center text-[10px] font-bold text-ink-200">
-                DR
+                {useAppStore.getState().currentUser?.fullName?.split(' ').map((n) => n[0]).join('').substring(0, 2) || '·'}
               </div>
             )}
           </div>
@@ -237,7 +200,7 @@ export default function AIChat() {
                 <span className="w-1.5 h-1.5 rounded-full bg-ink-400 animate-pulse" style={{ animationDelay: '0ms' }} />
                 <span className="w-1.5 h-1.5 rounded-full bg-ink-400 animate-pulse" style={{ animationDelay: '200ms' }} />
                 <span className="w-1.5 h-1.5 rounded-full bg-ink-400 animate-pulse" style={{ animationDelay: '400ms' }} />
-                <span className="text-ink-400 ml-1">Thinking...</span>
+                <span className="text-ink-400 ml-1">{t('chat.thinking')}</span>
               </div>
             </div>
           </div>
@@ -252,13 +215,9 @@ export default function AIChat() {
           <textarea
             ref={inputRef}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={
-              settings.language === 'ru' ? 'Задайте вопрос о находках...' :
-              settings.language === 'uz' ? 'Topilmalar haqida savol bering...' :
-              'Ask a question about findings...'
-            }
+            placeholder={t('chat.placeholder')}
             rows={2}
             className="w-full px-3 py-2 pr-10 text-xs bg-ink-900 border border-ink-700 rounded-lg text-ink-100 placeholder-ink-500 focus:outline-none focus:border-accent-500 resize-none"
           />
@@ -273,10 +232,10 @@ export default function AIChat() {
           </button>
         </div>
         <div className="text-[9px] text-ink-500 mt-1.5 flex items-center justify-between">
-          <span>Press Enter to send · Shift+Enter for new line</span>
+          <span>{t('chat.enterHint')}</span>
           <span className="flex items-center gap-1">
-            <span className="w-1 h-1 rounded-full bg-normal animate-pulse" />
-            Local · No internet
+            <span className={`w-1 h-1 rounded-full ${llmReady ? 'bg-normal animate-pulse' : 'bg-ink-600'}`} />
+            {t('chat.local')}
           </span>
         </div>
       </div>

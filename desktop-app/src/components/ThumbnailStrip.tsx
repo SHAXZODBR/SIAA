@@ -1,5 +1,6 @@
 import React from 'react';
 import { useAppStore } from '../store/appStore';
+import { useT } from '../i18n';
 
 /**
  * Series strip at the bottom — lists the REAL series descriptions the server
@@ -9,6 +10,7 @@ import { useAppStore } from '../store/appStore';
  */
 export default function ThumbnailStrip() {
   const { thumbnailStripOpen, selectedStudyId, studies } = useAppStore();
+  const t = useT();
   const study = studies.find((s) => s.id === selectedStudyId);
   const series = study?.seriesDescriptions || [];
 
@@ -17,9 +19,9 @@ export default function ThumbnailStrip() {
   return (
     <div className="h-16 bg-ink-950 border-t border-ink-800 flex items-center px-3 gap-2 overflow-x-auto animate-slide-up">
       <div className="flex-shrink-0 pr-3 border-r border-ink-800 h-full flex flex-col justify-center">
-        <div className="text-[9px] text-ink-500 uppercase tracking-wider font-semibold">Series</div>
+        <div className="text-[9px] text-ink-500 uppercase tracking-wider font-semibold">{t('series.title')}</div>
         <div className="text-[10px] text-ink-500">
-          {series.length}{study.numFiles ? ` · ${study.numFiles} files` : ''}
+          {series.length}{study.numFiles ? ` · ${t('series.files', { count: study.numFiles })}` : ''}
         </div>
       </div>
 
@@ -29,7 +31,7 @@ export default function ThumbnailStrip() {
           className="flex-shrink-0 px-2 py-1 rounded bg-ink-900 border border-ink-800 text-[10px] font-mono text-ink-300 max-w-[180px] truncate"
           title={name}
         >
-          {name || `Series ${i + 1}`}
+          {name || t('series.unnamed', { n: i + 1 })}
         </div>
       ))}
     </div>

@@ -1,5 +1,6 @@
 import React, { useEffect } from 'react';
 import { useAppStore } from '../store/appStore';
+import { useT } from '../i18n';
 
 const AUTO_DISMISS_MS = 8000;
 
@@ -9,6 +10,7 @@ const AUTO_DISMISS_MS = 8000;
  */
 export default function Toasts() {
   const { notifications, dismissNotification } = useAppStore();
+  const t = useT();
   const visible = notifications.slice(0, 4);
 
   useEffect(() => {
@@ -38,6 +40,7 @@ export default function Toasts() {
       {visible.map((n) => (
         <div
           key={n.id}
+          role="status"
           className={`pointer-events-auto p-3 rounded-lg border shadow-xl animate-slide-up ${styles[n.type] || styles.info}`}
         >
           <div className="flex items-start gap-2">
@@ -54,7 +57,8 @@ export default function Toasts() {
             <button
               onClick={() => dismissNotification(n.id)}
               className="text-ink-500 hover:text-ink-200 text-sm leading-none"
-              aria-label="Dismiss"
+              aria-label={t('common.dismiss')}
+              title={t('common.dismiss')}
             >
               ×
             </button>

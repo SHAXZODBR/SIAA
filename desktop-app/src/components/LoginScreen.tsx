@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../store/appStore';
 import { login, changePassword, describeApiError } from '../services/api';
-import { L } from '../services/findingTranslations';
+import { useT, LANGS, langShort, langName } from '../i18n';
 import { PRODUCT_NAME, getAppVersion } from '../services/appInfo';
 
 /**
@@ -11,6 +11,7 @@ import { PRODUCT_NAME, getAppVersion } from '../services/appInfo';
  */
 export default function LoginScreen() {
   const { setAuth, currentUser, mustChangePassword, settings, health, updateSettings } = useAppStore();
+  const t = useT();
   const lang = settings.language;
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -20,16 +21,16 @@ export default function LoginScreen() {
   const [version, setVersion] = useState('');
 
   useEffect(() => {
-    const t = setTimeout(() => setMounted(true), 50);
+    const tm = setTimeout(() => setMounted(true), 50);
     getAppVersion().then(setVersion).catch(() => {});
-    return () => clearTimeout(t);
+    return () => clearTimeout(tm);
   }, []);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     if (!username || !password) {
-      setError(L('enterBoth', lang));
+      setError(t('login.enterBoth'));
       return;
     }
     setLoading(true);
@@ -40,9 +41,9 @@ export default function LoginScreen() {
     } catch (err) {
       const info = describeApiError(err);
       console.error('Login failed:', info.code, info.detail);
-      if (info.code === 'auth') setError(L('badCredentials', lang));
-      else if (info.code === 'network') setError(L('aiServerDown', lang));
-      else setError(L('aiServerError', lang));
+      if (info.code === 'auth') setError(t('login.badCredentials'));
+      else if (info.code === 'network') setError(t('health.aiServerDown'));
+      else setError(t('health.aiServerError'));
     } finally {
       setLoading(false);
     }
@@ -51,10 +52,10 @@ export default function LoginScreen() {
   const showChangePassword = !!currentUser && mustChangePassword;
 
   const serverState = !health || !health.reachable
-    ? { label: L('offline', lang), color: 'bg-critical' }
+    ? { label: t('common.offline'), color: 'bg-critical' }
     : health.status === 'ok'
-      ? { label: L('online', lang), color: 'bg-normal' }
-      : { label: L('degraded', lang), color: 'bg-moderate' };
+      ? { label: t('common.online'), color: 'bg-normal' }
+      : { label: t('common.degraded'), color: 'bg-moderate' };
 
   return (
     <div className="h-screen w-screen bg-ink-950 flex overflow-hidden">
@@ -70,41 +71,42 @@ export default function LoginScreen() {
           </div>
           <div>
             <div className="text-lg font-bold text-ink-100 tracking-tight">SENTINEL</div>
-            <div className="text-[10px] text-ink-500 uppercase tracking-[0.2em]">Medical AI</div>
+            <div className="text-[10px] text-ink-500 uppercase tracking-[0.2em]">{t('product.tagline')}</div>
           </div>
         </div>
 
         {/* Language switcher */}
-        <div className="flex items-center gap-1 mb-6">
-          {(['ru', 'uz', 'en'] as const).map((l) => (
+        <div className="flex items-center gap-1 mb-6" role="group" aria-label={t('topbar.language')}>
+          {LANGS.map((l) => (
             <button
               key={l}
               type="button"
               onClick={() => updateSettings({ language: l })}
+              title={langName(l)}
               className={`px-2 py-0.5 text-[10px] font-semibold rounded ${
                 lang === l ? 'bg-accent-600 text-white' : 'bg-ink-800 text-ink-400 hover:text-ink-200'
               }`}
             >
-              {l === 'ru' ? 'РУС' : l === 'uz' ? "O'ZB" : 'ENG'}
+              {langShort(l)}
             </button>
           ))}
         </div>
 
         {showChangePassword ? (
-          <ChangePasswordForm lang={lang} />
+          <ChangePasswordForm />
         ) : (
           <>
             {/* Welcome */}
             <div className={`mb-8 transition-all duration-500 delay-100 ${mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}>
-              <h1 className="text-2xl font-bold text-ink-100 mb-1">{L('loginTitle', lang)}</h1>
-              <p className="text-sm text-ink-400">{L('loginSubtitle', lang)}</p>
+              <h1 className="text-2xl font-bold text-ink-100 mb-1">{t('login.title')}</h1>
+              <p className="text-sm text-ink-400">{t('login.subtitle')}</p>
             </div>
 
             {/* Form */}
             <form onSubmit={handleLogin} className={`space-y-4 transition-all duration-500 delay-200 ${mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}>
               <div>
                 <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">
-                  {L('username', lang)}
+                  {t('login.username')}
                 </label>
                 <input
                   type="text"
@@ -118,7 +120,7 @@ export default function LoginScreen() {
 
               <div>
                 <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">
-                  {L('password', lang)}
+                  {t('login.password')}
                 </label>
                 <input
                   type="password"
@@ -139,11 +141,11 @@ export default function LoginScreen() {
                 {loading ? (
                   <>
                     <Spinner />
-                    {L('authenticating', lang)}
+                    {t('login.authenticating')}
                   </>
                 ) : (
                   <>
-                    {L('signIn', lang)}
+                    {t('login.signIn')}
                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M17 8l4 4m0 0l-4 4m4-4H3" />
                     </svg>
@@ -162,13 +164,13 @@ export default function LoginScreen() {
           <div className="flex items-center gap-4 text-[10px] text-ink-500">
             <span className="flex items-center gap-1">
               <div className={`w-1.5 h-1.5 rounded-full ${serverState.color}`} />
-              {L('aiServer', lang)}: {serverState.label}
+              {t('login.aiServer')}: {serverState.label}
             </span>
-            <span className="font-mono truncate" title={settings.inferenceUrl}>{settings.inferenceUrl}</span>
+            <span className="font-mono truncate" title={`${t('login.serverUrl')}: ${settings.inferenceUrl}`}>{settings.inferenceUrl}</span>
           </div>
           <div className="text-[10px] text-ink-600 flex items-center justify-between">
             <span>{version ? `v${version}` : ''}</span>
-            <span>{L('support', lang)}: {settings.supportContact || L('supportPlaceholder', lang)}</span>
+            <span>{t('common.support')}: {settings.supportContact || t('login.supportPlaceholder')}</span>
           </div>
         </div>
       </div>
@@ -184,16 +186,17 @@ export default function LoginScreen() {
               {PRODUCT_NAME}
             </h2>
             {version && (
-              <div className="text-sm font-mono text-ink-500 mb-6">{L('version', lang)} {version}</div>
+              <div className="text-sm font-mono text-ink-500 mb-6">{t('common.version')} {version}</div>
             )}
             <p className="text-lg text-ink-300 max-w-xl leading-relaxed border-l-2 border-accent-500 pl-4">
-              {L('intendedUse', lang)}
+              {t('product.intendedUse')}
             </p>
           </div>
 
           <div className="max-w-xl p-4 bg-ink-900/50 backdrop-blur border border-ink-800 rounded-xl text-xs text-ink-400 leading-relaxed">
-            {settings.clinicName || L('clinicPlaceholder', lang)}
+            {settings.clinicName || t('login.clinicPlaceholder')}
             {settings.clinicAddress ? ` · ${settings.clinicAddress}` : ''}
+            {settings.clinicPhone ? ` · ${settings.clinicPhone}` : ''}
           </div>
         </div>
       </div>
@@ -201,8 +204,9 @@ export default function LoginScreen() {
   );
 }
 
-function ChangePasswordForm({ lang }: { lang: 'ru' | 'uz' | 'en' }) {
+function ChangePasswordForm() {
   const { setMustChangePassword } = useAppStore();
+  const t = useT();
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -212,8 +216,8 @@ function ChangePasswordForm({ lang }: { lang: 'ru' | 'uz' | 'en' }) {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    if (newPassword.length < 8) { setError(L('passwordTooShort', lang)); return; }
-    if (newPassword !== confirm) { setError(L('passwordsDiffer', lang)); return; }
+    if (newPassword.length < 8) { setError(t('login.passwordTooShort')); return; }
+    if (newPassword !== confirm) { setError(t('login.passwordsDiffer')); return; }
     setLoading(true);
     try {
       await changePassword(oldPassword, newPassword);
@@ -221,7 +225,7 @@ function ChangePasswordForm({ lang }: { lang: 'ru' | 'uz' | 'en' }) {
     } catch (err) {
       const info = describeApiError(err);
       console.error('Change password failed:', info.code, info.detail);
-      setError(info.code === 'network' ? L('aiServerDown', lang) : L('changeFailed', lang));
+      setError(info.code === 'network' ? t('health.aiServerDown') : t('login.changeFailed'));
     } finally {
       setLoading(false);
     }
@@ -230,20 +234,20 @@ function ChangePasswordForm({ lang }: { lang: 'ru' | 'uz' | 'en' }) {
   return (
     <>
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-ink-100 mb-1">{L('changePassword', lang)}</h1>
-        <p className="text-sm text-ink-400">{L('changePasswordHint', lang)}</p>
+        <h1 className="text-2xl font-bold text-ink-100 mb-1">{t('login.changePassword')}</h1>
+        <p className="text-sm text-ink-400">{t('login.changePasswordHint')}</p>
       </div>
       <form onSubmit={submit} className="space-y-4">
         <div>
-          <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">{L('currentPassword', lang)}</label>
+          <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">{t('login.currentPassword')}</label>
           <input type="password" value={oldPassword} onChange={(e) => setOldPassword(e.target.value)} autoFocus autoComplete="current-password" className="input-medical" />
         </div>
         <div>
-          <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">{L('newPassword', lang)}</label>
+          <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">{t('login.newPassword')}</label>
           <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoComplete="new-password" className="input-medical" />
         </div>
         <div>
-          <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">{L('confirmPassword', lang)}</label>
+          <label className="block text-[11px] font-semibold text-ink-400 uppercase tracking-wider mb-1.5">{t('login.confirmPassword')}</label>
           <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" className="input-medical" />
         </div>
         {error && <ErrorBox text={error} />}
@@ -253,7 +257,7 @@ function ChangePasswordForm({ lang }: { lang: 'ru' | 'uz' | 'en' }) {
           className="w-full py-2.5 bg-gradient-to-r from-accent-600 to-accent-500 hover:from-accent-500 hover:to-accent-400 text-white rounded-md font-semibold transition-all disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2"
         >
           {loading ? <Spinner /> : null}
-          {L('save', lang)}
+          {t('common.save')}
         </button>
       </form>
     </>

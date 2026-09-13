@@ -1,22 +1,51 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useAppStore } from '../store/appStore';
+import type { AppSettings, AvailableModel, HealthStatus, Lang } from '../types';
+import { probeHealth, listAvailableModels } from '../services/api';
+import { statusWord } from '../services/findingTranslations';
+import { useT, useLang, LANGS, langName, dictionarySizes } from '../i18n';
+import type { I18nKey } from '../i18n';
 import { PRODUCT_NAME, VENDOR_NAME, VENDOR_SITE, getPackageVersion } from '../services/appInfo';
+import LicensePanel from './LicensePanel';
+import { HealthSummary } from './SetupWizard';
 
-const SECTIONS = [
-  { id: 'general', label: 'General', icon: '⚙' },
-  { id: 'connections', label: 'Connections', icon: '🔗' },
-  { id: 'appearance', label: 'Appearance', icon: '🎨' },
-  { id: 'language', label: 'Language', icon: '🌐' },
-  { id: 'ai', label: 'AI Model', icon: '🧠' },
-  { id: 'security', label: 'Security', icon: '🔒' },
-  { id: 'notifications', label: 'Notifications', icon: '🔔' },
-  { id: 'shortcuts', label: 'Shortcuts', icon: '⌨' },
-  { id: 'about', label: 'About', icon: 'ⓘ' },
+type SectionId = 'general' | 'connections' | 'language' | 'ai' | 'license' | 'shortcuts' | 'about';
+
+const SECTIONS: { id: SectionId; labelKey: I18nKey; icon: string }[] = [
+  { id: 'general', labelKey: 'settings.general', icon: '⚕' },
+  { id: 'connections', labelKey: 'settings.connections', icon: '⇄' },
+  { id: 'language', labelKey: 'settings.language', icon: '🌐' },
+  { id: 'ai', labelKey: 'settings.ai', icon: '🧠' },
+  { id: 'license', labelKey: 'settings.license', icon: '🔑' },
+  { id: 'shortcuts', labelKey: 'settings.shortcuts', icon: '⌨' },
+  { id: 'about', labelKey: 'settings.about', icon: 'ⓘ' },
 ];
 
+function isSection(v: string): v is SectionId {
+  return SECTIONS.some((s) => s.id === v);
+}
+
+/**
+ * Preferences. Only settings that this build actually honours are shown —
+ * clinic identity (letterhead), server endpoints, language, live model and
+ * license status, the real shortcut table and product identity.
+ */
 export default function SettingsModal() {
-  const { settingsOpen, closeSettings, settings, updateSettings } = useAppStore();
-  const [section, setSection] = useState('general');
+  const { settingsOpen, settingsSection, closeSettings, settings, updateSettings } = useAppStore();
+  const t = useT();
+  const [section, setSection] = useState<SectionId>(isSection(settingsSection) ? settingsSection : 'general');
+
+  // Follow openSettings('shortcuts') / ('about') from menus and the palette.
+  useEffect(() => {
+    if (settingsOpen) setSection(isSection(settingsSection) ? settingsSection : 'general');
+  }, [settingsOpen, settingsSection]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') closeSettings(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [settingsOpen, closeSettings]);
 
   if (!settingsOpen) return null;
 
@@ -26,53 +55,57 @@ export default function SettingsModal() {
       onClick={closeSettings}
     >
       <div
-        className="w-[900px] h-[640px] max-w-[95vw] max-h-[90vh] glass rounded-xl border border-ink-700/50 shadow-2xl overflow-hidden flex animate-scale-in"
-        onClick={e => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('settings.title')}
+        className="w-[920px] h-[660px] max-w-[95vw] max-h-[90vh] glass rounded-xl border border-ink-700/50 shadow-2xl overflow-hidden flex animate-scale-in"
+        onClick={(e) => e.stopPropagation()}
       >
         {/* Sidebar */}
         <div className="w-56 border-r border-ink-800 bg-ink-950/30 flex flex-col">
           <div className="p-4 border-b border-ink-800">
-            <h2 className="text-sm font-bold text-ink-100">Preferences</h2>
+            <h2 className="text-sm font-bold text-ink-100">{t('settings.title')}</h2>
             <p className="text-[10px] text-ink-500 mt-0.5">{PRODUCT_NAME} v{getPackageVersion()}</p>
           </div>
           <div className="flex-1 overflow-y-auto p-2">
-            {SECTIONS.map(s => (
+            {SECTIONS.map((s) => (
               <button
                 key={s.id}
                 onClick={() => setSection(s.id)}
                 className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition-colors ${
-                  section === s.id
-                    ? 'bg-accent-600/20 text-white'
-                    : 'text-ink-300 hover:bg-ink-800/50 hover:text-white'
+                  section === s.id ? 'bg-accent-600/20 text-white' : 'text-ink-300 hover:bg-ink-800/50 hover:text-white'
                 }`}
               >
-                <span className="text-base">{s.icon}</span>
-                <span>{s.label}</span>
+                <span className="text-base w-5 text-center">{s.icon}</span>
+                <span>{t(s.labelKey)}</span>
               </button>
             ))}
           </div>
           <div className="p-3 border-t border-ink-800">
-            <button onClick={closeSettings} className="w-full btn-ghost text-center">
-              Close
-            </button>
+            <button onClick={closeSettings} className="w-full btn-ghost text-center">{t('common.close')}</button>
           </div>
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto min-w-0">
           {section === 'general' && <GeneralSection settings={settings} update={updateSettings} />}
           {section === 'connections' && <ConnectionsSection settings={settings} update={updateSettings} />}
-          {section === 'appearance' && <AppearanceSection />}
           {section === 'language' && <LanguageSection settings={settings} update={updateSettings} />}
           {section === 'ai' && <AISection />}
-          {section === 'security' && <SecuritySection />}
-          {section === 'notifications' && <NotificationsSection />}
+          {section === 'license' && <LicenseSection />}
           {section === 'shortcuts' && <ShortcutsSection />}
           {section === 'about' && <AboutSection />}
         </div>
       </div>
     </div>
   );
+}
+
+// ─── Building blocks ─────────────────────────────────────────────────────────
+
+interface SectionProps {
+  settings: AppSettings;
+  update: (patch: Partial<AppSettings>) => void;
 }
 
 function SectionHeader({ title, desc }: { title: string; desc?: string }) {
@@ -84,111 +117,123 @@ function SectionHeader({ title, desc }: { title: string; desc?: string }) {
   );
 }
 
-function Row({ label, desc, children }: { label: string; desc?: string; children: React.ReactNode }) {
+function Row({ label, desc, children, stacked }: { label: string; desc?: string; children: React.ReactNode; stacked?: boolean }) {
   return (
-    <div className="py-3 border-b border-ink-800/50 flex items-start justify-between gap-4">
+    <div className={`py-3 border-b border-ink-800/50 ${stacked ? 'space-y-2' : 'flex items-start justify-between gap-4'}`}>
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium text-ink-100">{label}</div>
         {desc && <div className="text-xs text-ink-500 mt-0.5">{desc}</div>}
       </div>
-      <div className="flex-shrink-0">{children}</div>
+      <div className={stacked ? '' : 'flex-shrink-0'}>{children}</div>
     </div>
   );
 }
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      onClick={() => onChange(!checked)}
-      className={`relative w-10 h-5 rounded-full transition-colors ${
-        checked ? 'bg-accent-600' : 'bg-ink-700'
-      }`}
-    >
-      <span
-        className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow-md transition-transform ${
-          checked ? 'translate-x-5' : 'translate-x-0.5'
-        }`}
-      />
-    </button>
-  );
-}
+// ─── Clinic ──────────────────────────────────────────────────────────────────
 
-function GeneralSection({ settings, update }: any) {
+function GeneralSection({ settings, update }: SectionProps) {
+  const t = useT();
+  const { openSetup } = useAppStore();
+  const missing = !settings.clinicName.trim();
   return (
     <div>
-      <SectionHeader title="General" desc="Common preferences for Sentinel" />
+      <SectionHeader title={t('settings.generalTitle')} desc={t('settings.generalDesc')} />
       <div className="p-6 space-y-1">
-        <Row label="Auto-analyze new studies" desc="Automatically run AI on new incoming DICOM files">
-          <Toggle checked={settings.autoAnalyze} onChange={(v) => update({ autoAnalyze: v })} />
-        </Row>
-        <Row label="Refresh interval" desc="How often to check for new studies (seconds)">
-          <input
-            type="number"
-            value={settings.refreshInterval}
-            onChange={(e) => update({ refreshInterval: +e.target.value })}
-            className="input-medical !w-20 !py-1 !text-center"
-          />
-        </Row>
-        <Row label="Storage path" desc="Local directory for studies and reports">
+        <Row label={t('settings.clinicName')} desc={t('settings.clinicNameDesc')}>
           <input
             type="text"
-            value={settings.storagePath}
-            onChange={(e) => update({ storagePath: e.target.value })}
-            className="input-medical !py-1 !w-64"
+            value={settings.clinicName}
+            onChange={(e) => update({ clinicName: e.target.value })}
+            className={`input-medical !py-1 !w-72 ${missing ? '!border-critical' : ''}`}
           />
         </Row>
-        <Row label="Open last study on startup" desc="Resume where you left off">
-          <Toggle checked={true} onChange={() => {}} />
+        <Row label={t('settings.clinicAddress')} desc={t('settings.clinicAddressDesc')}>
+          <input type="text" value={settings.clinicAddress} onChange={(e) => update({ clinicAddress: e.target.value })} className="input-medical !py-1 !w-72" />
         </Row>
-        <Row label="Enable telemetry" desc="Help improve Sentinel (anonymous usage data only)">
-          <Toggle checked={false} onChange={() => {}} />
+        <Row label={t('settings.clinicPhone')} desc={t('settings.clinicPhoneDesc')}>
+          <input type="text" value={settings.clinicPhone} onChange={(e) => update({ clinicPhone: e.target.value })} className="input-medical !py-1 !w-72" />
+        </Row>
+        <Row label={t('settings.supportContact')} desc={t('settings.supportContactDesc')}>
+          <input
+            type="text"
+            value={settings.supportContact}
+            onChange={(e) => update({ supportContact: e.target.value })}
+            placeholder={t('wizard.supportPlaceholder')}
+            className="input-medical !py-1 !w-72"
+          />
+        </Row>
+        <Row label={t('settings.runSetup')} desc={t('settings.runSetupDesc')}>
+          <button onClick={openSetup} className="btn-secondary">{t('settings.runSetup')}</button>
         </Row>
       </div>
     </div>
   );
 }
 
-function ConnectionsSection({ settings, update }: any) {
+// ─── Connections ─────────────────────────────────────────────────────────────
+
+function ConnectionsSection({ settings, update }: SectionProps) {
+  const t = useT();
+  const { orthancConnected, health } = useAppStore();
+  const [probe, setProbe] = useState<{ state: 'idle' | 'testing' | 'done'; health: HealthStatus | null }>({ state: 'idle', health: null });
+
+  const test = async () => {
+    setProbe({ state: 'testing', health: null });
+    const h = await probeHealth(settings.inferenceUrl);
+    setProbe({ state: 'done', health: h });
+  };
+
+  const aiLabel = !health || !health.reachable
+    ? t('common.offline')
+    : health.status === 'ok' ? t('common.ready') : health.status === 'degraded' ? t('common.degraded') : t('common.error');
+  const aiColor = !health || !health.reachable ? 'text-ink-500' : health.status === 'ok' ? 'text-normal' : health.status === 'degraded' ? 'text-moderate' : 'text-critical';
+
   return (
     <div>
-      <SectionHeader title="Connections" desc="Configure PACS and AI server endpoints" />
+      <SectionHeader title={t('settings.connectionsTitle')} desc={t('settings.connectionsDesc')} />
       <div className="p-6 space-y-1">
-        <Row label="Orthanc PACS URL" desc="Local PACS server receiving DICOM files">
+        <Row label={t('settings.inferenceUrl')} desc={t('settings.inferenceUrlDesc')} stacked>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={settings.inferenceUrl}
+              onChange={(e) => { update({ inferenceUrl: e.target.value }); setProbe({ state: 'idle', health: null }); }}
+              className="input-medical !py-1 !font-mono"
+              spellCheck={false}
+            />
+            <button onClick={test} disabled={probe.state === 'testing'} className="btn-secondary whitespace-nowrap">
+              {probe.state === 'testing' ? t('settings.testing') : t('settings.testConnection')}
+            </button>
+          </div>
+          {probe.state === 'done' && probe.health && <HealthSummary health={probe.health} />}
+        </Row>
+        <Row label={t('settings.orthancUrl')} desc={t('settings.orthancUrlDesc')}>
           <input
             type="text"
             value={settings.orthancUrl}
             onChange={(e) => update({ orthancUrl: e.target.value })}
             className="input-medical !py-1 !w-72 !font-mono"
+            spellCheck={false}
           />
         </Row>
-        <Row label="AI Inference URL" desc="Local Sentinel inference server">
-          <input
-            type="text"
-            value={settings.inferenceUrl}
-            onChange={(e) => update({ inferenceUrl: e.target.value })}
-            className="input-medical !py-1 !w-72 !font-mono"
-          />
-        </Row>
-        <Row label="DICOM AE Title" desc="Application Entity Title for DICOM C-STORE">
-          <input type="text" defaultValue="SENTINEL" className="input-medical !py-1 !w-40 !font-mono" />
-        </Row>
-        <Row label="DICOM Port" desc="Port for incoming DICOM C-STORE transfers">
-          <input type="number" defaultValue={4242} className="input-medical !py-1 !w-24 !text-center !font-mono" />
-        </Row>
+
         <div className="mt-6 p-3 bg-ink-850 rounded-lg border border-ink-800">
-          <div className="flex items-center gap-2 mb-2">
-            <div className="w-2 h-2 rounded-full bg-normal" />
-            <span className="text-xs font-semibold text-ink-100">Connection Status</span>
-          </div>
-          <div className="grid grid-cols-2 gap-2 text-[10px]">
-            <div className="flex items-center gap-1.5 text-normal">
-              <div className="w-1.5 h-1.5 rounded-full bg-normal animate-pulse" />
-              Orthanc: Connected
+          <div className="text-xs font-semibold text-ink-100 mb-2">{t('settings.connectionStatus')}</div>
+          <div className="grid grid-cols-2 gap-2 text-[11px]">
+            <div className={`flex items-center gap-1.5 ${orthancConnected ? 'text-normal' : 'text-ink-500'}`}>
+              <div className={`w-1.5 h-1.5 rounded-full ${orthancConnected ? 'bg-normal animate-pulse' : 'bg-ink-600'}`} />
+              {t('settings.pacs')}: {orthancConnected ? t('common.online') : t('common.offline')}
             </div>
-            <div className="flex items-center gap-1.5 text-normal">
-              <div className="w-1.5 h-1.5 rounded-full bg-normal animate-pulse" />
-              AI Server: Ready
+            <div className={`flex items-center gap-1.5 ${aiColor}`}>
+              <div className={`w-1.5 h-1.5 rounded-full ${health?.reachable && health.status === 'ok' ? 'bg-normal animate-pulse' : 'bg-ink-600'}`} />
+              {t('settings.aiServer')}: {aiLabel}
             </div>
+            {health?.reachable && (
+              <>
+                <div className="text-ink-400">{t('settings.authRequired')}: {health.authRequired ? t('common.yes') : t('common.no')}</div>
+                {health.dataDir && <div className="text-ink-400 font-mono truncate col-span-2" title={health.dataDir}>{t('settings.dataDir')}: {health.dataDir}</div>}
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -196,117 +241,108 @@ function ConnectionsSection({ settings, update }: any) {
   );
 }
 
-function AppearanceSection() {
-  return (
-    <div>
-      <SectionHeader title="Appearance" desc="Customize how Sentinel looks" />
-      <div className="p-6 space-y-4">
-        <div>
-          <div className="text-sm font-medium text-ink-100 mb-2">Theme</div>
-          <div className="grid grid-cols-3 gap-2">
-            {[
-              { id: 'dark', name: 'Dark (Medical)', preview: 'bg-gradient-to-br from-ink-900 to-ink-950' },
-              { id: 'darker', name: 'Pitch Black', preview: 'bg-black' },
-              { id: 'midnight', name: 'Midnight Blue', preview: 'bg-gradient-to-br from-slate-900 to-blue-950' },
-            ].map(t => (
-              <button key={t.id} className="rounded-lg overflow-hidden border-2 border-accent-500 p-2 text-left">
-                <div className={`h-16 rounded ${t.preview} mb-2`} />
-                <div className="text-xs font-medium text-ink-100">{t.name}</div>
-              </button>
-            ))}
-          </div>
-        </div>
-        <Row label="Compact mode" desc="Reduce spacing for denser information display">
-          <Toggle checked={false} onChange={() => {}} />
-        </Row>
-        <Row label="Animations" desc="Smooth transitions and effects">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
-      </div>
-    </div>
-  );
-}
+// ─── Language ────────────────────────────────────────────────────────────────
 
-function LanguageSection({ settings, update }: any) {
-  const languages = [
-    { id: 'ru', name: 'Русский', native: 'Russian', progress: 100 },
-    { id: 'uz', name: "O'zbek", native: 'Uzbek', progress: 100 },
-    { id: 'en', name: 'English', native: 'English', progress: 100 },
-  ];
+function LanguageSection({ settings, update }: SectionProps) {
+  const t = useT();
+  const sizes = dictionarySizes();
   return (
     <div>
-      <SectionHeader title="Language & Region" desc="Choose the interface and report language" />
+      <SectionHeader title={t('settings.languageTitle')} desc={t('settings.languageDesc')} />
       <div className="p-6 space-y-2">
-        <div className="text-sm font-medium text-ink-100 mb-2">Interface Language</div>
-        {languages.map(l => (
+        <div className="text-sm font-medium text-ink-100 mb-2">{t('settings.interfaceLanguage')}</div>
+        {LANGS.map((l: Lang) => (
           <button
-            key={l.id}
-            onClick={() => update({ language: l.id })}
+            key={l}
+            onClick={() => update({ language: l })}
             className={`w-full p-3 flex items-center justify-between rounded-lg border transition-all ${
-              settings.language === l.id
-                ? 'border-accent-500 bg-accent-900/20'
-                : 'border-ink-800 hover:border-ink-700 bg-ink-850'
+              settings.language === l ? 'border-accent-500 bg-accent-900/20' : 'border-ink-800 hover:border-ink-700 bg-ink-850'
             }`}
           >
             <div className="text-left">
-              <div className="text-sm font-semibold text-ink-100">{l.name}</div>
-              <div className="text-[10px] text-ink-500">{l.native} · {l.progress}% translated</div>
+              <div className="text-sm font-semibold text-ink-100">{langName(l)}</div>
+              <div className="text-[10px] text-ink-500 font-mono">{sizes[l]} / {sizes.en}</div>
             </div>
-            {settings.language === l.id && (
+            {settings.language === l && (
               <svg className="w-5 h-5 text-accent-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
               </svg>
             )}
           </button>
         ))}
+        <div className="mt-4 p-3 bg-ink-850 rounded-lg border border-ink-800 text-[11px] text-ink-400 leading-relaxed">
+          {t('settings.reportLanguageNote')}
+        </div>
       </div>
     </div>
   );
 }
 
+// ─── AI models ───────────────────────────────────────────────────────────────
+
 function AISection() {
   const { health, settings } = useAppStore();
+  const t = useT();
+  const lang = useLang();
   const models = health?.models ? Object.entries(health.models) : [];
-  const serverLabel = !health || !health.reachable ? 'offline' : health.status;
+  const [registry, setRegistry] = useState<AvailableModel[] | null>(null);
+  const [loadingRegistry, setLoadingRegistry] = useState(false);
+
+  const loadRegistry = useCallback(async () => {
+    setLoadingRegistry(true);
+    try {
+      setRegistry(await listAvailableModels());
+    } catch (e) {
+      console.warn('models/available failed:', e);
+      setRegistry([]);
+    } finally {
+      setLoadingRegistry(false);
+    }
+  }, []);
+
+  useEffect(() => { if (health?.reachable) loadRegistry(); }, [health?.reachable, loadRegistry]);
+
+  const serverLabel = !health || !health.reachable
+    ? t('common.offline')
+    : health.status === 'ok' ? t('common.ready') : health.status === 'degraded' ? t('common.degraded') : t('common.error');
   const serverPill = !health || !health.reachable
     ? 'bg-ink-800 text-ink-400 border border-ink-700'
     : health.status === 'ok' ? 'severity-normal' : health.status === 'degraded' ? 'severity-moderate' : 'severity-critical';
+
   return (
     <div>
-      <SectionHeader title="AI Model" desc="Live status reported by the inference server (/health)" />
+      <SectionHeader title={t('settings.aiTitle')} desc={t('settings.aiDesc')} />
       <div className="p-6 space-y-4">
         <div className="p-4 bg-ink-850 rounded-lg border border-ink-800">
           <div className="flex items-center justify-between mb-3">
             <div>
-              <div className="text-sm font-semibold text-ink-100">Inference server</div>
+              <div className="text-sm font-semibold text-ink-100">{t('settings.inferenceServer')}</div>
               <div className="text-[10px] text-ink-500 font-mono">{settings.inferenceUrl}</div>
             </div>
             <span className={`severity-pill ${serverPill}`}>{serverLabel}</span>
           </div>
           <div className="grid grid-cols-3 gap-3 text-[10px]">
             <div>
-              <div className="text-ink-500">Server version</div>
+              <div className="text-ink-500">{t('settings.serverVersion')}</div>
               <div className="text-ink-200 font-mono">{health?.version || '—'}</div>
             </div>
             <div>
-              <div className="text-ink-500">Device</div>
+              <div className="text-ink-500">{t('settings.device')}</div>
               <div className="text-ink-200 font-mono">{health?.device || '—'}</div>
             </div>
             <div>
-              <div className="text-ink-500">Report assistant (LLM)</div>
+              <div className="text-ink-500">{t('settings.llm')}</div>
               <div className="text-ink-200 font-mono">
-                {health?.llm.backend ? `${health.llm.backend} · ${health.llm.reachable ? 'reachable' : 'unreachable'}` : '—'}
+                {health?.llm.backend ? `${health.llm.backend} · ${health.llm.reachable ? t('common.reachable') : t('common.unreachable')}` : '—'}
               </div>
             </div>
           </div>
         </div>
 
         <div>
-          <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">Models</div>
+          <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">{t('settings.loadedModels')}</div>
           {models.length === 0 ? (
-            <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-400">
-              No model status reported — the server is offline or has not finished loading.
-            </div>
+            <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-400">{t('settings.noModelStatus')}</div>
           ) : (
             <div className="space-y-1">
               {models.map(([key, m]) => (
@@ -316,7 +352,7 @@ function AISection() {
                     {m.reason && <div className="text-[10px] text-ink-500 truncate">{m.reason}</div>}
                   </div>
                   <span className={`severity-pill flex-shrink-0 ${m.loaded ? 'severity-normal' : 'severity-critical'}`}>
-                    {m.loaded ? 'Loaded' : 'Not loaded'}
+                    {m.loaded ? t('settings.loaded') : t('settings.notLoaded')}
                   </span>
                 </div>
               ))}
@@ -324,76 +360,93 @@ function AISection() {
           )}
         </div>
 
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">{t('settings.availableModels')}</div>
+              <div className="text-[10px] text-ink-500">{t('settings.availableModelsDesc')}</div>
+            </div>
+            <button onClick={loadRegistry} disabled={loadingRegistry || !health?.reachable} className="btn-ghost !px-2 text-[10px]">
+              {loadingRegistry ? t('settings.testing') : t('settings.refresh')}
+            </button>
+          </div>
+          {!health?.reachable ? (
+            <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-400">{t('health.aiServerDown')}</div>
+          ) : registry === null || registry.length === 0 ? (
+            <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-400">{t('settings.noModelStatus')}</div>
+          ) : (
+            <div className="space-y-1">
+              {registry.map((m) => (
+                <div key={m.key} className="px-3 py-2 bg-ink-850 rounded-lg border border-ink-800 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-ink-100 truncate">{m.name}</div>
+                      <div className="text-[10px] text-ink-500 font-mono truncate">
+                        {m.key}{m.tier ? ` · ${t('settings.tier')}: ${m.tier}` : ''}{m.downloadMb != null ? ` · ${t('settings.downloadMb', { mb: m.downloadMb })}` : ''}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      {m.validationStatus && (
+                        <span className={`severity-pill text-[9px] ${m.validationStatus === 'validated' ? 'severity-normal' : m.validationStatus === 'pending' ? 'severity-moderate' : 'bg-ink-800 text-ink-400 border border-ink-700'}`}>
+                          {statusWord(m.validationStatus, lang)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {!m.depsOk && (
+                    <div className="text-[10px] text-moderate mt-1">{t('settings.depsMissing', { reason: m.depsReason || '—' })}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-[11px] text-ink-400 leading-relaxed">
-          Model selection, decision thresholds and heat-map generation are fixed on the server for the pilot.
-          The identity of every model (name, SHA-256, validation status) and the threshold used are shown with
-          each result and printed on every report.
+          {t('settings.aiFixedNote')}
         </div>
       </div>
     </div>
   );
 }
 
-function SecuritySection() {
+// ─── License ─────────────────────────────────────────────────────────────────
+
+function LicenseSection() {
+  const t = useT();
   return (
     <div>
-      <SectionHeader title="Security & Privacy" desc="Protect patient data and control access" />
-      <div className="p-6 space-y-1">
-        <Row label="Require login" desc="Authenticate users before accessing studies">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
-        <Row label="Auto-lock after idle" desc="Minutes of inactivity before locking">
-          <input type="number" defaultValue={15} className="input-medical !py-1 !w-20 !text-center" />
-        </Row>
-        <Row label="Audit logging" desc="Record all user actions for compliance">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
-        <Row label="Database encryption" desc="Use OS disk encryption (FileVault / BitLocker)">
-          <span className="severity-pill severity-moderate">OS-level</span>
-        </Row>
-        <Row label="Two-factor authentication" desc="Require 2FA for admin accounts">
-          <Toggle checked={false} onChange={() => {}} />
-        </Row>
-        <Row label="DICOM anonymization" desc="Strip PII from exported DICOM files">
-          <Toggle checked={true} onChange={() => {}} />
-        </Row>
+      <SectionHeader title={t('settings.licenseTitle')} desc={t('settings.licenseDesc')} />
+      <div className="p-6">
+        <LicensePanel />
       </div>
     </div>
   );
 }
 
-function NotificationsSection() {
-  return (
-    <div>
-      <SectionHeader title="Notifications" desc="Control alerts and sounds" />
-      <div className="p-6 space-y-1">
-        <Row label="New study alerts" desc="Notify when new studies arrive"><Toggle checked={true} onChange={() => {}} /></Row>
-        <Row label="Critical finding alerts" desc="Priority alerts for severe pathologies"><Toggle checked={true} onChange={() => {}} /></Row>
-        <Row label="Sound on new study" desc="Play chime when study arrives"><Toggle checked={true} onChange={() => {}} /></Row>
-        <Row label="Desktop notifications" desc="System-level notifications"><Toggle checked={true} onChange={() => {}} /></Row>
-      </div>
-    </div>
-  );
-}
+// ─── Shortcuts — every binding here exists in useKeyboardShortcuts ───────────
+
+const SHORTCUT_GROUPS: { groupKey: I18nKey; items: [I18nKey, string][] }[] = [
+  { groupKey: 'palette.cat.tools', items: [['tool.pan', 'P'], ['tool.zoom', 'Z'], ['tool.wwwl', 'W'], ['tool.length', 'L'], ['tool.angle', 'G'], ['tool.rotate', 'R'], ['tool.invert', 'I']] },
+  { groupKey: 'palette.cat.view', items: [['menu.heatmapOverlay', 'H'], ['menu.toggleSidebar', '⌘B'], ['menu.toggleRightPanel', '⌘⇧B'], ['menu.toggleSeriesStrip', 'T'], ['menu.fitToWindow', 'F'], ['menu.fullscreen', 'F11']] },
+  { groupKey: 'palette.cat.presets', items: [['preset.chest', '1'], ['preset.lung', '2'], ['preset.bone', '3'], ['preset.soft', '4'], ['preset.brain', '5']] },
+  { groupKey: 'palette.cat.file', items: [['menu.uploadFiles', '⌘O'], ['menu.uploadFolder', '⌘⇧O'], ['menu.exportPdf', '⌘P'], ['menu.preferences', '⌘,'], ['menu.commandPalette', '⌘K']] },
+  { groupKey: 'palette.cat.help', items: [['menu.documentation', 'F1'], ['menu.keyboardShortcuts', '⌘/']] },
+];
 
 function ShortcutsSection() {
-  const shortcuts = [
-    { group: 'Tools', items: [['Pan', 'P'], ['Zoom', 'Z'], ['Window/Level', 'W'], ['Length', 'L'], ['Angle', 'G'], ['Ellipse ROI', 'E']] },
-    { group: 'View', items: [['Toggle Heatmap', 'H'], ['Toggle Sidebar', '⌘B'], ['Fullscreen', 'F11'], ['Fit to Window', 'F']] },
-    { group: 'AI', items: [['Re-run Analysis', '⌘↩'], ['Show Confidence', 'C'], ['Show Segmentation', 'S']] },
-    { group: 'File', items: [['Open', '⌘O'], ['Export PDF', '⌘P'], ['Preferences', '⌘,'], ['Command Palette', '⌘K']] },
-  ];
+  const t = useT();
   return (
     <div>
-      <SectionHeader title="Keyboard Shortcuts" desc="Speed up your workflow" />
+      <SectionHeader title={t('settings.shortcutsTitle')} desc={t('settings.shortcutsDesc')} />
       <div className="p-6 space-y-4">
-        {shortcuts.map(g => (
-          <div key={g.group}>
-            <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">{g.group}</div>
+        {SHORTCUT_GROUPS.map((g) => (
+          <div key={g.groupKey}>
+            <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">{t(g.groupKey)}</div>
             <div className="bg-ink-850 rounded-lg border border-ink-800 overflow-hidden">
-              {g.items.map(([label, key], i) => (
-                <div key={label} className={`flex items-center justify-between px-3 py-2 ${i > 0 ? 'border-t border-ink-800' : ''}`}>
-                  <span className="text-sm text-ink-200">{label}</span>
+              {g.items.map(([labelKey, key], i) => (
+                <div key={labelKey} className={`flex items-center justify-between px-3 py-2 ${i > 0 ? 'border-t border-ink-800' : ''}`}>
+                  <span className="text-sm text-ink-200">{t(labelKey)}</span>
                   <span className="kbd">{key}</span>
                 </div>
               ))}
@@ -405,10 +458,13 @@ function ShortcutsSection() {
   );
 }
 
+// ─── About ───────────────────────────────────────────────────────────────────
+
 function AboutSection() {
+  const t = useT();
   return (
     <div>
-      <SectionHeader title={`About ${PRODUCT_NAME}`} />
+      <SectionHeader title={t('settings.aboutTitle', { product: PRODUCT_NAME })} />
       <div className="p-6">
         <div className="flex items-center gap-4 mb-6">
           <div className="w-16 h-16 bg-gradient-to-br from-accent-400 to-accent-700 rounded-2xl flex items-center justify-center">
@@ -418,23 +474,23 @@ function AboutSection() {
           </div>
           <div>
             <h3 className="text-xl font-bold text-ink-100">{PRODUCT_NAME}</h3>
-            <div className="text-xs text-ink-400">Version {getPackageVersion()}</div>
-            <div className="text-[10px] text-ink-500 mt-1">© 2026 {VENDOR_NAME} · {VENDOR_SITE}</div>
+            <div className="text-xs text-ink-400">{t('common.version')} {getPackageVersion()}</div>
+            <div className="text-[10px] text-ink-500 mt-1">{t('about.copyright', { vendor: VENDOR_NAME, site: VENDOR_SITE })}</div>
           </div>
         </div>
         <div className="p-4 bg-ink-850 rounded-lg border border-ink-800 text-xs text-ink-300 leading-relaxed">
-          {PRODUCT_NAME} is an on-premise radiology AI assistant for clinics in Central Asia. It routes DICOM studies
-          to modality-specific detectors and drafts structured reports in Russian, Uzbek and English. AI output is
-          decision support only: every study is read and signed by a radiologist, and each finding carries the
-          identity and validation status of the model that produced it.
+          {t('about.description', { product: PRODUCT_NAME })}
+        </div>
+        <div className="mt-3 p-3 bg-ink-850 rounded-lg border border-ink-800 text-[11px] text-ink-400 leading-relaxed">
+          {t('product.intendedUse')}
         </div>
         <div className="mt-4 grid grid-cols-2 gap-2 text-[10px]">
           <div className="p-2 bg-ink-850 rounded border border-ink-800">
-            <div className="text-ink-500">Built with</div>
+            <div className="text-ink-500">{t('about.builtWith')}</div>
             <div className="text-ink-200 font-mono">PyTorch · FastAPI · Electron · React</div>
           </div>
           <div className="p-2 bg-ink-850 rounded border border-ink-800">
-            <div className="text-ink-500">Imaging stack</div>
+            <div className="text-ink-500">{t('about.imagingStack')}</div>
             <div className="text-ink-200 font-mono">MONAI · TorchXRayVision</div>
           </div>
         </div>

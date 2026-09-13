@@ -2,7 +2,8 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { useAppStore } from '../store/appStore';
 import type { Finding, Study, AIResult, Lang } from '../types';
 import { DEMO_MODE, DEMO_STUDIES, getDemoResultForStudy } from '../services/demoData';
-import { L, translateFinding, statusWord } from '../services/findingTranslations';
+import { translateFinding, statusWord } from '../services/findingTranslations';
+import { translate, useT, formatDate } from '../i18n';
 import { PRODUCT_NAME } from '../services/appInfo';
 
 /**
@@ -101,7 +102,7 @@ export default function DicomViewer() {
     if (previewImg) {
       drawScanImage(ctx, w, h, previewImg);
     } else if (DEMO_MODE && selStudy && selStudy.id.startsWith('demo-')) {
-      drawDemoPlaceholder(ctx, w, h);
+      drawDemoPlaceholder(ctx, w, h, lang);
     } else {
       ctx.filter = 'none';
       drawNoPreview(ctx, w, h, lang, !!selStudy?.restored);
@@ -109,7 +110,7 @@ export default function DicomViewer() {
     ctx.restore();
 
     // Real metadata overlays (not affected by transform)
-    drawCornerOverlays(ctx, w, h, selStudy, result);
+    drawCornerOverlays(ctx, w, h, selStudy, result, lang);
   }, [selectedStudyId, studies, aiResults, imgTick, viewerZoom, panOffset, rotation, invert, windowLevel, lang]);
 
   // ===== Overlay Rendering (real AI heatmaps + measurements) =====
@@ -267,7 +268,8 @@ export default function DicomViewer() {
 }
 
 // ===== Helper: AI Status Badge =====
-function AIStatusBadge({ result, lang }: { result: AIResult | null; lang: Lang }) {
+function AIStatusBadge({ result }: { result: AIResult | null; lang: Lang }) {
+  const t = useT();
   if (!result) return null;
 
   const review = result.rejected || result.requiresReview;
@@ -275,7 +277,7 @@ function AIStatusBadge({ result, lang }: { result: AIResult | null; lang: Lang }
   const validatedFlag = result.findings.some((f) => f.positive && f.status === 'validated');
 
   const dot = review ? 'bg-moderate' : flagged ? (validatedFlag ? 'bg-critical shadow-glow-critical' : 'bg-moderate') : 'bg-ink-500';
-  const text = review ? L('notAnalyzed', lang) : flagged ? L('abnormalFlagged', lang) : L('noFindingFlagged', lang);
+  const text = review ? t('viewer.notAnalyzed') : flagged ? t('viewer.abnormalFlagged') : t('viewer.noFindingFlagged');
 
   return (
     <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 glass px-3 py-1.5 rounded-full border border-ink-700/50 animate-slide-down max-w-[80%]">
@@ -346,22 +348,22 @@ function drawEmptyState(ctx: CanvasRenderingContext2D, w: number, h: number, lan
   ctx.fillStyle = '#64748b';
   ctx.font = '500 14px Inter, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText(L('selectStudy', lang), cx, cy + 20);
+  ctx.fillText(translate(lang, 'viewer.selectStudy'), cx, cy + 20);
 
   ctx.fillStyle = '#475569';
   ctx.font = '400 11px Inter, sans-serif';
-  ctx.fillText(L('dropHint', lang), cx, cy + 40);
+  ctx.fillText(translate(lang, 'viewer.dropHint'), cx, cy + 40);
 }
 
 function drawNoPreview(ctx: CanvasRenderingContext2D, w: number, h: number, lang: Lang, restored: boolean) {
   ctx.fillStyle = '#64748b';
   ctx.font = '500 13px Inter, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText(L('noImagePreview', lang), w / 2, h / 2);
+  ctx.fillText(translate(lang, 'viewer.noImagePreview'), w / 2, h / 2);
   if (restored) {
     ctx.fillStyle = '#475569';
     ctx.font = '400 11px Inter, sans-serif';
-    ctx.fillText(L('restoredHint', lang), w / 2, h / 2 + 20);
+    ctx.fillText(translate(lang, 'viewer.restoredHint'), w / 2, h / 2 + 20);
   }
 }
 
@@ -373,7 +375,7 @@ function drawScanImage(ctx: CanvasRenderingContext2D, w: number, h: number, img:
 }
 
 /** Demo builds only: a clearly-labelled placeholder, not a fake anatomy render. */
-function drawDemoPlaceholder(ctx: CanvasRenderingContext2D, w: number, h: number) {
+function drawDemoPlaceholder(ctx: CanvasRenderingContext2D, w: number, h: number, lang: Lang) {
   const cx = w / 2, cy = h / 2;
   const r = Math.min(w, h) * 0.35;
   ctx.fillStyle = '#111827';
@@ -382,10 +384,10 @@ function drawDemoPlaceholder(ctx: CanvasRenderingContext2D, w: number, h: number
   ctx.fillStyle = '#64748b';
   ctx.font = '700 16px Inter, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('DEMO — no image', cx, cy);
+  ctx.fillText(translate(lang, 'viewer.demo'), cx, cy);
 }
 
-function drawCornerOverlays(ctx: CanvasRenderingContext2D, w: number, h: number, study: Study | null, result: AIResult | null) {
+function drawCornerOverlays(ctx: CanvasRenderingContext2D, w: number, h: number, study: Study | null, result: AIResult | null, lang: Lang) {
   ctx.font = '500 10px JetBrains Mono, monospace';
   ctx.fillStyle = '#64748b';
   ctx.textBaseline = 'alphabetic';
@@ -399,17 +401,17 @@ function drawCornerOverlays(ctx: CanvasRenderingContext2D, w: number, h: number,
   if (study?.patientSex) demo.push(study.patientSex);
   if (study?.patientAge) demo.push(study.patientAge);
   if (demo.length) left.push(demo.join(' · '));
-  if (study?.patientBirthDate) left.push(`DOB: ${study.patientBirthDate}`);
+  if (study?.patientBirthDate) left.push(`${translate(lang, 'viewer.dob')}: ${formatDate(study.patientBirthDate, lang)}`);
   left.forEach((line, i) => ctx.fillText(line, 8, 14 + i * 12));
 
   // Top-right: study
   ctx.textAlign = 'right';
   const right: string[] = [];
   if (study) right.push(`${study.modality}${study.bodyPart && study.bodyPart !== '—' ? ` — ${study.bodyPart}` : ''}`);
-  if (study?.studyDate) right.push(study.studyDate);
+  if (study?.studyDate) right.push(formatDate(study.studyDate, lang));
   if (study?.studyDescription) right.push(study.studyDescription);
-  if (study?.accessionNumber) right.push(`ACC ${study.accessionNumber}`);
-  if (study?.numFiles) right.push(`${study.numFiles} files`);
+  if (study?.accessionNumber) right.push(`${translate(lang, 'viewer.acc')} ${study.accessionNumber}`);
+  if (study?.numFiles) right.push(translate(lang, 'viewer.files', { count: study.numFiles }));
   right.forEach((line, i) => ctx.fillText(line, w - 8, 14 + i * 12));
 
   // Bottom-right: models actually used (identity from the server)
@@ -419,7 +421,7 @@ function drawCornerOverlays(ctx: CanvasRenderingContext2D, w: number, h: number,
     ctx.fillStyle = '#3b82f6';
     const models = result.modelIdentity.slice(0, 3);
     models.forEach((m, i) => {
-      const line = `${m.displayName}${m.sha256_12 ? ` ${m.sha256_12}` : ''} · ${m.status}`;
+      const line = `${m.displayName}${m.sha256_12 ? ` ${m.sha256_12}` : ''} · ${statusWord(m.status, lang)}`;
       ctx.fillText(line, w - 8, h - 26 - (models.length - 1 - i) * 12);
     });
     ctx.fillStyle = '#64748b';

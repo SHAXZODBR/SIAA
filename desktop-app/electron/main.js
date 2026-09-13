@@ -183,6 +183,78 @@ ipcMain.handle('write-license', async (_, licenseData) => {
   }
 });
 
+// ===== Documentation =====
+// A packaged build may ship a docs/ folder next to the backend
+// (electron-builder extraResources); in dev the repo root is used. When no
+// folder exists the renderer falls back to its in-app quick guide.
+function docsDir() {
+  const candidates = [
+    path.join(process.resourcesPath || '', 'docs'),
+    path.join(__dirname, '..', '..', 'docs'),
+  ];
+  return candidates.find((p) => { try { return p && fs.statSync(p).isDirectory(); } catch { return false; } }) || null;
+}
+
+ipcMain.handle('open-docs', async () => {
+  const dir = docsDir();
+  if (!dir) return { opened: false, path: null };
+  try {
+    const err = await shell.openPath(dir);
+    if (err) return { opened: false, path: dir, error: err };
+    return { opened: true, path: dir };
+  } catch (e) {
+    return { opened: false, path: dir, error: String(e) };
+  }
+});
+
+// ===== Server-side machine fingerprint =====
+// Licenses are bound to the fingerprint computed by the Python server
+// (src/utils/license.py::get_machine_id), which is NOT the same recipe as
+// 'get-machine-id' above. The setup wizard therefore asks the server's own
+// CLI for it, so the value the clinic sends to the vendor is the one that
+// verify_license() will compare against.
+function backendPaths() {
+  const resourcesPath = process.resourcesPath || path.join(__dirname, '..');
+  const packagedDir = path.join(resourcesPath, 'backend');
+  const devDir = path.join(__dirname, '..', '..');
+  const backendDir = fs.existsSync(path.join(packagedDir, 'src', 'utils', 'license.py')) ? packagedDir
+    : fs.existsSync(path.join(devDir, 'src', 'utils', 'license.py')) ? devDir : null;
+  if (!backendDir) return null;
+  const candidates = [
+    path.join(backendDir, 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+    process.env.SENTINEL_PYTHON || '',
+    process.platform === 'win32' ? 'python.exe' : 'python3',
+  ].filter(Boolean);
+  const pythonExe = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || candidates[candidates.length - 1];
+  return { backendDir, pythonExe };
+}
+
+ipcMain.handle('get-server-fingerprint', () => new Promise((resolve) => {
+  const bp = backendPaths();
+  if (!bp) return resolve({ fingerprint: null, error: 'backend not found' });
+  let out = '';
+  let done = false;
+  const finish = (result) => { if (!done) { done = true; resolve(result); } };
+  try {
+    const child = spawn(bp.pythonExe, ['-m', 'src.utils.license', 'fingerprint'], {
+      cwd: bp.backendDir,
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ fingerprint: null, error: 'timeout' }); }, 15000);
+    child.stdout.on('data', (d) => { out += String(d); });
+    child.stderr.on('data', (d) => { out += String(d); });
+    child.on('error', (err) => { clearTimeout(timer); finish({ fingerprint: null, error: String(err) }); });
+    child.on('exit', () => {
+      clearTimeout(timer);
+      const m = out.match(/\b([0-9a-f]{64})\b/);
+      finish(m ? { fingerprint: m[1], error: null } : { fingerprint: null, error: out.trim().slice(0, 400) || 'no output' });
+    });
+  } catch (e) {
+    finish({ fingerprint: null, error: String(e) });
+  }
+}));
+
 // ===== Backend lifecycle =====
 // In a packaged build the desktop app launches the inference server itself so
 // the user doesn't have to start Python/Ollama by hand. In dev we assume the

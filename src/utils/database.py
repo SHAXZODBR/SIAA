@@ -162,6 +162,13 @@ MIGRATIONS = [
     ("reports",    "sha256",               "TEXT"),
     ("reports",    "findings_json",        "TEXT"),
     ("reports",    "model_identity_json",  "TEXT"),
+    # Signed-report PDF + its DICOM Encapsulated PDF twin (POST /report/{id}/pdf)
+    ("reports",    "pdf_sha256",            "TEXT"),
+    ("reports",    "dicom_path",            "TEXT"),
+    ("reports",    "dicom_sop_instance_uid", "TEXT"),
+    ("reports",    "orthanc_instance_id",   "TEXT"),
+    ("reports",    "pdf_attached_at",       "TIMESTAMP"),
+    ("reports",    "pushed_at",             "TIMESTAMP"),
     ("audit_log",  "ip_address",           "TEXT"),
     ("audit_log",  "prev_hash",            "TEXT"),
     ("audit_log",  "row_hash",             "TEXT"),
@@ -544,6 +551,36 @@ class SentinelDB:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         return dict(row) if row else None
+
+    def attach_report_pdf(
+        self,
+        report_id: str,
+        *,
+        pdf_path: str,
+        pdf_sha256: str,
+        dicom_path: str,
+        sop_instance_uid: str,
+    ) -> bool:
+        """Record the stored PDF rendering of a signed report and its DICOM
+        Encapsulated PDF twin. Returns False when the report does not exist."""
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE reports SET pdf_path=?, pdf_sha256=?, dicom_path=?,
+                   dicom_sop_instance_uid=?, pdf_attached_at=?, updated_at=? WHERE id=?""",
+                (pdf_path, pdf_sha256, dicom_path, sop_instance_uid, now, now, report_id),
+            )
+            return cur.rowcount > 0
+
+    def record_report_push(self, report_id: str, orthanc_instance_id: str) -> bool:
+        """Remember the Orthanc instance id the report's DICOM was stored under."""
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE reports SET orthanc_instance_id=?, pushed_at=?, updated_at=? WHERE id=?",
+                (orthanc_instance_id, now, now, report_id),
+            )
+            return cur.rowcount > 0
 
     def get_reports_for_study(self, study_id: str) -> list[dict]:
         """All report rows for a study, newest first, with signer info joined."""

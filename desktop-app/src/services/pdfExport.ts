@@ -19,7 +19,8 @@
  */
 
 import type { Finding, ModelIdentity, Lang } from '../types';
-import { translateFinding, translateLocation, findingUrgency, statusWord, L as UI } from './findingTranslations';
+import { translateFinding, translateLocation, findingUrgency, statusWord } from './findingTranslations';
+import { translate } from '../i18n';
 import { PRODUCT_NAME, VENDOR_NAME, VENDOR_SITE } from './appInfo';
 
 export interface PDFReportData {
@@ -252,9 +253,9 @@ function buildSinglePagePDFHTML(data: PDFReportData): string {
 
   const draftBanner = data.signedAt
     ? ''
-    : `<div class="draft-banner">${escapeHtml(UI('aiDraftWatermark', lang))}</div>`;
+    : `<div class="draft-banner">${escapeHtml(translate(lang, 'report.draftWatermark'))}</div>`;
   const translatedBanner = data.autoTranslated
-    ? `<div class="translated-banner">${escapeHtml(UI('autoTranslated', lang))}</div>`
+    ? `<div class="translated-banner">${escapeHtml(translate(lang, 'report.autoTranslated'))}</div>`
     : '';
   const disclaimerHTML = data.disclaimer
     ? `<p class="disclaimer">${escapeHtml(data.disclaimer)}</p>`
@@ -270,7 +271,7 @@ function buildSinglePagePDFHTML(data: PDFReportData): string {
     : `<div class="sig">
          <div class="sig-line"></div>
          <div class="sig-name">${escapeHtml(data.doctorName || L.radiologist)}</div>
-         <div class="sig-status not-signed">${L.notSigned} — ${escapeHtml(UI('aiDraftWatermark', lang))}</div>
+         <div class="sig-status not-signed">${L.notSigned} — ${escapeHtml(translate(lang, 'report.draftWatermark'))}</div>
        </div>`;
 
   const optionalRow = (label: string, value: string | null | undefined, mono = false) =>

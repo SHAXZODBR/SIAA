@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useAppStore, signedKey } from '../store/appStore';
 import type { Finding, AIResult, Study, Lang, ModelIdentity, SignedReport } from '../types';
 import { generateReport, formatFullReport } from '../services/reportGenerator';
@@ -7,21 +7,12 @@ import type { PDFBaseData, PDFLanguageSection } from '../services/pdfExport';
 import { regenerateReport, signReport, saveReportCorrection, describeApiError } from '../services/api';
 import { DEMO_MODE, DEMO_STUDIES, getDemoResultForStudy } from '../services/demoData';
 import {
-  translateFinding, translateLocation, findingUrgency, urgencyWord, statusWord, L,
+  translateFinding, translateLocation, findingUrgency, urgencyWord, statusWord,
 } from '../services/findingTranslations';
 import type { FindingUrgency } from '../services/findingTranslations';
 import { getAppVersion } from '../services/appInfo';
+import { useT, LANGS, langShort, formatDate, formatDateTime } from '../i18n';
 import AIChat from './AIChat';
-
-const LANGS: Lang[] = ['ru', 'uz', 'en'];
-const LANG_SHORT: Record<Lang, string> = { ru: 'РУС', uz: "O'ZB", en: 'ENG' };
-const LOCALES: Record<Lang, string> = { ru: 'ru-RU', uz: 'uz-UZ', en: 'en-US' };
-
-function formatDateTime(iso: string | null | undefined, lang: Lang): string {
-  if (!iso) return '';
-  const d = new Date(iso);
-  return isNaN(d.getTime()) ? String(iso) : d.toLocaleString(LOCALES[lang]);
-}
 
 /** Validation-status badge: validated = green, pending = amber, experimental = grey. */
 function statusPillClass(status: string): string {
@@ -42,7 +33,8 @@ function isSameFinding(a: Finding | null, b: Finding): boolean {
 }
 
 export default function RightPanel() {
-  const { rightPanelTab, setRightPanelTab, selectedStudyId, aiResults, studies, settings, updateSettings } = useAppStore();
+  const { rightPanelTab, setRightPanelTab, selectedStudyId, aiResults, studies, settings } = useAppStore();
+  const t = useT();
   const lang = settings.language;
   const allStudies: Study[] = studies.length > 0 ? studies : (DEMO_MODE ? DEMO_STUDIES : []);
   const study = allStudies.find((s) => s.id === selectedStudyId) || null;
@@ -52,34 +44,17 @@ export default function RightPanel() {
 
   // The Compare tab has no real data source in this build (no PACS prior lookup), so it is not offered.
   const tabs = [
-    { id: 'findings', label: L('findings', lang), count: result ? result.findings.filter((f) => f.positive).length : 0 },
-    { id: 'report',   label: L('report', lang),   count: null },
-    { id: 'chat',     label: L('askAI', lang),    count: null },
-    { id: 'info',     label: L('details', lang),  count: null },
+    { id: 'findings', label: t('panel.findings'), count: result ? result.findings.filter((f) => f.positive).length : 0 },
+    { id: 'report',   label: t('panel.report'),   count: null },
+    { id: 'chat',     label: t('panel.askAi'),    count: null },
+    { id: 'info',     label: t('panel.details'),  count: null },
   ] as const;
 
   return (
     <div className="h-full flex flex-col bg-ink-900 border-l border-ink-800">
-      {/* Language switcher */}
-      <div className="flex items-center justify-end gap-1 px-2 py-1 border-b border-ink-800 bg-ink-950/40">
-        <span className="text-[9px] uppercase tracking-wider text-ink-500 mr-1">Язык / Til / Lang:</span>
-        {LANGS.map((l) => (
-          <button
-            key={l}
-            onClick={() => updateSettings({ language: l })}
-            className={`px-2 py-0.5 text-[10px] font-semibold rounded ${
-              lang === l ? 'bg-accent-600 text-white' : 'bg-ink-800 text-ink-400 hover:text-ink-200'
-            }`}
-            title={`Switch to ${l.toUpperCase()}`}
-          >
-            {LANG_SHORT[l]}
-          </button>
-        ))}
-      </div>
-
       {/* Tab Bar */}
       <div className="flex border-b border-ink-800 bg-ink-950/50 overflow-x-auto">
-        {tabs.map(tab => (
+        {tabs.map((tab) => (
           <button
             key={tab.id}
             onClick={() => setRightPanelTab(tab.id)}
@@ -101,7 +76,7 @@ export default function RightPanel() {
         {rightPanelTab === 'report' && <ReportTab result={result} study={study} lang={lang} />}
         {rightPanelTab === 'chat' && <AIChat />}
         {rightPanelTab === 'info' && <InfoTab study={study} result={result} lang={lang} />}
-        {rightPanelTab === 'compare' && <CompareTab lang={lang} />}
+        {rightPanelTab === 'compare' && <CompareTab />}
       </div>
     </div>
   );
@@ -112,6 +87,7 @@ export default function RightPanel() {
 // ========================================================================
 function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) {
   const { selectFinding, selectedFinding } = useAppStore();
+  const t = useT();
 
   // Flagged findings first, then by confidence. Presentation order only — urgency never comes from the score.
   const ordered = useMemo(() => {
@@ -123,14 +99,14 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
     return (
       <EmptyState
         icon="⚕"
-        title={L('noAnalysisYet', lang)}
-        description={L('selectStudy', lang)}
+        title={t('findings.noAnalysisYet')}
+        description={t('findings.selectStudy')}
       />
     );
   }
 
   if (result.rejected || result.requiresReview) {
-    return <NotAnalyzedState result={result} lang={lang} />;
+    return <NotAnalyzedState result={result} />;
   }
 
   const overall = result.overallAssessment;
@@ -140,32 +116,32 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
 
   return (
     <div className="p-3 space-y-3">
-      <DisclaimerBanner text={result.disclaimer} lang={lang} />
+      <DisclaimerBanner text={result.disclaimer} />
 
       {/* Overall assessment — the server's rule; never a "normal" certificate */}
       <div className={`p-3 rounded-lg border ${flagged ? 'severity-critical' : 'border-ink-700 bg-ink-850/60 text-ink-200'}`}>
-        <div className="text-[10px] font-bold uppercase tracking-wider mb-1 opacity-80">{L('overallAssessment', lang)}</div>
+        <div className="text-[10px] font-bold uppercase tracking-wider mb-1 opacity-80">{t('findings.overallAssessment')}</div>
         <div className="text-sm font-semibold leading-tight">
-          {flagged ? L('abnormalFlagged', lang) : L('noFindingFlagged', lang)}
+          {flagged ? t('findings.abnormalFlagged') : t('findings.noFindingFlagged')}
         </div>
         {overallText && <p className="text-xs mt-1 opacity-90">{overallText}</p>}
       </div>
 
       {/* Stats grid — real numbers from the result only */}
       <div className="grid grid-cols-3 gap-2">
-        <StatCard label={L('flagged', lang)} value={`${flaggedCount} / ${ordered.length}`} />
-        <StatCard label={L('time', lang)} value={result.inferenceTimeMs ? `${result.inferenceTimeMs} ms` : '—'} />
-        <StatCard label={L('threshold', lang)} value={result.threshold != null ? result.threshold.toFixed(2) : '—'} />
+        <StatCard label={t('findings.flagged')} value={`${flaggedCount} / ${ordered.length}`} />
+        <StatCard label={t('findings.time')} value={result.inferenceTimeMs ? `${result.inferenceTimeMs} ms` : '—'} />
+        <StatCard label={t('findings.threshold')} value={result.threshold != null ? result.threshold.toFixed(2) : '—'} />
       </div>
 
       {/* Findings list */}
       <div className="space-y-2">
         <div className="px-1 text-[10px] font-semibold text-ink-500 uppercase tracking-wider">
-          {L('detectedPath', lang)}
+          {t('findings.detected')}
         </div>
         {ordered.length === 0 && (
           <div className="p-3 rounded-lg border border-ink-800 bg-ink-850/50 text-xs text-ink-400">
-            {L('noFindingFlagged', lang)}
+            {t('findings.noFindingFlagged')}
           </div>
         )}
         {ordered.map((finding, idx) => (
@@ -191,24 +167,26 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
   );
 }
 
-function NotAnalyzedState({ result, lang }: { result: AIResult; lang: Lang }) {
+function NotAnalyzedState({ result }: { result: AIResult }) {
+  const t = useT();
   const reason = result.rejectionReason || '';
   return (
     <div className="p-4 space-y-3">
       <div className="p-4 rounded-lg border severity-moderate">
         <div className="text-sm font-semibold leading-snug">
-          {L('notAnalyzed', lang)}{reason ? `: ${reason}` : ''}
+          {t('findings.notAnalyzed')}{reason ? `: ${reason}` : ''}
         </div>
       </div>
-      <DisclaimerBanner text={result.disclaimer} lang={lang} />
+      <DisclaimerBanner text={result.disclaimer} />
     </div>
   );
 }
 
-function DisclaimerBanner({ text, lang }: { text: string; lang: Lang }) {
+function DisclaimerBanner({ text }: { text: string }) {
+  const t = useT();
   return (
     <div className="px-3 py-2 rounded-lg border border-moderate/40 bg-moderate/10 text-[11px] text-ink-200 leading-snug">
-      {text || L('intendedUse', lang)}
+      {text || t('findings.intendedUse')}
     </div>
   );
 }
@@ -234,6 +212,7 @@ function Meta({ label, value }: { label: string; value: string }) {
 function FindingCard({ finding, rank, lang, threshold, isSelected, onClick }: {
   finding: Finding; rank: number; lang: Lang; threshold: number | null; isSelected: boolean; onClick: () => void;
 }) {
+  const t = useT();
   const confidence = Math.round(finding.confidence * 100);
   const urgency = findingUrgency(finding);
   const name = translateFinding(finding.className, lang);
@@ -263,7 +242,7 @@ function FindingCard({ finding, rank, lang, threshold, isSelected, onClick }: {
         </div>
         <div className="text-right ml-2 flex-shrink-0">
           <div className={`text-base font-bold font-mono ${finding.positive ? 'text-ink-100' : 'text-ink-500'}`}>{confidence}%</div>
-          <div className="text-[9px] text-ink-500 uppercase tracking-wider">{L('conf', lang)}</div>
+          <div className="text-[9px] text-ink-500 uppercase tracking-wider">{t('findings.conf')}</div>
         </div>
       </div>
 
@@ -283,7 +262,7 @@ function FindingCard({ finding, rank, lang, threshold, isSelected, onClick }: {
           <div
             className="absolute inset-y-0 w-px bg-ink-300"
             style={{ left: `${thresholdPct}%` }}
-            title={`${L('threshold', lang)} ${thresholdPct}%`}
+            title={`${t('findings.threshold')} ${thresholdPct}%`}
           />
         )}
       </div>
@@ -291,11 +270,11 @@ function FindingCard({ finding, rank, lang, threshold, isSelected, onClick }: {
       {/* Metadata — only what the server reported */}
       {isSelected && (
         <div className="mt-3 pt-3 border-t border-ink-800 grid grid-cols-2 gap-2 text-[10px] animate-fade-in">
-          <Meta label={L('detector', lang)} value={finding.detector || '—'} />
-          <Meta label={L('sequence', lang)} value={finding.sequenceUsed || '—'} />
-          <Meta label={L('status', lang)} value={statusWord(finding.status, lang)} />
-          <Meta label="Class" value={finding.className} />
-          {thresholdPct != null && <Meta label={L('threshold', lang)} value={`${thresholdPct}%`} />}
+          <Meta label={t('findings.detector')} value={finding.detector || '—'} />
+          <Meta label={t('findings.sequence')} value={finding.sequenceUsed || '—'} />
+          <Meta label={t('findings.status')} value={statusWord(finding.status, lang)} />
+          <Meta label={t('findings.class')} value={finding.className} />
+          {thresholdPct != null && <Meta label={t('findings.threshold')} value={`${thresholdPct}%`} />}
         </div>
       )}
     </div>
@@ -305,9 +284,10 @@ function FindingCard({ finding, rank, lang, threshold, isSelected, onClick }: {
 function ModelIdentityList({ models, fallback, appVersion, lang }: {
   models: ModelIdentity[]; fallback: string; appVersion: string | null; lang: Lang;
 }) {
+  const t = useT();
   return (
     <div className="pt-3 border-t border-ink-800">
-      <div className="px-1 text-[10px] font-semibold text-ink-500 uppercase tracking-wider mb-2">{L('models', lang)}</div>
+      <div className="px-1 text-[10px] font-semibold text-ink-500 uppercase tracking-wider mb-2">{t('findings.models')}</div>
       {models.length === 0 ? (
         <div className="px-1 text-[10px] text-ink-500 font-mono">{fallback || '—'}</div>
       ) : (
@@ -325,7 +305,7 @@ function ModelIdentityList({ models, fallback, appVersion, lang }: {
         </div>
       )}
       {appVersion && (
-        <div className="px-1 mt-2 text-[9px] text-ink-600 font-mono">{L('aiServer', lang)} · {L('version', lang)}: {appVersion}</div>
+        <div className="px-1 mt-2 text-[9px] text-ink-600 font-mono">{t('findings.aiServerVersion')}: {appVersion}</div>
       )}
     </div>
   );
@@ -344,7 +324,8 @@ interface ReportCache {
 const EMPTY_CACHE: ReportCache = { studyId: '', texts: {}, drafts: {} };
 
 function ReportTab({ result, study, lang }: { result: AIResult | null; study: Study | null; lang: Lang }) {
-  const { currentUser, settings, reports, signedReports, setSignedReport, addNotification } = useAppStore();
+  const { currentUser, settings, reports, signedReports, setSignedReport, addNotification, exportRequest } = useAppStore();
+  const t = useT();
   const studyId = study?.id || '';
   const storedReport = reports[studyId];
 
@@ -354,7 +335,7 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
   const drafts = cache.studyId === studyId ? cache.drafts : {};
 
   const [language, setLanguage] = useState<Lang>(settings.language);
-  // Follow the global language switcher (top of right panel) when it changes.
+  // Follow the global interface language (top bar switcher) — it is the default report language.
   useEffect(() => { setLanguage(settings.language); }, [settings.language]);
   const [editMode, setEditMode] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
@@ -436,7 +417,7 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
         const template = generateReport(result, language, modality, bodyPart);
         const fullText = formatFullReport(template, study.patientId, study.studyDate || '—', currentUser?.fullName || '', language);
         seedText(language, fullText, fullText);
-        setRegenError(L('llmUnavailable', lang));
+        setRegenError(t('health.llmUnavailable'));
       } finally {
         if (!cancelled) setRegenerating(false);
       }
@@ -450,11 +431,88 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
   const edited = !signed && !!draftText && reportText !== draftText;
   const notAnalyzed = !!result && (result.rejected || result.requiresReview);
 
+  // ----- PDF export ----------------------------------------------------------
+  const sectionFor = (l: Lang): PDFLanguageSection | null => {
+    const s = signedFor(l);
+    const text = s ? s.reportText : texts[l];
+    if (!text) return null;
+    return {
+      reportText: text,
+      doctorName: s ? (s.signer.fullName || s.signer.username) : (currentUser?.fullName || ''),
+      signedAt: s?.signedAt,
+      sha256: s?.sha256,
+      // A signed translation was reviewed by the signer; only unsigned ones carry the tag.
+      autoTranslated: !s && l !== originalLang,
+    };
+  };
+  const openedLangs = LANGS.filter((l) => !!sectionFor(l));
+  const allOpenedSigned = openedLangs.length > 0 && openedLangs.every((l) => !!signedFor(l));
+  const canExport = !!result && !notAnalyzed && !!study && (exportMode === 'opened' ? openedLangs.length > 0 : !!reportText);
+
+  const buildPdfBase = async (): Promise<PDFBaseData> => ({
+    patientId: study!.patientId,
+    patientName: study!.patientName,
+    studyDate: study!.studyDate || '—',
+    accessionNumber: study!.accessionNumber,
+    studyInstanceUid: study!.studyInstanceUid,
+    modality: result!.modality || study!.modality,
+    bodyPart: result!.bodyPart || study!.bodyPart,
+    clinicName: settings.clinicName || t('login.clinicPlaceholder'),
+    clinicAddress: [settings.clinicAddress, settings.clinicPhone].filter(Boolean).join(' · '),
+    findings: result!.findings,
+    modelIdentity: result!.modelIdentity,
+    threshold: result!.threshold,
+    appVersion: await getAppVersion(),
+    disclaimer: result!.disclaimer,
+  });
+
+  // <studyInstanceUid last 12 chars | patientId>_<studyDate>_<lang>[_DRAFT].pdf
+  const pdfFilename = (langPart: string, draft: boolean) => {
+    const uid = study?.studyInstanceUid || '';
+    const idPart = uid ? uid.slice(-12) : study?.patientId || 'study';
+    return `${sanitizeFilePart(idPart)}_${sanitizeFilePart(study?.studyDate || 'nodate')}_${langPart}${draft ? '_DRAFT' : ''}.pdf`;
+  };
+
+  const handleExport = async () => {
+    if (exporting || !canExport) return;
+    setExporting(true);
+    try {
+      const base = await buildPdfBase();
+      let res;
+      if (exportMode === 'opened') {
+        const sections: Partial<Record<Lang, PDFLanguageSection>> = {};
+        for (const l of openedLangs) sections[l] = sectionFor(l)!;
+        res = await downloadMultiLanguagePDF(base, sections, pdfFilename(openedLangs.join('-'), !allOpenedSigned));
+      } else {
+        const section = sectionFor(language);
+        if (!section) return;
+        res = await downloadPDF({ ...base, ...section, language }, pdfFilename(language, !signed));
+      }
+      if (res.success) addNotification({ type: 'success', title: t('report.pdfSaved'), message: res.filePath });
+      else if (!res.canceled) addNotification({ type: 'error', title: t('report.exportFailed'), message: res.error });
+    } catch (e) {
+      console.error('PDF export failed:', e);
+      addNotification({ type: 'error', title: t('report.exportFailed') });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // File → Export PDF / ⌘P / palette: run the same export as the button.
+  const seenExportRequest = useRef(exportRequest);
+  useEffect(() => {
+    if (exportRequest === seenExportRequest.current) return;
+    seenExportRequest.current = exportRequest;
+    if (!result) { addNotification({ type: 'warning', title: t('report.noReportYet'), message: t('report.selectStudy') }); return; }
+    if (!canExport) { addNotification({ type: 'warning', title: t('report.noReportYet') }); return; }
+    handleExport();
+  }, [exportRequest]);
+
   if (!result) {
-    return <EmptyState icon="📄" title={L('noReportYet', lang)} description={L('selectStudyForReport', lang)} />;
+    return <EmptyState icon="📄" title={t('report.noReportYet')} description={t('report.selectStudy')} />;
   }
   if (notAnalyzed || !study) {
-    return <NotAnalyzedState result={result} lang={lang} />;
+    return <NotAnalyzedState result={result} />;
   }
 
   const handleToggleEdit = () => {
@@ -476,92 +534,25 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
       setEditMode(false);
       addNotification({
         type: 'success',
-        title: L('signedLocked', lang),
+        title: t('report.signedLocked'),
         message: `${s.signer.fullName || s.signer.username} · ${s.sha256.slice(0, 12)}`,
       });
     } catch (e) {
       const info = describeApiError(e);
       console.error('Sign failed:', info.code, info.detail);
-      if (info.code === 'conflict') addNotification({ type: 'warning', title: L('alreadySigned', lang) });
-      else if (info.code === 'forbidden') addNotification({ type: 'warning', title: L('noPermissionSign', lang) });
-      else if (info.code === 'network') addNotification({ type: 'error', title: L('aiServerDown', lang) });
-      else if (info.code === 'auth') addNotification({ type: 'warning', title: L('sessionExpired', lang) });
-      else addNotification({ type: 'error', title: L('signFailed', lang), message: info.detail });
+      if (info.code === 'conflict') addNotification({ type: 'warning', title: t('report.alreadySigned') });
+      else if (info.code === 'forbidden') addNotification({ type: 'warning', title: t('report.noPermissionSign') });
+      else if (info.code === 'network') addNotification({ type: 'error', title: t('health.aiServerDown') });
+      else if (info.code === 'auth') addNotification({ type: 'warning', title: t('health.sessionExpired') });
+      else addNotification({ type: 'error', title: t('report.signFailed'), message: info.detail });
     } finally {
       setSigning(false);
     }
   };
 
-  // ----- PDF export ----------------------------------------------------------
-  const sectionFor = (l: Lang): PDFLanguageSection | null => {
-    const s = signedFor(l);
-    const text = s ? s.reportText : texts[l];
-    if (!text) return null;
-    return {
-      reportText: text,
-      doctorName: s ? (s.signer.fullName || s.signer.username) : (currentUser?.fullName || ''),
-      signedAt: s?.signedAt,
-      sha256: s?.sha256,
-      // A signed translation was reviewed by the signer; only unsigned ones carry the tag.
-      autoTranslated: !s && l !== originalLang,
-    };
-  };
-  const openedLangs = LANGS.filter((l) => !!sectionFor(l));
-  const allOpenedSigned = openedLangs.length > 0 && openedLangs.every((l) => !!signedFor(l));
-
-  const buildPdfBase = async (): Promise<PDFBaseData> => ({
-    patientId: study.patientId,
-    patientName: study.patientName,
-    studyDate: study.studyDate || '—',
-    accessionNumber: study.accessionNumber,
-    studyInstanceUid: study.studyInstanceUid,
-    modality: result.modality || study.modality,
-    bodyPart: result.bodyPart || study.bodyPart,
-    clinicName: settings.clinicName || L('clinicPlaceholder', lang),
-    clinicAddress: settings.clinicAddress || '',
-    findings: result.findings,
-    modelIdentity: result.modelIdentity,
-    threshold: result.threshold,
-    appVersion: await getAppVersion(),
-    disclaimer: result.disclaimer,
-  });
-
-  // <studyInstanceUid last 12 chars | patientId>_<studyDate>_<lang>[_DRAFT].pdf
-  const pdfFilename = (langPart: string, draft: boolean) => {
-    const uid = study.studyInstanceUid || '';
-    const idPart = uid ? uid.slice(-12) : study.patientId;
-    return `${sanitizeFilePart(idPart)}_${sanitizeFilePart(study.studyDate || 'nodate')}_${langPart}${draft ? '_DRAFT' : ''}.pdf`;
-  };
-
-  const handleExport = async () => {
-    if (exporting) return;
-    setExporting(true);
-    try {
-      const base = await buildPdfBase();
-      let res;
-      if (exportMode === 'opened') {
-        const sections: Partial<Record<Lang, PDFLanguageSection>> = {};
-        for (const l of openedLangs) sections[l] = sectionFor(l)!;
-        res = await downloadMultiLanguagePDF(base, sections, pdfFilename(openedLangs.join('-'), !allOpenedSigned));
-      } else {
-        const section = sectionFor(language);
-        if (!section) return;
-        res = await downloadPDF({ ...base, ...section, language }, pdfFilename(language, !signed));
-      }
-      if (res.success) addNotification({ type: 'success', title: L('pdfSaved', lang), message: res.filePath });
-      else if (!res.canceled) addNotification({ type: 'error', title: L('exportFailed', lang), message: res.error });
-    } catch (e) {
-      console.error('PDF export failed:', e);
-      addNotification({ type: 'error', title: L('exportFailed', lang) });
-    } finally {
-      setExporting(false);
-    }
-  };
-
   const exportLabel = exportMode === 'opened'
-    ? `${allOpenedSigned ? L('exportSignedPdf', lang) : L('exportDraftPdf', lang)} (${openedLangs.length})`
-    : (signed ? L('exportSignedPdf', lang) : L('exportDraftPdf', lang));
-  const canExport = exportMode === 'opened' ? openedLangs.length > 0 : !!reportText;
+    ? `${allOpenedSigned ? t('report.exportSigned') : t('report.exportDraft')} (${openedLangs.length})`
+    : (signed ? t('report.exportSigned') : t('report.exportDraft'));
 
   return (
     <div className="flex flex-col h-full">
@@ -576,9 +567,9 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
               className={`px-2.5 py-1 text-[10px] font-bold rounded transition-colors disabled:opacity-50 ${
                 language === l ? 'bg-accent-600 text-white' : 'bg-ink-800 text-ink-400 hover:text-ink-200'
               }`}
-              title={signedFor(l) ? L('signedLocked', lang) : (texts[l] ? L('draft', lang) : '')}
+              title={signedFor(l) ? t('report.signedLocked') : (texts[l] ? t('report.draft') : '')}
             >
-              {LANG_SHORT[l]}
+              {langShort(l)}
               {signedFor(l) ? (
                 <span className="ml-1 text-[8px] text-normal">✓</span>
               ) : texts[l] ? (
@@ -591,7 +582,7 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
           <button
             onClick={handleToggleEdit}
             className={`p-1 rounded transition-colors ${editMode ? 'bg-accent-600 text-white' : 'text-ink-500 hover:text-ink-200'}`}
-            title={L('editReport', lang)}
+            title={t('report.edit')}
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
@@ -609,19 +600,19 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              {L('generatingReport', lang)} · {LANG_SHORT[language]}…
+              {t('report.generating')} · {langShort(language)}…
             </span>
           )}
           {regenError && <span className="text-yellow-300">⚠ {regenError}</span>}
           {!signed && reportText && language !== originalLang && (
-            <span className="text-moderate">⚠ {L('autoTranslated', lang)}</span>
+            <span className="text-moderate">⚠ {t('report.autoTranslated')}</span>
           )}
-          {edited && <span className="text-ink-400">{L('draftEdited', lang)}</span>}
+          {edited && <span className="text-ink-400">{t('report.draftEdited')}</span>}
         </div>
       )}
 
       {/* Report content */}
-      <div className="flex-1 overflow-hidden p-3">
+      <div className="flex-1 overflow-hidden p-3 relative">
         <div className={`h-full rounded-lg border transition-colors ${
           signed
             ? 'border-normal/40 bg-normal/5'
@@ -637,6 +628,12 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
             className="w-full h-full p-3 text-xs leading-relaxed font-mono bg-transparent resize-none focus:outline-none text-ink-200"
           />
         </div>
+        {/* Draft watermark — the same text the PDF banner prints */}
+        {!signed && reportText && (
+          <div className="absolute top-4 right-5 pointer-events-none select-none px-2 py-0.5 rounded border border-critical/40 bg-ink-950/70 text-[9px] font-bold tracking-wider text-critical/80 uppercase rotate-[-3deg]">
+            {t('report.draftWatermark')}
+          </div>
+        )}
       </div>
 
       {/* Footer actions */}
@@ -649,7 +646,7 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
               exportMode === 'current' ? 'bg-ink-700 text-white' : 'text-ink-500 hover:text-ink-300'
             }`}
           >
-            {L('currentLanguage', lang)}
+            {t('report.currentLanguage')}
           </button>
           <button
             onClick={() => setExportMode('opened')}
@@ -657,7 +654,7 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
               exportMode === 'opened' ? 'bg-ink-700 text-white' : 'text-ink-500 hover:text-ink-300'
             }`}
           >
-            {L('exportOpened', lang)} ({openedLangs.length})
+            {t('report.openedLanguages')} ({openedLangs.length})
           </button>
         </div>
 
@@ -670,15 +667,15 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
                 </svg>
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-xs font-semibold text-normal">{L('signedLocked', lang)}</div>
+                <div className="text-xs font-semibold text-normal">{t('report.signedLocked')}</div>
                 <div className="text-[10px] text-ink-300 truncate">
-                  {L('signedBy', lang)}: {signed.signer.fullName || signed.signer.username} · {formatDateTime(signed.signedAt, lang)}
+                  {t('report.signedBy')}: {signed.signer.fullName || signed.signer.username} · {formatDateTime(signed.signedAt, lang)}
                 </div>
-                <div className="text-[9px] text-ink-500 font-mono break-all" title={signed.sha256}>SHA-256: {signed.sha256}</div>
+                <div className="text-[9px] text-ink-500 font-mono break-all" title={signed.sha256}>{t('report.sha')}: {signed.sha256}</div>
               </div>
             </div>
             <button onClick={handleExport} disabled={exporting || !canExport} className="w-full btn-primary py-2 disabled:opacity-50">
-              {exporting ? L('exporting', lang) : exportLabel}
+              {exporting ? t('report.exporting') : exportLabel}
             </button>
           </>
         ) : (
@@ -688,14 +685,14 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
               disabled={!reportText || regenerating || signing}
               className="btn-primary py-2 disabled:opacity-50"
             >
-              {signing ? L('signing', lang) : `✓ ${L('signReport', lang)}`}
+              {signing ? t('report.signing') : `✓ ${t('report.sign')}`}
             </button>
             <button
               onClick={handleExport}
               disabled={!canExport || regenerating || exporting}
               className="btn-secondary py-2 disabled:opacity-50"
             >
-              {exporting ? L('exporting', lang) : exportLabel}
+              {exporting ? t('report.exporting') : exportLabel}
             </button>
           </div>
         )}
@@ -709,9 +706,10 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
 // ========================================================================
 function InfoTab({ study, result, lang }: { study: Study | null; result: AIResult | null; lang: Lang }) {
   const { health } = useAppStore();
+  const t = useT();
 
   if (!study) {
-    return <EmptyState icon="ⓘ" title={L('noStudySelected', lang)} description={L('selectStudyForDetails', lang)} />;
+    return <EmptyState icon="ⓘ" title={t('details.noStudySelected')} description={t('details.selectStudy')} />;
   }
 
   type Row = [string, string];
@@ -721,51 +719,51 @@ function InfoTab({ study, result, lang }: { study: Study | null; result: AIResul
 
   const sections = [
     {
-      title: L('patient', lang),
+      title: t('details.patient'),
       items: compact([
-        row(L('patientId', lang), study.patientId),
-        row(L('patientName', lang), study.patientName),
-        row(L('sex', lang), study.patientSex),
-        row(L('age', lang), study.patientAge),
-        row(L('birthDate', lang), study.patientBirthDate),
+        row(t('details.patientId'), study.patientId),
+        row(t('details.patientName'), study.patientName),
+        row(t('details.sex'), study.patientSex),
+        row(t('details.age'), study.patientAge),
+        row(t('details.birthDate'), study.patientBirthDate ? formatDate(study.patientBirthDate, lang) : null),
       ]),
     },
     {
-      title: L('study', lang),
+      title: t('details.study'),
       items: compact([
-        row(L('studyUid', lang), study.studyInstanceUid),
-        row(L('accession', lang), study.accessionNumber),
-        row(L('studyDate', lang), study.studyDate),
-        row(L('modality', lang), study.modality !== 'N/A' ? study.modality : null),
-        row(L('bodyPart', lang), study.bodyPart !== '—' ? study.bodyPart : null),
-        row(L('description', lang), study.studyDescription),
-        row(L('filesCount', lang), study.numFiles),
-        row(L('series', lang), study.seriesDescriptions?.length ? study.seriesDescriptions.join(', ') : null),
+        row(t('details.studyUid'), study.studyInstanceUid),
+        row(t('details.accession'), study.accessionNumber),
+        row(t('details.studyDate'), study.studyDate ? formatDate(study.studyDate, lang) : null),
+        row(t('details.modality'), study.modality !== 'N/A' ? study.modality : null),
+        row(t('details.bodyPart'), study.bodyPart !== '—' ? study.bodyPart : null),
+        row(t('details.description'), study.studyDescription),
+        row(t('details.filesCount'), study.numFiles),
+        row(t('details.series'), study.seriesDescriptions?.length ? study.seriesDescriptions.join(', ') : null),
       ]),
     },
     {
-      title: L('equipment', lang),
+      title: t('details.equipment'),
       items: compact([
-        row(L('manufacturer', lang), study.manufacturer),
-        row(L('scannerModel', lang), study.scannerModel),
+        row(t('details.manufacturer'), study.manufacturer),
+        row(t('details.scannerModel'), study.scannerModel),
       ]),
     },
     {
-      title: L('aiPipeline', lang),
+      title: t('details.aiPipeline'),
       items: compact([
         ...(result?.modelIdentity || []).map((m) => row(m.displayName, `${m.sha256_12 || '—'} · ${statusWord(m.status, lang)}`)),
-        row(L('threshold', lang), result?.threshold != null ? result.threshold.toFixed(2) : null),
-        row(L('inferenceTime', lang), result?.inferenceTimeMs ? `${result.inferenceTimeMs} ms` : null),
-        row(L('analyzedAt', lang), formatDateTime(result?.createdAt || study.aiAnalyzedAt, lang) || null),
-        row(L('device', lang), health?.device),
-        row(`${L('aiServer', lang)} · ${L('version', lang)}`, result?.appVersion || health?.version),
+        row(t('details.threshold'), result?.threshold != null ? result.threshold.toFixed(2) : null),
+        row(t('details.inferenceTime'), result?.inferenceTimeMs ? `${result.inferenceTimeMs} ms` : null),
+        row(t('details.analyzedAt'), formatDateTime(result?.createdAt || study.aiAnalyzedAt, lang) || null),
+        row(t('details.device'), health?.device),
+        row(t('findings.aiServerVersion'), result?.appVersion || health?.version),
       ]),
     },
   ].filter((s) => s.items.length > 0);
 
   return (
     <div className="p-3 space-y-4">
-      {sections.map(section => (
+      {sections.map((section) => (
         <div key={section.title}>
           <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2 px-1">
             {section.title}
@@ -787,8 +785,9 @@ function InfoTab({ study, result, lang }: { study: Study | null; result: AIResul
 // ========================================================================
 // COMPARE TAB — no prior-study / similar-case data source exists in this build
 // ========================================================================
-function CompareTab({ lang }: { lang: Lang }) {
-  return <EmptyState icon="⇄" title={L('compare', lang)} description={L('compareUnavailable', lang)} />;
+function CompareTab() {
+  const t = useT();
+  return <EmptyState icon="⇄" title={t('panel.compare')} description={t('details.compareUnavailable')} />;
 }
 
 // ========================================================================

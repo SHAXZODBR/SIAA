@@ -1671,11 +1671,27 @@ def _persist_analysis(resp: dict, hdr: dict, user: dict, inference_time_ms: int)
         return False
 
 
+# Real MRI studies from GE/Siemens scanners often contain 1,500–5,000 single-frame
+# files. Starlette's default multipart parser refuses >1000 parts, so the study
+# routes parse the form themselves with a clinical-scale limit.
+MAX_STUDY_FILES = int(os.environ.get('SENTINEL_MAX_STUDY_FILES', '20000'))
+
+
+async def _read_study_uploads(request: Request, field: str = 'files') -> list[UploadFile]:
+    """Parse multipart with a study-scale part limit and return the UploadFile parts."""
+    form = await request.form(max_files=MAX_STUDY_FILES, max_fields=MAX_STUDY_FILES)
+    # Starlette hands back its own UploadFile class (not FastAPI's subclass), so duck-type.
+    uploads = [v for k, v in form.multi_items()
+               if k == field and hasattr(v, 'filename') and hasattr(v, 'read')]
+    if not uploads:
+        raise HTTPException(status_code=400, detail=f"No files uploaded (multipart field '{field}')")
+    return uploads
+
+
 @app.post("/analyze/study")
 async def analyze_study(
-    files: list[UploadFile] = File(...),
+    request: Request,
     language: str = "ru",
-    request: Request = None,
     user: dict = Depends(clinical_auth("analyze")),
 ):
     """Whole-study analysis — API contract v1 (POST multipart, repeated `files`).
@@ -1688,6 +1704,7 @@ async def analyze_study(
     (model_identity), a localized disclaimer and the actual analyzed slice.
     Persisted to the studies/ai_results tables. `normal` is ALWAYS false.
     """
+    files = await _read_study_uploads(request)
     _enforce_license_or_demo_limit()
     if not files:
         raise HTTPException(status_code=400, detail="No DICOM files provided")
@@ -1886,6 +1903,161 @@ def list_studies(limit: int = 100, user: dict = Depends(clinical_auth("view"))):
 
     limit = max(1, min(int(limit), 500))
     return [_study_out(s) for s in db.list_studies(limit=limit)]
+
+
+# ==================== PACS integration (Orthanc) ====================
+# Studies arrive from the scanner through the local Orthanc PACS
+# (src/inference/orthanc_watcher.py submits them to /analyze/study); the signed
+# report goes back into the same study as a DICOM Encapsulated PDF.
+
+REPORTS_DIR = DATA_DIR / "reports"
+MAX_REPORT_PDF_BYTES = 25 * 1024 * 1024
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Create/overwrite `path` with mode 0600 (report PDFs carry PHI)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as fh:
+        fh.write(data)
+    os.chmod(path, 0o600)
+
+
+@app.get("/pacs/status")
+def pacs_status(user: dict = Depends(clinical_auth("view"))):
+    """Orthanc integration status: whether a PACS is configured, whether the
+    in-process watcher thread is running, and the auto-ingest watcher's
+    persisted state/counters (read from DATA_DIR/orthanc_watcher_state.json,
+    which the standalone `python -m src.inference.orthanc_watcher` service
+    also writes). Ids and counters only - never patient fields."""
+    from src.inference.orthanc_watcher import orthanc_configured, default_state_path, read_state
+
+    watcher = state.orthanc_watcher
+    return {
+        'configured': orthanc_configured(),
+        'orthanc_url': (os.environ.get('ORTHANC_URL') or 'http://127.0.0.1:8042').rstrip('/'),
+        'orthanc_auth_set': bool(os.environ.get('ORTHANC_USER')),
+        'in_process_watcher': watcher is not None,
+        'in_process_connected': bool(watcher.check_connection()) if watcher is not None else None,
+        'state_file': str(default_state_path()),
+        'watcher': read_state(),
+    }
+
+
+@app.post("/report/{report_id}/pdf")
+async def attach_report_pdf(
+    report_id: str,
+    request: Request,
+    pdf: UploadFile = File(...),
+    push: int = 0,
+    user: dict = Depends(clinical_auth("view")),
+):
+    """Attach the rendered PDF of a SIGNED report (multipart field `pdf`).
+
+    Stores the PDF under DATA_DIR/reports/<report_id>.pdf (0600), records its
+    sha256 on the report row, wraps it as a DICOM Encapsulated PDF instance
+    (same StudyInstanceUID as the images, new series 'DOC') stored alongside,
+    and with ?push=1 sends that instance to the configured Orthanc PACS.
+    Allowed for users who may sign reports, or for the report's own signer.
+    Unsigned report -> 409. Re-uploading the identical PDF is idempotent (same
+    SOP Instance UID); a different PDF for an already-attached report -> 409.
+    """
+    from src.inference.auth_routes import db
+    from src.utils.auth import check_permission
+    from src.utils import dicom_export
+    from src.inference.orthanc_watcher import orthanc_configured, orthanc_auth
+
+    report = db.get_report(report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    is_owner = bool(report.get('signer_id')) and report.get('signer_id') == user.get('sub')
+    if not (check_permission(user.get('role', ''), 'sign_report') or is_owner):
+        raise HTTPException(status_code=403, detail="Only the signer or a signing role may attach the report PDF")
+    if not report.get('is_signed'):
+        raise HTTPException(status_code=409, detail="Report is not signed - sign it before exporting to PACS")
+
+    content = await pdf.read()
+    if not content or not dicom_export.is_pdf(content):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a PDF")
+    if len(content) > MAX_REPORT_PDF_BYTES:
+        raise HTTPException(status_code=413, detail="PDF too large")
+    sha = hashlib.sha256(content).hexdigest()
+    if report.get('pdf_sha256') and report['pdf_sha256'] != sha:
+        raise HTTPException(status_code=409,
+                            detail="A different PDF is already attached to this signed report")
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(REPORTS_DIR, 0o700)
+    except OSError:
+        pass
+    pdf_path = REPORTS_DIR / f"{report_id}.pdf"
+    dcm_path = REPORTS_DIR / f"{report_id}.dcm"
+    sop_uid = report.get('dicom_sop_instance_uid')
+
+    if report.get('pdf_sha256') == sha and sop_uid and pdf_path.exists() and dcm_path.exists():
+        dicom_bytes = dcm_path.read_bytes()          # idempotent re-upload
+    else:
+        study = db.get_study(report['study_id']) or {}
+        signer_row = db.get_user(report.get('signer_id') or '') or {}
+        signer_name = (signer_row.get('full_name') or signer_row.get('username')
+                       or user.get('username') or 'signer')
+        meta = {
+            'patient_id': study.get('patient_id'),
+            'patient_name': study.get('patient_name'),
+            'patient_sex': study.get('patient_sex'),
+            'patient_birth_date': study.get('patient_birth_date'),
+            'study_instance_uid': study.get('study_instance_uid'),
+            'accession_number': study.get('accession_number'),
+            'study_date': study.get('study_date'),
+            'modality': study.get('modality'),
+            'referring_physician': '',
+            'study_description': study.get('study_description'),
+        }
+        ds = dicom_export.build_encapsulated_pdf(content, meta, signer_name, report.get('signed_at'),
+                                                 software_version=APP_VERSION)
+        dicom_bytes = dicom_export.dataset_to_bytes(ds)
+        sop_uid = str(ds.SOPInstanceUID)
+        _write_private(pdf_path, content)
+        _write_private(dcm_path, dicom_bytes)
+        db.attach_report_pdf(report_id, pdf_path=str(pdf_path), pdf_sha256=sha,
+                             dicom_path=str(dcm_path), sop_instance_uid=sop_uid)
+
+    pushed = False
+    orthanc_id = report.get('orthanc_instance_id')
+    push_error = None
+    if push:
+        if orthanc_id:
+            pushed = True                                # already in the PACS
+        elif not orthanc_configured():
+            push_error = "Orthanc is not configured (set ORTHANC_URL)"
+        else:
+            url = (os.environ.get('ORTHANC_URL') or 'http://127.0.0.1:8042').rstrip('/')
+            try:
+                res = await asyncio.to_thread(dicom_export.push_to_orthanc, dicom_bytes, url, orthanc_auth())
+                orthanc_id = res.get('orthanc_id')
+                pushed = bool(orthanc_id)
+                if pushed:
+                    db.record_report_push(report_id, orthanc_id)
+                else:
+                    push_error = "Orthanc accepted the instance but returned no ID"
+            except RuntimeError as e:
+                push_error = str(e)
+                logger.warning(f"PACS push failed for report {report_id}: {e}")
+
+    _audit(user, 'attach_report_pdf', 'report', report_id,
+           details=f"study={report['study_id']}; sha256={sha[:12]}; sop={sop_uid}; "
+                   f"push={int(bool(push))}; pushed={pushed}; orthanc_id={orthanc_id or ''}",
+           request=request)
+    return {
+        'report_id': report_id,
+        'study_id': report['study_id'],
+        'pdf_sha256': sha,
+        'pdf_bytes': len(content),
+        'dicom_sop_instance_uid': sop_uid,
+        'pushed': pushed,
+        'orthanc_id': orthanc_id,
+        'push_error': push_error,
+    }
 
 
 def _estimate_location(heatmap: np.ndarray) -> str:

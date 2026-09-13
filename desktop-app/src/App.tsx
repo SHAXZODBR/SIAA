@@ -2,7 +2,8 @@ import React, { useEffect, useRef } from 'react';
 import { useAppStore } from './store/appStore';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { getHealth, checkOrthancHealth, listStudies, getStudy } from './services/api';
-import { L } from './services/findingTranslations';
+import { useT } from './i18n';
+import type { I18nKey } from './i18n';
 
 import TopBar from './components/TopBar';
 import Toolbar from './components/Toolbar';
@@ -14,18 +15,28 @@ import ThumbnailStrip from './components/ThumbnailStrip';
 import LoginScreen from './components/LoginScreen';
 import CommandPalette from './components/CommandPalette';
 import SettingsModal from './components/SettingsModal';
+import SetupWizard from './components/SetupWizard';
+import HelpModal from './components/HelpModal';
 import Toasts from './components/Toasts';
 
 const HEALTH_POLL_MS = 15000;
 
+const ROLE_KEYS: Record<string, I18nKey> = {
+  admin: 'role.admin',
+  radiologist: 'role.radiologist',
+  technician: 'role.technician',
+};
+
 export default function App() {
   const {
     currentUser, mustChangePassword, setConnectionStatus, setHealth, health,
-    sidebarOpen, rightPanelOpen, addNotification, settings,
+    sidebarOpen, rightPanelOpen, addNotification, settings, setupOpen,
     studies, setStudies, selectedStudyId, aiResults, setAIResult, setSignedReport, setReport, updateStudy,
   } = useAppStore();
-  const lang = settings.language;
+  const t = useT();
   const loggedIn = !!currentUser && !mustChangePassword;
+  // First-run wizard: shown after login until the clinic is configured, or when re-run from Settings.
+  const needsSetup = setupOpen || !settings.setupComplete || !settings.clinicName.trim();
 
   // Setup keyboard shortcuts
   useKeyboardShortcuts();
@@ -48,10 +59,11 @@ export default function App() {
   const restoredForUser = useRef<string | null>(null);
   useEffect(() => {
     if (!loggedIn || !currentUser) return;
+    const roleKey = ROLE_KEYS[currentUser.role];
     addNotification({
       type: 'info',
       title: `${currentUser.fullName || currentUser.username}`,
-      message: `${currentUser.role}`,
+      message: roleKey ? t(roleKey) : currentUser.role,
     });
     if (restoredForUser.current === currentUser.id) return;
     restoredForUser.current = currentUser.id;
@@ -62,7 +74,7 @@ export default function App() {
         const known = new Set(current.map((s) => s.id));
         const merged = [...current, ...restored.filter((s) => !known.has(s.id))];
         setStudies(merged);
-        addNotification({ type: 'success', title: L('studiesRestored', lang), message: `${restored.length}` });
+        addNotification({ type: 'success', title: t('health.studiesRestored'), message: `${restored.length}` });
       })
       .catch((e) => {
         console.warn('Worklist restore failed:', e?.message || e);
@@ -101,7 +113,7 @@ export default function App() {
       .catch((e) => {
         fetchedDetail.current.delete(selectedStudyId);
         console.warn('Study detail fetch failed:', e?.message || e);
-        addNotification({ type: 'warning', title: L('aiServerError', lang) });
+        addNotification({ type: 'warning', title: t('health.aiServerError') });
       });
   }, [loggedIn, selectedStudyId, studies, aiResults]);
 
@@ -115,22 +127,32 @@ export default function App() {
     );
   }
 
+  // First-run setup — full screen, before the worklist
+  if (needsSetup) {
+    return (
+      <>
+        <SetupWizard />
+        <Toasts />
+      </>
+    );
+  }
+
   const healthBanner = !health || !health.reachable
-    ? L('aiServerDown', lang)
+    ? t('health.aiServerDown')
     : health.status === 'degraded'
-      ? L('aiServerDegraded', lang)
+      ? t('health.aiServerDegraded')
       : health.status === 'error'
-        ? L('aiServerError', lang)
+        ? t('health.aiServerError')
         : null;
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-ink-950 text-ink-200 overflow-hidden">
+    <div className="h-screen w-screen flex flex-col bg-ink-950 text-ink-200 overflow-hidden" lang={settings.language}>
       {/* Server health banner — full width, above everything */}
       {healthBanner && (
         <div className="w-full px-4 py-1.5 bg-critical/20 border-b border-critical/40 text-xs text-critical flex items-center gap-2 select-none">
           <span className="w-2 h-2 rounded-full bg-critical animate-pulse flex-shrink-0" />
           <span className="font-semibold">{healthBanner}</span>
-          {settings.supportContact && <span className="text-ink-300 ml-2">{L('support', lang)}: {settings.supportContact}</span>}
+          {settings.supportContact && <span className="text-ink-300 ml-2">{t('common.support')}: {settings.supportContact}</span>}
         </div>
       )}
 
@@ -173,6 +195,7 @@ export default function App() {
       {/* Overlays */}
       <CommandPalette />
       <SettingsModal />
+      <HelpModal />
       <Toasts />
     </div>
   );
