@@ -71,3 +71,5 @@ models/monai_bundles/
 
 # build output
 desktop-app/dist/
+packaging/dist/
+packaging/build/
