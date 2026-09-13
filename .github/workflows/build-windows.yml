@@ -1,0 +1,315 @@
+# Installer builds for the Sentinel desktop app — Windows NSIS (x64) and macOS DMG (Apple Silicon).
+#
+#   trigger   Actions tab -> "Build installers" -> Run workflow, or push a tag v1.0.0 (tags v*)
+#   output    artifact  sentinel-windows-x64-{full|NO-VALIDATED-MODEL}   <- desktop-app/release/*.exe
+#             artifact  sentinel-macos-arm64-{full|NO-VALIDATED-MODEL}   <- desktop-app/release/*.dmg
+#             tag builds also attach the files to a DRAFT GitHub Release for the tag
+#
+# Each job: checkout -> Python 3.11 venv with CPU-only PyTorch -> PyInstaller freeze
+# (packaging/build_backend.{ps1,sh}) -> public models (scripts/download_all_models.py) ->
+# validated model from the MODEL_BUNDLE_URL secret (packaging/fetch_model_bundle.py) ->
+# /health smoke of the frozen exe (packaging/smoke_backend.{ps1,sh}) -> npm ci + type-check ->
+# electron-builder -> upload.
+#
+# Secrets (Settings -> Secrets and variables -> Actions); every one is optional:
+#   MODEL_BUNDLE_URL      zip of models/brain_triage_finetuned (validated triage model — never in
+#                         git, not downloadable). ABSENT -> the installer is built WITHOUT it, the
+#                         artifact is named ...-NO-VALIDATED-MODEL and every install reports
+#                         /health status 'degraded'. Layout + verification: packaging/fetch_model_bundle.py
+#   MODEL_BUNDLE_TOKEN    bearer token for that URL (private GitHub Release asset via its API URL;
+#                         an asset of THIS repo needs none — the job's GITHUB_TOKEN is used)
+#   WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD   Authenticode certificate (.pfx as base64 or URL) + password,
+#                         read by electron-builder. ABSENT -> unsigned installer: Windows SmartScreen
+#                         shows "Windows protected your PC" on first run (More info -> Run anyway).
+#   CSC_LINK, CSC_KEY_PASSWORD           macOS Developer ID certificate (.p12) + password.
+#                         ABSENT -> unsigned, un-notarized DMG (Gatekeeper: right-click -> Open).
+#
+# PyTorch: CPU-only wheels from the PyTorch index (no CUDA runtime, so the frozen backend stays
+# ~1.3 GB instead of ~4 GB). torch / torchvision are pinned below to the versions the macOS
+# bundle was verified with; bump both together. Python 3.11 is the CI interpreter (the
+# developer Mac runs 3.14 — the spec is version-agnostic).
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write     # draft-release upload on tag builds (checkout needs read)
+
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+  TORCH_VERSION: '2.11.0'
+  TORCHVISION_VERSION: '0.26.0'
+  TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+  # keys understood by scripts/download_all_models.py --only (registry keys + extras)
+  PUBLIC_MODEL_KEYS: brain_tumor_class,chest,chest_checkpoint,generic_processors
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  PYTHONUTF8: '1'            # download_all_models.py prints non-ASCII; Windows consoles default to cp1252
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  windows:
+    name: Windows installer (NSIS x64)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Python venv + CPU torch + requirements
+        run: |
+          python -m venv .venv
+          $py = "$env:GITHUB_WORKSPACE\.venv\Scripts\python.exe"
+          & $py -m pip install --upgrade pip wheel
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          & $py -m pip install "torch==$env:TORCH_VERSION" "torchvision==$env:TORCHVISION_VERSION" --index-url $env:TORCH_INDEX_URL
+          if ($LASTEXITCODE -ne 0) { throw "CPU torch install failed" }
+          & $py -m pip install -r requirements.txt -r requirements-dev.txt --extra-index-url $env:TORCH_INDEX_URL
+          if ($LASTEXITCODE -ne 0) { throw "requirements install failed" }
+          & $py -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'cuda', torch.cuda.is_available())"
+          $v = (& $py -c "import torch; print(torch.__version__)") | Select-Object -Last 1
+          if (-not "$v".StartsWith($env:TORCH_VERSION)) { throw "torch resolved to $v, expected $env:TORCH_VERSION (a requirement re-pinned it; update TORCH_VERSION)" }
+          "PYTHON=$py" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Freeze backend (PyInstaller -> packaging/dist/sentinel-backend/sentinel-backend.exe)
+        run: .\packaging\build_backend.ps1
+
+      - name: Free disk (PyInstaller work dir)
+        run: Remove-Item -Recurse -Force packaging\build -ErrorAction SilentlyContinue
+
+      - name: Cache public models
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/hf
+            models/xrv
+            models/densenet
+          key: public-models-${{ runner.os }}-${{ env.PUBLIC_MODEL_KEYS }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}
+
+      - name: Download public models (${{ env.PUBLIC_MODEL_KEYS }})
+        run: |
+          & $env:PYTHON scripts\download_all_models.py --only $env:PUBLIC_MODEL_KEYS --dest models
+          if ($LASTEXITCODE -ne 0) { throw "download_all_models.py failed ($LASTEXITCODE)" }
+
+      - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
+        id: bundle
+        env:
+          MODEL_BUNDLE_URL: ${{ secrets.MODEL_BUNDLE_URL }}
+          MODEL_BUNDLE_TOKEN: ${{ secrets.MODEL_BUNDLE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          & $env:PYTHON packaging\fetch_model_bundle.py --dest models
+          if ($LASTEXITCODE -ne 0) { throw "fetch_model_bundle.py failed ($LASTEXITCODE)" }
+
+      - name: Smoke-test frozen backend (/health)
+        env:
+          REQUIRE_VALIDATED: ${{ steps.bundle.outputs.have_bundle }}
+          SENTINEL_MODELS_DIR: ${{ github.workspace }}\models
+        run: .\packaging\smoke_backend.ps1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: desktop-app/package-lock.json
+
+      - name: npm ci + type-check
+        working-directory: desktop-app
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+          npm run type-check
+          if ($LASTEXITCODE -ne 0) { throw "type-check failed" }
+
+      - name: Build NSIS installer (electron-builder)
+        working-directory: desktop-app
+        env:
+          WIN_CSC_LINK_IN: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD_IN: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          if ($env:WIN_CSC_LINK_IN) {
+            $env:WIN_CSC_LINK = $env:WIN_CSC_LINK_IN
+            $env:WIN_CSC_KEY_PASSWORD = $env:WIN_CSC_KEY_PASSWORD_IN
+            $signed = 'yes'
+            Write-Host 'Code signing: WIN_CSC_LINK provided - electron-builder signs the installer and the app exe.'
+          } else {
+            $signed = 'no'
+            Write-Host '::warning title=Unsigned installer::WIN_CSC_LINK secret not set - the installer is UNSIGNED. Windows SmartScreen will show "Windows protected your PC" on first run (More info -> Run anyway). Sign before a clinic roll-out.'
+          }
+          npm run build:win -- --publish never
+          if ($LASTEXITCODE -ne 0) { throw "electron-builder failed ($LASTEXITCODE)" }
+          $files = Get-ChildItem release -Filter *.exe
+          if (-not $files) { throw "no installer in desktop-app/release" }
+          $lines = @('## Windows installer (NSIS x64)', '')
+          foreach ($f in $files) {
+            Write-Host ('{0}  {1:N0} MB' -f $f.Name, ($f.Length / 1MB))
+            $lines += ('- `{0}` — {1:N0} MB' -f $f.Name, ($f.Length / 1MB))
+          }
+          $lines += "- Code signing: $signed"
+          $lines += ''
+          $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-windows-x64-${{ steps.bundle.outputs.have_bundle == '1' && 'full' || 'NO-VALIDATED-MODEL' }}
+          path: desktop-app/release/*.exe
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0     # the NSIS payload is already LZMA-compressed
+
+      - name: Attach to draft GitHub Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            # the macOS job may create it first — ignore a duplicate-create error, the upload decides
+            gh release create $tag --draft --title "Sentinel Medical AI $tag" --notes "Installers built by GitHub Actions run $env:GITHUB_RUN_ID" *> $null
+          }
+          foreach ($f in Get-ChildItem desktop-app/release -Filter *.exe) {
+            gh release upload $tag $f.FullName --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for $($f.Name)" }
+          }
+
+  macos:
+    name: macOS installer (DMG arm64)
+    runs-on: macos-latest      # Apple Silicon runner -> arm64 backend + arm64 DMG (an Intel DMG needs an Intel runner)
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Python venv + CPU torch + requirements
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          PY="$GITHUB_WORKSPACE/.venv/bin/python"
+          "$PY" -m pip install --upgrade pip wheel
+          "$PY" -m pip install "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" --index-url "$TORCH_INDEX_URL"
+          "$PY" -m pip install -r requirements.txt -r requirements-dev.txt --extra-index-url "$TORCH_INDEX_URL"
+          v="$("$PY" -c 'import torch; print(torch.__version__)')"
+          "$PY" -c 'import torch, torchvision; print("torch", torch.__version__, "torchvision", torchvision.__version__, "cuda", torch.cuda.is_available())'
+          case "$v" in "$TORCH_VERSION"*) ;; *) echo "torch resolved to $v, expected $TORCH_VERSION (a requirement re-pinned it; update TORCH_VERSION)"; exit 1;; esac
+          echo "PYTHON=$PY" >> "$GITHUB_ENV"
+
+      - name: Freeze backend (PyInstaller -> packaging/dist/sentinel-backend/sentinel-backend)
+        run: zsh packaging/build_backend.sh
+
+      - name: Free disk (PyInstaller work dir)
+        run: rm -rf packaging/build
+
+      - name: Cache public models
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/hf
+            models/xrv
+            models/densenet
+          key: public-models-${{ runner.os }}-${{ env.PUBLIC_MODEL_KEYS }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}
+
+      - name: Download public models (${{ env.PUBLIC_MODEL_KEYS }})
+        run: '"$PYTHON" scripts/download_all_models.py --only "$PUBLIC_MODEL_KEYS" --dest models'
+
+      - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
+        id: bundle
+        env:
+          MODEL_BUNDLE_URL: ${{ secrets.MODEL_BUNDLE_URL }}
+          MODEL_BUNDLE_TOKEN: ${{ secrets.MODEL_BUNDLE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '"$PYTHON" packaging/fetch_model_bundle.py --dest models'
+
+      - name: Smoke-test frozen backend (/health)
+        env:
+          REQUIRE_VALIDATED: ${{ steps.bundle.outputs.have_bundle }}
+          SENTINEL_MODELS_DIR: ${{ github.workspace }}/models
+        run: bash packaging/smoke_backend.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: desktop-app/package-lock.json
+
+      - name: npm ci + type-check
+        working-directory: desktop-app
+        run: |
+          npm ci
+          npm run type-check
+
+      - name: Build DMG (electron-builder, arm64)
+        working-directory: desktop-app
+        env:
+          CSC_LINK_IN: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD_IN: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CSC_LINK_IN" ]; then
+            export CSC_LINK="$CSC_LINK_IN" CSC_KEY_PASSWORD="$CSC_KEY_PASSWORD_IN"
+            signed=yes
+            echo "Code signing: CSC_LINK provided - electron-builder signs the app."
+          else
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            signed=no
+            echo "::warning title=Unsigned DMG::CSC_LINK secret not set - the DMG is UNSIGNED and not notarized. Gatekeeper blocks it on first open (right-click -> Open, or xattr -d com.apple.quarantine)."
+          fi
+          npm run build:mac:arm64 -- --publish never
+          ls -1 release/*.dmg >/dev/null
+          {
+            echo '## macOS installer (DMG arm64)'
+            echo
+            for f in release/*.dmg; do
+              mb=$(( $(stat -f %z "$f") / 1048576 ))
+              echo "$(basename "$f")  ${mb} MB"
+              echo "- \`$(basename "$f")\` — ${mb} MB"
+            done
+            echo "- Code signing: $signed"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-macos-arm64-${{ steps.bundle.outputs.have_bundle == '1' && 'full' || 'NO-VALIDATED-MODEL' }}
+          path: desktop-app/release/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Attach to draft GitHub Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            # the Windows job may create it first — ignore a duplicate-create error, the upload decides
+            gh release create "$tag" --draft --title "Sentinel Medical AI $tag" --notes "Installers built by GitHub Actions run $GITHUB_RUN_ID" >/dev/null 2>&1 || true
+          fi
+          for f in desktop-app/release/*.dmg; do
+            gh release upload "$tag" "$f" --clobber
+          done

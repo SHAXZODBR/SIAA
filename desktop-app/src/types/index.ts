@@ -30,6 +30,8 @@ export interface Study {
   seriesDescriptions?: string[];
   /** true when restored from GET /studies (result must be lazily fetched) */
   restored?: boolean;
+  /** GET /studies has_preview — the server stored a slice preview; fetch GET /study/{id} to draw it */
+  hasPreview?: boolean;
 }
 
 export interface Finding {

@@ -111,9 +111,19 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
   }
 
   const overall = result.overallAssessment;
-  const flagged = overall ? overall.abnormalFlagged : ordered.some((f) => f.positive);
-  const overallText = overall?.text || result.overallImpression || '';
-  const flaggedCount = ordered.filter((f) => f.positive).length;
+  const positives = ordered.filter((f) => f.positive);
+  const flagged = overall ? overall.abnormalFlagged : positives.length > 0;
+  const flaggedCount = positives.length;
+  // The body sentence is composed on the client in the UI language — the
+  // server's overall text is English and stays available as technical detail.
+  const flaggedNames = Array.from(new Set(
+    (positives.length > 0 ? positives.map((f) => f.className) : (overall?.flags || []))
+      .map((name) => translateFinding(name, lang)),
+  ));
+  const overallSummary = flagged
+    ? t('findings.flaggedFor', { findings: flaggedNames.join('; ') || '—' })
+    : t('findings.noFlagNotNormal');
+  const serverText = overall?.text || result.overallImpression || '';
 
   return (
     <div className="p-3 space-y-3">
@@ -125,7 +135,13 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
         <div className="text-sm font-semibold leading-tight">
           {flagged ? t('findings.abnormalFlagged') : t('findings.noFindingFlagged')}
         </div>
-        {overallText && <p className="text-xs mt-1 opacity-90">{overallText}</p>}
+        <p className="text-xs mt-1 opacity-90">{overallSummary}</p>
+        {serverText && (
+          <details className="mt-1.5 text-[10px] opacity-70">
+            <summary className="cursor-pointer select-none">{t('findings.technicalDetail')}</summary>
+            <p className="mt-1 font-mono break-words" lang="en">{serverText}</p>
+          </details>
+        )}
       </div>
 
       {/* Stats grid — real numbers from the result only */}

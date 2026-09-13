@@ -423,6 +423,9 @@ function mapStudyRow(row: any): Study {
     numFiles: typeof row?.num_files === 'number' ? row.num_files : null,
     seriesDescriptions: Array.isArray(row?.series_descriptions) ? row.series_descriptions.map(String) : [],
     restored: true,
+    // Only set when the server reports it, so a GET /study/{id} row without the
+    // field never clears the flag learned from GET /studies.
+    ...(row?.has_preview != null ? { hasPreview: !!row.has_preview } : {}),
   };
 }
 
@@ -480,7 +483,8 @@ export async function getStudy(studyId: string): Promise<StudyDetail> {
       isNormal: false,
       overallImpression: overall?.text || '',
       createdAt: String(ai.created_at ?? study.receivedAt),
-      previewBase64: undefined, // preview slices are not persisted server-side
+      // data-URI PNG of the analyzed slice, when the server persisted one
+      previewBase64: typeof ai.preview_base64 === 'string' && ai.preview_base64 ? ai.preview_base64 : undefined,
       modality: study.modality,
       bodyPart: study.bodyPart,
       overallAssessment: overall,
@@ -492,6 +496,7 @@ export async function getStudy(studyId: string): Promise<StudyDetail> {
       rejectionReason: ai.rejection_reason ?? null,
       appVersion: ai.app_version ?? null,
     };
+    if (result.previewBase64) study.hasPreview = true;
   }
 
   const reports: any[] = Array.isArray(data.reports) ? data.reports : [];

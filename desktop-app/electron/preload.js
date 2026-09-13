@@ -19,5 +19,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Help → Documentation (bundled docs/ folder, if any)
   openDocs: () => ipcRenderer.invoke('open-docs'),
+  // Language for main-process dialogs (file pickers, backend crash boxes); ru/uz/en
+  setLanguage: (lang) => ipcRenderer.send('set-language', lang),
   readFileBase64: (filePath) => ipcRenderer.invoke('read-file-base64', filePath),
 });

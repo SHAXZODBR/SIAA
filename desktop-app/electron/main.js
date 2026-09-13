@@ -14,6 +14,91 @@ if (!gotLock) {
   app.quit();
 }
 
+// ===== Main-process UI strings (RU default · UZ Latin · EN) =====
+// Native dialogs (file pickers, backend crash boxes) are shown by the main
+// process, outside React, so they carry their own tiny dictionary. The renderer
+// pushes settings.language through the 'set-language' IPC whenever it changes;
+// until then Russian — the product default — is used. Keep entries short and
+// professional; {name} placeholders are filled by msg().
+const UI_LANGS = ['ru', 'uz', 'en'];
+let uiLang = 'ru';
+
+const MESSAGES = {
+  en: {
+    ok: 'OK',
+    openDicomTitle: 'Open DICOM files',
+    openFolderTitle: 'Open DICOM folder',
+    dicomFiles: 'DICOM files',
+    allFiles: 'All files',
+    savePdfTitle: 'Save report PDF',
+    pdfFiles: 'PDF',
+    backendNotFoundTitle: 'AI server not found',
+    backendNotFoundBody: 'The Sentinel inference server was not found in this install. Reinstall the full package or start the server manually.',
+    backendStartFailedTitle: 'AI server failed to start',
+    backendStoppedTitle: 'AI server stopped',
+    backendStoppedBody: 'The Sentinel inference server stopped {n} times in a row ({reason}) and will not be restarted automatically.',
+    backendStoppedDetail: 'Log file: {log}\n\nContact IT support. Analysis is unavailable until the server is running again.',
+    backendRestartingTitle: 'AI server restarting',
+    backendRestartingBody: 'The Sentinel inference server stopped unexpectedly ({reason}). Restarting in {seconds} s (attempt {attempt} of {max}).',
+    logFile: 'Log file: {log}',
+    exitCode: 'exit code {code}',
+    signal: 'signal {signal}',
+  },
+  ru: {
+    ok: 'ОК',
+    openDicomTitle: 'Открыть файлы DICOM',
+    openFolderTitle: 'Открыть папку DICOM',
+    dicomFiles: 'Файлы DICOM',
+    allFiles: 'Все файлы',
+    savePdfTitle: 'Сохранить отчёт PDF',
+    pdfFiles: 'PDF',
+    backendNotFoundTitle: 'Сервер ИИ не найден',
+    backendNotFoundBody: 'Сервер анализа Sentinel не найден в этой установке. Переустановите полный пакет или запустите сервер вручную.',
+    backendStartFailedTitle: 'Не удалось запустить сервер ИИ',
+    backendStoppedTitle: 'Сервер ИИ остановлен',
+    backendStoppedBody: 'Сервер анализа Sentinel остановился {n} раз подряд ({reason}) и не будет перезапущен автоматически.',
+    backendStoppedDetail: 'Файл журнала: {log}\n\nОбратитесь в ИТ-поддержку. Анализ недоступен, пока сервер не запущен.',
+    backendRestartingTitle: 'Перезапуск сервера ИИ',
+    backendRestartingBody: 'Сервер анализа Sentinel неожиданно остановился ({reason}). Перезапуск через {seconds} с (попытка {attempt} из {max}).',
+    logFile: 'Файл журнала: {log}',
+    exitCode: 'код выхода {code}',
+    signal: 'сигнал {signal}',
+  },
+  uz: {
+    ok: 'OK',
+    openDicomTitle: 'DICOM fayllarini ochish',
+    openFolderTitle: 'DICOM papkasini ochish',
+    dicomFiles: 'DICOM fayllari',
+    allFiles: 'Barcha fayllar',
+    savePdfTitle: 'Hisobot PDF faylini saqlash',
+    pdfFiles: 'PDF',
+    backendNotFoundTitle: 'AI serveri topilmadi',
+    backendNotFoundBody: 'Sentinel tahlil serveri ushbu o‘rnatishda topilmadi. To‘liq paketni qayta o‘rnating yoki serverni qo‘lda ishga tushiring.',
+    backendStartFailedTitle: 'AI serverini ishga tushirib bo‘lmadi',
+    backendStoppedTitle: 'AI serveri to‘xtadi',
+    backendStoppedBody: 'Sentinel tahlil serveri ketma-ket {n} marta to‘xtadi ({reason}) va avtomatik qayta ishga tushirilmaydi.',
+    backendStoppedDetail: 'Jurnal fayli: {log}\n\nIT xizmatiga murojaat qiling. Server ishga tushguncha tahlil mavjud emas.',
+    backendRestartingTitle: 'AI serveri qayta ishga tushirilmoqda',
+    backendRestartingBody: 'Sentinel tahlil serveri kutilmaganda to‘xtadi ({reason}). {seconds} soniyadan so‘ng qayta ishga tushiriladi ({attempt}/{max} urinish).',
+    logFile: 'Jurnal fayli: {log}',
+    exitCode: 'chiqish kodi {code}',
+    signal: 'signal {signal}',
+  },
+};
+
+function msg(key, params) {
+  const dict = MESSAGES[uiLang] || MESSAGES.ru;
+  const raw = dict[key] ?? MESSAGES.en[key] ?? key;
+  if (!params) return raw;
+  return raw.replace(/\{(\w+)\}/g, (m, name) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : m);
+}
+
+// Renderer → main: settings.language changed (also sent once on startup).
+ipcMain.on('set-language', (_, lang) => {
+  if (UI_LANGS.includes(lang)) uiLang = lang;
+});
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1600,
@@ -54,10 +139,10 @@ function createWindow() {
 // Open DICOM file dialog
 ipcMain.handle('open-dicom-file', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Open DICOM File',
+    title: msg('openDicomTitle'),
     filters: [
-      { name: 'DICOM Files', extensions: ['dcm', 'dicom'] },
-      { name: 'All Files', extensions: ['*'] },
+      { name: msg('dicomFiles'), extensions: ['dcm', 'dicom'] },
+      { name: msg('allFiles'), extensions: ['*'] },
     ],
     properties: ['openFile', 'multiSelections'],
   });
@@ -67,7 +152,7 @@ ipcMain.handle('open-dicom-file', async () => {
 // Open folder dialog
 ipcMain.handle('open-dicom-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Open DICOM Folder',
+    title: msg('openFolderTitle'),
     properties: ['openDirectory'],
   });
   return result.filePaths[0] || null;
@@ -113,9 +198,9 @@ ipcMain.handle('export-pdf', async (_, { html, filename, suggestedDir }) => {
       filename || `report_${Date.now()}.pdf`
     );
     const saveResult = await dialog.showSaveDialog(mainWindow, {
-      title: 'Save Report PDF',
+      title: msg('savePdfTitle'),
       defaultPath,
-      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+      filters: [{ name: msg('pdfFiles'), extensions: ['pdf'] }],
     });
 
     if (saveResult.canceled || !saveResult.filePath) {
@@ -336,7 +421,7 @@ function backendEnv() {
 }
 
 function showBackendDialog(type, title, message, detail) {
-  const opts = { type, title, message, detail, buttons: ['OK'] };
+  const opts = { type, title, message, detail, buttons: [msg('ok')] };
   const p = mainWindow && !mainWindow.isDestroyed()
     ? dialog.showMessageBox(mainWindow, opts)
     : dialog.showMessageBox(opts);
@@ -356,9 +441,7 @@ function spawnBackend() {
   const frozenExe = frozenBackendExe();
   if (!frozenExe && !fs.existsSync(serverScript)) {
     logBackend(`server script not found: ${serverScript}`);
-    dialog.showErrorBox('Backend not found',
-      'The Sentinel inference server was not found in this install. ' +
-      'Reinstall the full package, or start the server manually.');
+    dialog.showErrorBox(msg('backendNotFoundTitle'), msg('backendNotFoundBody'));
     return;
   }
 
@@ -370,6 +453,7 @@ function spawnBackend() {
       cwd: backendDir,
       env: backendEnv(),
       detached: false,
+      windowsHide: true,               // no stray console window for the frozen backend on Windows
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     inferenceProcess = child;
@@ -386,7 +470,7 @@ function spawnBackend() {
 
     child.on('error', (err) => {
       logBackend(`spawn error: ${err}`);
-      if (!quitting) dialog.showErrorBox('Backend failed to start', String(err));
+      if (!quitting) dialog.showErrorBox(msg('backendStartFailedTitle'), String(err));
     });
 
     child.on('exit', (code, signal) => {
@@ -397,7 +481,7 @@ function spawnBackend() {
     });
   } catch (e) {
     logBackend(`spawn threw: ${e}`);
-    dialog.showErrorBox('Backend failed to start', String(e));
+    dialog.showErrorBox(msg('backendStartFailedTitle'), String(e));
   }
 }
 
@@ -405,14 +489,14 @@ function handleBackendExit(code, signal) {
   // A server that ran for a while before dying gets a fresh restart budget.
   if (Date.now() - backendStartedAt > BACKEND_STABLE_MS) backendRestarts = 0;
 
-  const reason = code !== null && code !== undefined ? `exit code ${code}` : `signal ${signal}`;
+  const reason = code !== null && code !== undefined ? msg('exitCode', { code }) : msg('signal', { signal });
   if (backendRestarts >= MAX_BACKEND_RESTARTS) {
     logBackend(`giving up after ${MAX_BACKEND_RESTARTS} restarts`);
     showBackendDialog(
       'error',
-      'AI server stopped',
-      `The Sentinel inference server stopped ${MAX_BACKEND_RESTARTS} times in a row (${reason}) and will not be restarted automatically.`,
-      `Log file: ${backendLogPath()}\n\nContact IT support. Analysis is unavailable until the server is running again.`,
+      msg('backendStoppedTitle'),
+      msg('backendStoppedBody', { n: MAX_BACKEND_RESTARTS, reason }),
+      msg('backendStoppedDetail', { log: backendLogPath() }),
     );
     return;
   }
@@ -422,9 +506,9 @@ function handleBackendExit(code, signal) {
   logBackend(`scheduling restart ${backendRestarts}/${MAX_BACKEND_RESTARTS} in ${delayMs}ms`);
   showBackendDialog(
     'warning',
-    'AI server restarting',
-    `The Sentinel inference server stopped unexpectedly (${reason}). Restarting in ${delayMs / 1000}s (attempt ${backendRestarts} of ${MAX_BACKEND_RESTARTS}).`,
-    `Log file: ${backendLogPath()}`,
+    msg('backendRestartingTitle'),
+    msg('backendRestartingBody', { reason, seconds: delayMs / 1000, attempt: backendRestarts, max: MAX_BACKEND_RESTARTS }),
+    msg('logFile', { log: backendLogPath() }),
   );
   setTimeout(() => {
     if (!quitting && !inferenceProcess) spawnBackend();

@@ -298,3 +298,27 @@ Har bir shifokorga shaxsiy hisob qaydnomasi bering — hisobotdagi imzo bu uni i
 - Imzolangan hisobotlar sezilmas o‘zgartirishdan himoyalangan (matn SHA-256 si, imzolagan shaxs, vaqt, model identifikatori, audit yozuvi), audit jurnali esa `GET /audit/verify` bilan tekshiriladigan xesh zanjiri (7-band) — lekin baza faylining o‘zini diskka kirish huquqi bo‘lgan har kim tahrirlashi mumkin; hisob qaydnomasi va diskni himoya qiling.
 - Yuklangan fayllar diskda hech qachon mijoz fayl nomlari bilan saqlanmaydi; vaqtinchalik fayllar tahlildan keyin o‘chiriladi.
 - Har bir foydalanuvchiga shaxsiy hisob qaydnomasi bering, ishdan ketgan xodimlarning hisob qaydnomalarini o‘chiring va bir martalik administrator parolini umumiy hujjatlarda saqlamang.
+
+---
+
+## 13. Windows o‘rnatuvchisini yig‘ish
+
+3-bandda tasvirlangan o‘rnatuvchini GitHub Actions ish jarayoni `.github/workflows/build-windows.yml` (`SHAXZODBR/SIAA` repozitoriysi) yig‘adi. U Python serverini PyInstaller yordamida «muzlatadi» (`packaging/build_backend.ps1`), ochiq modellarni yuklab oladi, validatsiyadan o‘tgan triaj modelini yopiq arxivdan tiklaydi, muzlatilgan serverni `/health` orqali tekshiradi va so‘ngra electron-builder ni ishga tushiradi (`npm run build:win`). Xuddi shu ish jarayoni macOS-runnerda macOS uchun disk tasvirini (Apple Silicon) yig‘adi.
+
+### 13.1 Yig‘ishni ishga tushirish va o‘rnatuvchini olish
+
+1. GitHub → **Actions** → **Build installers** → **Run workflow** (istalgan branch) — yoki `v1.0.0` ko‘rinishidagi teg yuboring; teg bo‘yicha yig‘ishlar o‘rnatuvchilarni qo‘shimcha ravishda GitHub Release *qoralamasiga* biriktiradi.
+2. *Windows installer (NSIS x64)* topshirig‘i tugashini kuting (bu uzoq davom etadi: faqat CPU uchun PyTorch 2.11.0 / torchvision 0.26.0 bilan Python bog‘liqliklari, PyInstaller, modellar, o‘rnatuvchini siqish).
+3. Ishga tushirish sahifasida: **Artifacts** → `sentinel-windows-x64-full` — ichida `Sentinel Medical AI Setup 1.0.0.exe` fayli bo‘lgan zip-arxiv (electron-builder uni `desktop-app/release/` papkasiga yozadi). Artefaktlar 14 kun saqlanadi.
+4. Validatsiyadan o‘tgan model mavjud bo‘lmagan bo‘lsa (13.2-ga qarang), artefakt `sentinel-windows-x64-NO-VALIDATED-MODEL` deb nomlanadi — bunday yig‘ilmani klinikaga berish mumkin emas: undan qilingan har bir o‘rnatish `/health` → `"status": "degraded"` deb xabar beradi.
+
+### 13.2 Sirlar: validatsiyadan o‘tgan model va kod imzosi
+
+| Sir | Vazifasi | Berilmagan bo‘lsa |
+|---|---|---|
+| `MODEL_BUNDLE_URL` | Ildizida `brain_triage_finetuned/` papkasi (`MANIFEST.json`, `config.json`, `preprocessor_config.json`, `model.safetensors`) bo‘lgan zip-arxivning URL manzili — masalan, yopiq GitHub Release resursi (`https://api.github.com/repos/<owner>/<repo>/releases/assets/<id>`) yoki obyekt omboridagi oldindan imzolangan havola. Yuklab olingandan so‘ng har bir fayl qayta xeshlanadi va `MANIFEST.json` bilan solishtiriladi, muzlatilgan server esa tutun testida `"status": "ok"` qaytarishi shart. | Topshiriq jurnali va xulosasida baland ogohlantirish; o‘rnatuvchi validatsiyadan o‘tgan triaj modeli **bo‘lmagan holda** yig‘iladi. |
+| `MODEL_BUNDLE_TOKEN` | Ushbu URL uchun Bearer token (boshqa repozitoriyning yopiq resursi). Shu repozitoriy reliziga biriktirilgan resurs uchun topshiriqning o‘z tokeni avtomatik ishlatiladi. | Autentifikatsiyasiz yuklab olish. |
+| `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` | Authenticode sertifikati (`.pfx`: base64 satr yoki URL) va uning paroli; electron-builder o‘rnatuvchi va ilovaning bajariladigan faylini imzolaydi. | Imzolanmagan yig‘ilma: birinchi ishga tushirishda Windows SmartScreen *«Windows kompyuteringizni himoya qildi»* oynasini ko‘rsatadi (**More info → Run anyway**); antivirus faylni karantinga olishi mumkin. Klinikaga joriy etishdan oldin yig‘ilmani imzolang. |
+| `CSC_LINK`, `CSC_KEY_PASSWORD` | DMG topshirig‘i uchun macOS Developer ID sertifikati (`.p12`). | Imzolanmagan va notarizatsiyadan o‘tmagan DMG (Gatekeeper: o‘ng tugma → Open). |
+
+Ochiq modellar (`scripts/download_all_models.py --only brain_tumor_class,chest,chest_checkpoint,generic_processors`) ishga tushirishlar orasida keshlanadi; validatsiyadan o‘tgan model har safar qaytadan yuklab olinadi va hech qachon repozitoriyda saqlanmaydi. Windows yig‘ilmasini qo‘lda takrorlash uchun Windows va Python 3.11 o‘rnatilgan kompyuterda `packaging\build_backend.ps1` va `packaging\smoke_backend.ps1` ni, so‘ngra `desktop-app\` papkasida `npm run build:win` ni bajaring.

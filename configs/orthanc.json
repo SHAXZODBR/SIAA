@@ -3,10 +3,12 @@
 //
 // SECURITY
 //   * No credentials live in this file. Provide the REST user through the
-//     environment of the Orthanc process/container instead, e.g. for the
-//     osimis/orthanc image:  ORTHANC__REGISTERED_USERS={"sentinel": "<strong password>"}
-//     and give the SAME values to the watcher / inference server as
-//     ORTHANC_USER / ORTHANC_PASSWORD.
+//     environment of the Orthanc process/container instead. With
+//     docker-compose.yml that is ./.env (copy .env.example; git-ignored):
+//         ORTHANC_USER=... / ORTHANC_PASSWORD=...
+//     which compose turns into the orthancteam/orthanc image's
+//     ORTHANC__REGISTERED_USERS={"<user>": "<password>"} and passes to the
+//     watcher / inference server as ORTHANC_USER / ORTHANC_PASSWORD.
 //   * RemoteAccessAllowed=false keeps the REST API (port 8042) on localhost
 //     only: the watcher and the signed-report push run on the same host.
 //     Set it to true ONLY if another machine on the hospital LAN must reach

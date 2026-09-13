@@ -35,7 +35,7 @@ from src.pipeline.preprocessor import preprocess_study
 from src.training.densenet_trainer import DenseNet121Classifier, get_device
 from src.training.gradcam import GradCAM
 from src.utils.config import get_config
-from src.utils.paths import DATA_DIR, LOG_DIR, CORRECTIONS_DIR, REPO_ROOT, ensure_data_dirs
+from src.utils.paths import DATA_DIR, LOG_DIR, CORRECTIONS_DIR, PREVIEWS_DIR, REPO_ROOT, ensure_data_dirs
 from src.utils.logger import setup_logger
 from src.utils.auth import DEV_INSECURE, REQUIRE_AUTH
 from src.utils.offline import OFFLINE
@@ -185,6 +185,11 @@ async def lifespan(app: FastAPI):
     ensure_data_dirs()
     setup_logger(LOG_DIR)
     logger.info(f"Data dir: {DATA_DIR}")
+    # Retention guard for the persisted analyzed-slice previews (PHI on disk).
+    try:
+        prune_previews()
+    except Exception as e:
+        logger.warning(f"Preview prune failed: {e}")
     if DEV_INSECURE:
         logger.warning("SENTINEL_DEV_INSECURE=1 — auth relaxed, OpenAPI docs exposed. NOT for a clinic.")
     if OFFLINE:
@@ -1620,9 +1625,124 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
     return resp
 
 
+# ==================== Preview persistence ====================
+# The analyzed slice (preview_base64) is what the doctor sees next to the
+# findings. It is written to DATA_DIR/previews/<study_id>.png (0600, dir 0700)
+# so GET /study/{id} can show the scan after a restart; only the path + sha256
+# land in SQLite. PHI on disk -> pruned after SENTINEL_PREVIEW_RETENTION_DAYS.
+
+DEFAULT_PREVIEW_RETENTION_DAYS = 365
+_DATA_URI_PNG = "data:image/png;base64,"
+
+
+def _ensure_private_dir(path: Path) -> Path:
+    """mkdir -p `path` and keep it owner-only (0700): report PDFs / previews carry PHI."""
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Create/overwrite `path` with mode 0600 (report PDFs and previews carry PHI)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as fh:
+        fh.write(data)
+    os.chmod(path, 0o600)
+
+
+def _preview_file(study_id: str) -> Path:
+    return PREVIEWS_DIR / f"{study_id}.png"
+
+
+def _save_preview(study_id: str, data_uri: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Persist a preview data-URI as DATA_DIR/previews/<study_id>.png.
+    Returns (path, sha256), or (None, None) when there is nothing to save or
+    the write failed — the analysis is still persisted, just without its image."""
+    if not data_uri or not data_uri.startswith(_DATA_URI_PNG):
+        return None, None
+    try:
+        png = base64.b64decode(data_uri[len(_DATA_URI_PNG):], validate=True)
+        if not png:
+            return None, None
+        _ensure_private_dir(PREVIEWS_DIR)
+        path = _preview_file(study_id)
+        _write_private(path, png)
+        return str(path), hashlib.sha256(png).hexdigest()
+    except Exception as e:
+        logger.warning(f"Preview for study {study_id} not persisted: {e}")
+        return None, None
+
+
+def _load_preview(path: Optional[str], sha256: Optional[str] = None) -> Optional[str]:
+    """Read a persisted preview back as a data-URI. None when it is gone
+    (pruned / never written) or no longer matches its recorded sha256 — a
+    wrong image next to a finding is worse than 'image unavailable'."""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        png = p.read_bytes()
+    except OSError as e:
+        logger.warning(f"Preview {p.name} unreadable: {e}")
+        return None
+    if sha256 and hashlib.sha256(png).hexdigest() != sha256:
+        logger.warning(f"Preview {p.name} does not match its recorded sha256 — not served")
+        return None
+    return _DATA_URI_PNG + base64.b64encode(png).decode()
+
+
+def _preview_exists(path: Optional[str]) -> bool:
+    return bool(path) and Path(path).is_file()
+
+
+def _preview_retention_days() -> int:
+    raw = os.environ.get('SENTINEL_PREVIEW_RETENTION_DAYS')
+    if raw is None or not raw.strip():
+        return DEFAULT_PREVIEW_RETENTION_DAYS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(f"SENTINEL_PREVIEW_RETENTION_DAYS={raw!r} is not an integer; "
+                       f"using {DEFAULT_PREVIEW_RETENTION_DAYS}")
+        return DEFAULT_PREVIEW_RETENTION_DAYS
+
+
+def prune_previews(retention_days: Optional[int] = None) -> dict:
+    """Delete previews older than `retention_days` (default: env
+    SENTINEL_PREVIEW_RETENTION_DAYS, else 365) by file mtime; 0 removes all.
+    Called at startup. The ai_results row keeps preview_path/sha256 as the
+    record of what was shown — GET /study/{id} then returns preview_base64=null.
+    Returns {'retention_days', 'removed', 'kept', 'errors'}."""
+    days = _preview_retention_days() if retention_days is None else max(0, int(retention_days))
+    stats = {'retention_days': days, 'removed': 0, 'kept': 0, 'errors': 0}
+    if not PREVIEWS_DIR.is_dir():
+        logger.info(f"Preview retention ({days} days): no previews dir yet at {PREVIEWS_DIR}")
+        return stats
+    cutoff = time.time() - days * 86400
+    for p in PREVIEWS_DIR.glob('*.png'):
+        try:
+            if p.stat().st_mtime <= cutoff:
+                p.unlink()
+                stats['removed'] += 1
+            else:
+                stats['kept'] += 1
+        except OSError as e:
+            stats['errors'] += 1
+            logger.warning(f"Preview prune: could not process {p.name}: {e}")
+    logger.info(f"Preview retention ({days} days): removed {stats['removed']}, "
+                f"kept {stats['kept']}, errors {stats['errors']} in {PREVIEWS_DIR}")
+    return stats
+
+
 def _persist_analysis(resp: dict, hdr: dict, user: dict, inference_time_ms: int) -> bool:
-    """studies + ai_results rows for the worklist / GET /study. The preview and
-    heatmaps are not persisted (findings carry heatmap_base64='')."""
+    """studies + ai_results rows for the worklist / GET /study. The preview
+    PNG goes to DATA_DIR/previews (path + sha256 on the row); heatmaps are not
+    persisted (findings carry heatmap_base64='')."""
     from src.inference.auth_routes import db
 
     try:
@@ -1651,6 +1771,7 @@ def _persist_analysis(resp: dict, hdr: dict, user: dict, inference_time_ms: int)
         model_version = ', '.join(
             m.get('display_name') or m.get('key') or '' for m in resp.get('model_identity') or []
         ) or str(resp.get('route') or '')
+        preview_path, preview_sha = _save_preview(resp['study_id'], resp.get('preview_base64'))
         db.save_ai_result(
             study_id=resp['study_id'],
             findings_json=json.dumps(resp.get('findings') or [], ensure_ascii=False),
@@ -1664,6 +1785,8 @@ def _persist_analysis(resp: dict, hdr: dict, user: dict, inference_time_ms: int)
             report_text=resp.get('report_text'),
             report_language=resp.get('report_language'),
             app_version=APP_VERSION,
+            preview_path=preview_path,
+            preview_sha256=preview_sha,
         )
         return True
     except Exception as e:
@@ -1876,6 +1999,9 @@ def get_study_detail(
             'rejection_reason': (ai_row.get('overall_impression') or None) if study.get('rejected') else None,
             'app_version': ai_row.get('app_version'),
             'created_at': ai_row.get('created_at'),
+            # The persisted analyzed slice; null once pruned or never written.
+            'preview_base64': _load_preview(ai_row.get('preview_path'), ai_row.get('preview_sha256')),
+            'preview_sha256': ai_row.get('preview_sha256'),
         }
 
     reports = []
@@ -1902,7 +2028,13 @@ def list_studies(limit: int = 100, user: dict = Depends(clinical_auth("view"))):
     from src.inference.auth_routes import db
 
     limit = max(1, min(int(limit), 500))
-    return [_study_out(s) for s in db.list_studies(limit=limit)]
+    out = []
+    for s in db.list_studies(limit=limit):
+        row = _study_out(s)
+        # Kept light: no image bytes here, only whether GET /study/{id} can serve one.
+        row['has_preview'] = _preview_exists(row.pop('preview_path', None))
+        out.append(row)
+    return out
 
 
 # ==================== PACS integration (Orthanc) ====================
@@ -1912,14 +2044,6 @@ def list_studies(limit: int = 100, user: dict = Depends(clinical_auth("view"))):
 
 REPORTS_DIR = DATA_DIR / "reports"
 MAX_REPORT_PDF_BYTES = 25 * 1024 * 1024
-
-
-def _write_private(path: Path, data: bytes) -> None:
-    """Create/overwrite `path` with mode 0600 (report PDFs carry PHI)."""
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'wb') as fh:
-        fh.write(data)
-    os.chmod(path, 0o600)
 
 
 @app.get("/pacs/status")
@@ -1985,11 +2109,7 @@ async def attach_report_pdf(
         raise HTTPException(status_code=409,
                             detail="A different PDF is already attached to this signed report")
 
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(REPORTS_DIR, 0o700)
-    except OSError:
-        pass
+    _ensure_private_dir(REPORTS_DIR)
     pdf_path = REPORTS_DIR / f"{report_id}.pdf"
     dcm_path = REPORTS_DIR / f"{report_id}.dcm"
     sop_uid = report.get('dicom_sop_instance_uid')

@@ -41,6 +41,12 @@ export default function App() {
   // Setup keyboard shortcuts
   useKeyboardShortcuts();
 
+  // Native dialogs (file pickers, backend crash boxes) live in the Electron main
+  // process — keep them in the same language as the interface.
+  useEffect(() => {
+    try { window.electronAPI?.setLanguage?.(settings.language); } catch { /* browser build */ }
+  }, [settings.language]);
+
   // Poll /health every 15s (public route — also drives the login screen status line)
   useEffect(() => {
     let cancelled = false;
@@ -83,15 +89,46 @@ export default function App() {
 
   // Lazily fetch the persisted AI result for a restored study (GET /study/{id})
   const fetchedDetail = useRef<Set<string>>(new Set());
+  const fetchedPreview = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!loggedIn || !selectedStudyId) return;
-    if (aiResults[selectedStudyId]) return;
     const study = studies.find((s) => s.id === selectedStudyId);
+    const existing = aiResults[selectedStudyId];
+    if (existing) {
+      // Result already in memory but without its slice preview: when the server
+      // says it stored one (has_preview), fetch GET /study/{id} once and merge it.
+      if (existing.previewBase64 || !study?.hasPreview || fetchedPreview.current.has(selectedStudyId)) return;
+      const id = selectedStudyId;
+      fetchedPreview.current.add(id);
+      getStudy(id)
+        .then((detail) => {
+          const preview = detail.result?.previewBase64;
+          if (!preview) {
+            updateStudy(id, { hasPreview: false }); // truly absent — viewer shows "image unavailable"
+            return;
+          }
+          const current = useAppStore.getState().aiResults[id];
+          if (current && !current.previewBase64) setAIResult(id, { ...current, previewBase64: preview });
+        })
+        .catch((e) => {
+          fetchedPreview.current.delete(id);
+          updateStudy(id, { hasPreview: false });
+          console.warn('Study preview fetch failed:', e?.message || e);
+          addNotification({ type: 'warning', title: t('health.aiServerError') });
+        });
+      return;
+    }
     if (!study || !study.restored || fetchedDetail.current.has(selectedStudyId)) return;
     fetchedDetail.current.add(selectedStudyId);
     getStudy(selectedStudyId)
       .then((detail) => {
-        updateStudy(selectedStudyId, { ...detail.study, id: selectedStudyId, restored: true });
+        // GET /study/{id} already carries the preview when the server stored one,
+        // so no second fetch is needed; a result without it is truly image-less.
+        fetchedPreview.current.add(selectedStudyId);
+        updateStudy(selectedStudyId, {
+          ...detail.study, id: selectedStudyId, restored: true,
+          ...(detail.result ? { hasPreview: !!detail.result.previewBase64 } : {}),
+        });
         if (detail.result) setAIResult(selectedStudyId, detail.result);
         for (const s of detail.signed) setSignedReport(selectedStudyId, s.language, s);
         const draft = detail.drafts[0];

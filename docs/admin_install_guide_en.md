@@ -298,3 +298,27 @@ Give each doctor a personal account — the signature on a report is the account
 - Signed reports are tamper-evident (SHA-256 of the text, signer, time, model identity, audit entry) and the audit log is a hash chain verifiable with `GET /audit/verify` (§7), but the database file itself can be edited by anyone with disk access — protect the account and the disk.
 - Uploaded files never keep their client file names on disk; temporary files are removed after analysis.
 - Give every user a personal account, remove accounts when staff leave, and keep the one-time admin password out of shared documents.
+
+---
+
+## 13. Building the Windows installer
+
+The installer described in §3 is produced by the GitHub Actions workflow `.github/workflows/build-windows.yml` (repository `SHAXZODBR/SIAA`). It freezes the Python server with PyInstaller (`packaging/build_backend.ps1`), downloads the public models, restores the validated triage model from a private bundle, smoke-tests the frozen server against `/health` and then runs electron-builder (`npm run build:win`). The same workflow builds the macOS disk image (Apple Silicon) on a macOS runner.
+
+### 13.1 Triggering the build and collecting the installer
+
+1. GitHub → **Actions** → **Build installers** → **Run workflow** (any branch), or push a tag of the form `v1.0.0` — tag builds additionally attach the installers to a *draft* GitHub Release.
+2. Wait for the *Windows installer (NSIS x64)* job to finish (it is slow: Python dependencies with CPU-only PyTorch 2.11.0 / torchvision 0.26.0, PyInstaller, models, installer compression).
+3. On the run page: **Artifacts** → `sentinel-windows-x64-full` — a zip containing `Sentinel Medical AI Setup 1.0.0.exe` (electron-builder writes it to `desktop-app/release/`). Artifacts are kept for 14 days.
+4. When the validated model was not available (see 13.2) the artifact is named `sentinel-windows-x64-NO-VALIDATED-MODEL` — never hand such a build to a clinic: every install made from it reports `/health` → `"status": "degraded"`.
+
+### 13.2 Secrets: the validated model and code signing
+
+| Secret | Purpose | If absent |
+|---|---|---|
+| `MODEL_BUNDLE_URL` | URL of a zip whose top level is the folder `brain_triage_finetuned/` (`MANIFEST.json`, `config.json`, `preprocessor_config.json`, `model.safetensors`) — e.g. a private GitHub Release asset (`https://api.github.com/repos/<owner>/<repo>/releases/assets/<id>`) or a pre-signed object-store link. After download every file is re-hashed against `MANIFEST.json`, and the frozen server must return `"status": "ok"` in the smoke test. | Loud warning in the job log and summary; the installer is built **without** the validated triage model. |
+| `MODEL_BUNDLE_TOKEN` | Bearer token for that URL (private asset of another repository). For an asset attached to a release of this repository the job's own token is used automatically. | Download without authentication. |
+| `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` | Authenticode certificate (`.pfx`: base64 string or URL) and its password; electron-builder signs the installer and the application executable. | Unsigned build: on first run Windows SmartScreen shows *"Windows protected your PC"* (**More info → Run anyway**); antivirus software may quarantine the file. Sign the build before a clinic roll-out. |
+| `CSC_LINK`, `CSC_KEY_PASSWORD` | macOS Developer ID certificate (`.p12`) for the DMG job. | Unsigned, un-notarized DMG (Gatekeeper: right-click → Open). |
+
+The public models (`scripts/download_all_models.py --only brain_tumor_class,chest,chest_checkpoint,generic_processors`) are cached between runs; the validated model is fetched afresh on every run and is never stored in the repository. To reproduce the Windows build by hand, run `packaging\build_backend.ps1` and `packaging\smoke_backend.ps1` on a Windows PC with Python 3.11, then `npm run build:win` in `desktop-app\`.

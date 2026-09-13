@@ -35,6 +35,10 @@ LOG_DIR: Path = DATA_DIR / "logs"
 CORRECTIONS_DIR: Path = DATA_DIR / "doctor_corrections"
 DICOM_CACHE_DIR: Path = DATA_DIR / "dicom_cache"
 TRAINING_CORPUS_DIR: Path = DATA_DIR / "training_corpus"
+# The analyzed slice of every /analyze/study run, one PNG per study (0600 in
+# a 0700 dir), so a study restored from the DB after a restart still shows
+# its scan. Pruned at startup after SENTINEL_PREVIEW_RETENTION_DAYS (365).
+PREVIEWS_DIR: Path = DATA_DIR / "previews"
 JWT_SECRET_PATH: Path = DATA_DIR / "jwt_secret.key"
 LICENSE_PATH: Path = DATA_DIR / "license.dat"
 # Per-install secret that (together with the machine fingerprint) unlocks

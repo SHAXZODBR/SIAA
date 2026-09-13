@@ -10,6 +10,12 @@ version: '3.8'
 #   2. inference  — FastAPI AI server (DenseNet121 + Grad-CAM)
 #   3. watcher    — Background service (monitors Orthanc, triggers AI)
 #
+# Credentials live in ./.env (git-ignored) — never in this file:
+#   cp .env.example .env      # then set strong, unique values
+# Compose reads ./.env for the ${...} substitutions below; `${VAR:?...}`
+# makes `docker compose config` / `up` fail fast with a clear message when
+# a value is missing instead of starting with a blank password.
+#
 # Usage:
 #   docker-compose up -d
 #
@@ -18,9 +24,12 @@ version: '3.8'
 
 services:
   # ===== Orthanc PACS Server =====
-  # Receives DICOM files from MRI/CT/X-ray machines via C-STORE protocol
+  # Receives DICOM files from MRI/CT/X-ray machines via C-STORE protocol.
+  # orthancteam/orthanc (formerly osimis/orthanc) maps ORTHANC__* environment
+  # variables onto configuration keys — that is how the REST user is
+  # registered without the password ever being written to configs/orthanc.json.
   orthanc:
-    image: jodogne/orthanc:latest
+    image: orthancteam/orthanc:latest
     container_name: sentinel-orthanc
     restart: unless-stopped
     ports:
@@ -33,9 +42,19 @@ services:
       - ORTHANC__NAME=SentinelPACS
       - ORTHANC__DICOM_AET=SENTINEL
       - ORTHANC__DICOM_PORT=4242
-      - ORTHANC__REGISTERED_USERS={"sentinel": "sentinel2024"}
+      # The single REST user (from .env). The watcher and the inference
+      # server authenticate with the same pair as ORTHANC_USER/ORTHANC_PASSWORD.
+      # Single-quoted: the JSON value contains ': ' which YAML would otherwise
+      # read as a mapping key. Compose still interpolates ${...} inside it.
+      - 'ORTHANC__REGISTERED_USERS={"${ORTHANC_USER:?set ORTHANC_USER in .env}": "${ORTHANC_PASSWORD:?set ORTHANC_PASSWORD in .env}"}'
+      # Only for the health probe below ($$ = literal $, expanded by the
+      # container shell so any password characters survive quoting).
+      - ORTHANC_USER=${ORTHANC_USER:?set ORTHANC_USER in .env}
+      - ORTHANC_PASSWORD=${ORTHANC_PASSWORD:?set ORTHANC_PASSWORD in .env}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8042/system"]
+      # AuthenticationEnabled=true (configs/orthanc.json): an anonymous
+      # /system is a 401, so the probe must log in or the dependants never start.
+      test: ["CMD-SHELL", "curl -fsS -u \"$$ORTHANC_USER:$$ORTHANC_PASSWORD\" http://localhost:8042/system > /dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -56,7 +75,14 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     environment:
-      - SENTINEL_DB_KEY=${SENTINEL_DB_KEY:-default_key_change_me}
+      # Signed-report push back into the PACS (POST /report/{id}/pdf?push=1)
+      - ORTHANC_URL=http://orthanc:8042
+      - ORTHANC_USER=${ORTHANC_USER:?set ORTHANC_USER in .env}
+      - ORTHANC_PASSWORD=${ORTHANC_PASSWORD:?set ORTHANC_PASSWORD in .env}
+      - SENTINEL_DB_KEY=${SENTINEL_DB_KEY:-}
+      # Persisted analyzed-slice previews (DATA_DIR/previews) are deleted at
+      # startup once older than this; default 365.
+      - SENTINEL_PREVIEW_RETENTION_DAYS=${SENTINEL_PREVIEW_RETENTION_DAYS:-365}
     deploy:
       resources:
         reservations:
@@ -90,7 +116,14 @@ services:
     environment:
       - ORTHANC_URL=http://orthanc:8042
       - INFERENCE_URL=http://inference:8000
-      - SENTINEL_DB_KEY=${SENTINEL_DB_KEY:-default_key_change_me}
+      # Orthanc REST user (same pair registered on the orthanc service above)
+      - ORTHANC_USER=${ORTHANC_USER:?set ORTHANC_USER in .env}
+      - ORTHANC_PASSWORD=${ORTHANC_PASSWORD:?set ORTHANC_PASSWORD in .env}
+      # Sentinel account (role radiologist/admin) the watcher logs in with to
+      # submit studies — required because the server runs with auth ON.
+      - SENTINEL_SERVICE_USER=${SENTINEL_SERVICE_USER:?set SENTINEL_SERVICE_USER in .env}
+      - SENTINEL_SERVICE_PASSWORD=${SENTINEL_SERVICE_PASSWORD:?set SENTINEL_SERVICE_PASSWORD in .env}
+      - SENTINEL_DB_KEY=${SENTINEL_DB_KEY:-}
     depends_on:
       orthanc:
         condition: service_healthy

@@ -158,6 +158,10 @@ MIGRATIONS = [
     ("ai_results", "report_text",          "TEXT"),
     ("ai_results", "report_language",      "TEXT"),
     ("ai_results", "app_version",          "TEXT"),
+    # Persisted preview of the analyzed slice: DATA_DIR/previews/<study_id>.png
+    # and its sha256. The PNG itself is never stored in SQLite.
+    ("ai_results", "preview_path",         "TEXT"),
+    ("ai_results", "preview_sha256",       "TEXT"),
     ("reports",    "signer_id",            "TEXT"),
     ("reports",    "sha256",               "TEXT"),
     ("reports",    "findings_json",        "TEXT"),
@@ -362,7 +366,9 @@ class SentinelDB:
 
     def list_studies(self, limit: int = 100) -> list[dict]:
         """Newest-first studies with a compact AI summary + signed languages —
-        what the desktop worklist needs to restore itself after a restart."""
+        what the desktop worklist needs to restore itself after a restart.
+        preview_path is the on-disk PNG reference only (no image bytes), for
+        the API layer to turn into has_preview."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM studies ORDER BY COALESCE(created_at, received_at) DESC LIMIT ?",
@@ -372,8 +378,9 @@ class SentinelDB:
             for r in rows:
                 study = self._study_row(r)
                 ai = conn.execute(
-                    "SELECT overall_json, is_normal, inference_time_ms, created_at FROM ai_results "
-                    "WHERE study_id=? ORDER BY created_at DESC LIMIT 1", (study["id"],)
+                    "SELECT overall_json, is_normal, inference_time_ms, created_at, preview_path "
+                    "FROM ai_results WHERE study_id=? ORDER BY created_at DESC LIMIT 1",
+                    (study["id"],)
                 ).fetchone()
                 overall = None
                 if ai and ai["overall_json"]:
@@ -386,6 +393,7 @@ class SentinelDB:
                 ).fetchall()
                 study["overall_assessment"] = overall
                 study["signed_languages"] = [s["language"] for s in signed]
+                study["preview_path"] = ai["preview_path"] if ai else None
                 out.append(study)
         return out
 
@@ -418,20 +426,25 @@ class SentinelDB:
         report_text: Optional[str] = None,
         report_language: Optional[str] = None,
         app_version: Optional[str] = None,
+        preview_path: Optional[str] = None,
+        preview_sha256: Optional[str] = None,
     ) -> str:
-        """Save AI analysis results. Returns result ID."""
+        """Save AI analysis results. Returns result ID.
+
+        preview_path / preview_sha256 point at the PNG of the analyzed slice on
+        disk (see server._save_preview); the image bytes never enter the DB."""
         result_id = str(uuid.uuid4())[:8]
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO ai_results (id, study_id, findings_json, heatmap_paths,
                    inference_time_ms, model_version, is_normal, overall_impression,
                    model_identity_json, overall_json, threshold, report_text, report_language,
-                   app_version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   app_version, preview_path, preview_sha256)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result_id, study_id, findings_json, heatmap_paths,
                  inference_time_ms, model_version, is_normal, overall_impression,
                  model_identity_json, overall_json, threshold, report_text, report_language,
-                 app_version),
+                 app_version, preview_path, preview_sha256),
             )
         self.update_study_status(study_id, "complete")
         return result_id

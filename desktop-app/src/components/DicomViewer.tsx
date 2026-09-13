@@ -103,6 +103,10 @@ export default function DicomViewer() {
       drawScanImage(ctx, w, h, previewImg);
     } else if (DEMO_MODE && selStudy && selStudy.id.startsWith('demo-')) {
       drawDemoPlaceholder(ctx, w, h, lang);
+    } else if (result?.previewBase64 || selStudy?.hasPreview) {
+      // Preview exists (decoding, or still to be fetched from GET /study/{id})
+      ctx.filter = 'none';
+      drawLoadingPreview(ctx, w, h, lang);
     } else {
       ctx.filter = 'none';
       drawNoPreview(ctx, w, h, lang, !!selStudy?.restored);
@@ -365,6 +369,13 @@ function drawNoPreview(ctx: CanvasRenderingContext2D, w: number, h: number, lang
     ctx.font = '400 11px Inter, sans-serif';
     ctx.fillText(translate(lang, 'viewer.restoredHint'), w / 2, h / 2 + 20);
   }
+}
+
+function drawLoadingPreview(ctx: CanvasRenderingContext2D, w: number, h: number, lang: Lang) {
+  ctx.fillStyle = '#64748b';
+  ctx.font = '500 13px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(translate(lang, 'viewer.loadingPreview'), w / 2, h / 2);
 }
 
 /** Draw a REAL scan image (the actual analyzed slice), fit to the viewport on black. */
