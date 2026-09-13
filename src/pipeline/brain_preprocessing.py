@@ -61,8 +61,46 @@ def n4_bias_correct(vol: np.ndarray, spacing: tuple = (1, 1, 1), shrink: int = 4
         return vol
 
 
+def _bundle_params_dir():
+    from src.utils.paths import HDBET_PARAMS_DIR
+    return HDBET_PARAMS_DIR
+
+
+def hdbet_params_dir() -> Optional[str]:
+    """Directory holding HD-BET's fold_all/checkpoint_final.pth WITHOUT
+    downloading: the offline bundle (models/hd-bet_params/release_2.0.0) first,
+    then HD-BET's own default (~/hd-bet_params/release_2.0.0). None if absent."""
+    cands = [_bundle_params_dir()]
+    try:
+        from HD_BET.paths import folder_with_parameter_files
+        cands.append(folder_with_parameter_files)
+    except Exception:
+        pass
+    for d in cands:
+        if os.path.isfile(os.path.join(str(d), 'fold_all', 'checkpoint_final.pth')):
+            return str(d)
+    return None
+
+
+def _point_hdbet_at(params_dir: str) -> None:
+    """HD-BET reads its parameter folder from a module constant copied into
+    each submodule at import; rebind it everywhere so the bundle dir is used."""
+    import sys
+    for mod_name in ('HD_BET.paths', 'HD_BET.checkpoint_download', 'HD_BET.hd_bet_prediction',
+                     'HD_BET.entry_point'):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            try:
+                mod = __import__(mod_name, fromlist=['_'])
+            except Exception:
+                continue
+        if hasattr(mod, 'folder_with_parameter_files'):
+            mod.folder_with_parameter_files = params_dir
+
+
 def _get_hdbet(device: str = 'cpu'):
-    """Lazy-load the HD-BET predictor + weights once. Returns None on failure."""
+    """Lazy-load the HD-BET predictor + weights once. Returns None on failure.
+    Offline-safe: uses the bundled params and never downloads when SENTINEL_OFFLINE."""
     global _hdbet_predictor, _hdbet_failed
     if _hdbet_predictor is not None:
         return _hdbet_predictor
@@ -70,12 +108,20 @@ def _get_hdbet(device: str = 'cpu'):
         return None
     try:
         import torch
-        from HD_BET.entry_point import maybe_download_parameters
+        params_dir = hdbet_params_dir()
+        if params_dir is None:
+            from src.utils.offline import OFFLINE, missing_model_reason
+            if OFFLINE:
+                # Never let HD-BET reach for zenodo on an air-gapped box.
+                raise RuntimeError(missing_model_reason('hd_bet', [str(_bundle_params_dir())]))
+            from HD_BET.checkpoint_download import maybe_download_parameters
+            maybe_download_parameters()  # one-time (internet) into ~/hd-bet_params
+        else:
+            _point_hdbet_at(params_dir)
         from HD_BET.hd_bet_prediction import get_hdbet_predictor
-        maybe_download_parameters()  # one-time; pre-bake for air-gapped clinics
         _hdbet_predictor = get_hdbet_predictor(
             use_tta=False, device=torch.device(device), verbose=False)
-        logger.info("HD-BET skull-stripping ready")
+        logger.info(f"HD-BET skull-stripping ready ({params_dir or 'downloaded'})")
         return _hdbet_predictor
     except Exception as e:
         logger.warning(f"HD-BET unavailable ({e}); skull-stripping disabled. "

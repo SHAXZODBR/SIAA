@@ -37,6 +37,26 @@ DICOM_CACHE_DIR: Path = DATA_DIR / "dicom_cache"
 TRAINING_CORPUS_DIR: Path = DATA_DIR / "training_corpus"
 JWT_SECRET_PATH: Path = DATA_DIR / "jwt_secret.key"
 LICENSE_PATH: Path = DATA_DIR / "license.dat"
+# Per-install secret that (together with the machine fingerprint) unlocks
+# encrypted model weights — see src/utils/model_crypto.py. Created 0600 on
+# first use.
+MODEL_KEY_PATH: Path = DATA_DIR / "model_key.bin"
+
+# Read-only model bundle shipped with the install (weights, HF snapshots,
+# HD-BET params, MONAI bundle). scripts/download_all_models.py fills it on a
+# machine WITH internet; a hospital PC only ever reads from it.
+#   SENTINEL_MODELS_DIR overrides (tests, relocated bundles); default <repo>/models.
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent.parent
+MODELS_DIR: Path = Path(os.environ.get("SENTINEL_MODELS_DIR") or REPO_ROOT / "models").expanduser()
+HF_MODELS_DIR: Path = MODELS_DIR / "hf"              # snapshot_download(local_dir=...) per repo
+XRV_MODELS_DIR: Path = MODELS_DIR / "xrv"            # torchxrayvision weight files
+HDBET_PARAMS_DIR: Path = MODELS_DIR / "hd-bet_params" / "release_2.0.0"
+MONAI_BUNDLES_DIR: Path = MODELS_DIR / "monai_bundles"
+
+
+def hf_bundle_dir(repo_id: str) -> Path:
+    """Where the offline bundle keeps a HuggingFace repo: models/hf/<org>__<name>."""
+    return HF_MODELS_DIR / repo_id.replace("/", "__")
 
 
 def ensure_data_dirs() -> Path:

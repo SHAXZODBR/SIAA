@@ -60,6 +60,11 @@ from typing import Optional, Callable
 from loguru import logger
 import numpy as np
 
+# Offline posture FIRST (exports HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE before
+# transformers is imported below, lazily, inside the loaders).
+from src.utils.offline import OFFLINE, missing_model_reason
+from src.utils.paths import MODELS_DIR, XRV_MODELS_DIR, MONAI_BUNDLES_DIR, hf_bundle_dir
+
 
 # ============================================================================
 # MODEL CARDS
@@ -565,8 +570,7 @@ def _build_predictor(card: ModelCard, device: str):
         # 3D segmentation models use custom HF code (trust_remote_code path)
         if card.is_3d:
             # Prefer the MONAI bundle if it's installed locally
-            from pathlib import Path as _PP
-            monai_bundle = _PP(__file__).parent.parent.parent / 'models' / 'monai_bundles' / 'brats_mri_segmentation'
+            monai_bundle = MONAI_BUNDLES_DIR / 'brats_mri_segmentation'
             if monai_bundle.exists() and (monai_bundle / 'models' / 'model.pt').exists():
                 return _build_monai_brats_predictor(card, device, monai_bundle)
             return _build_hf_3d_seg_predictor(card, device)
@@ -725,17 +729,19 @@ def _build_hf_3d_seg_predictor(card: ModelCard, device: str):
     except ImportError as e:
         return None, False, f'monai not installed: {e}'
 
-    # Find the safetensors file in HF cache
-    from pathlib import Path as _P
-    hf_root = _P.home() / '.cache' / 'huggingface' / 'hub'
+    # Find the safetensors file: offline bundle (models/hf/<repo>) first, then
+    # the HF cache. Both are on-disk lookups — never a download.
+    hf_root = _hf_cache_root()
 
     repos = [card.repo_id] + (card.fallback_repos or [])
     last_err = None
 
     for repo in repos:
-        cache_dir = hf_root / f'models--{repo.replace("/", "--")}'
+        cache_dir = hf_bundle_dir(repo)
         if not cache_dir.exists():
-            last_err = f'no cache for {repo}'
+            cache_dir = hf_root / f'models--{repo.replace("/", "--")}'
+        if not cache_dir.exists():
+            last_err = f'no local copy of {repo}'
             continue
 
         try:
@@ -825,6 +831,8 @@ def _build_hf_3d_seg_predictor(card: ModelCard, device: str):
             logger.debug(f"3D seg repo {repo} failed: {str(e)[:200]}")
             continue
 
+    if OFFLINE:
+        return None, False, missing_model_reason(card.modality, [str(hf_bundle_dir(card.repo_id))]) + f' — {last_err}'
     return None, False, f'No 3D seg model loadable. Last error: {last_err}'
 
 
@@ -835,8 +843,11 @@ def _build_xrv_predictor(card: ModelCard, device: str):
     except ImportError as e:
         return None, False, f'torchxrayvision not installed: {e}'
 
+    cache_dir, weights_path = resolve_xrv_weights('densenet121-res224-all')
+    if weights_path is None and OFFLINE:
+        return None, False, missing_model_reason(card.modality, [str(XRV_MODELS_DIR)])
     try:
-        model = xrv.models.DenseNet(weights='densenet121-res224-all')
+        model = xrv.models.DenseNet(weights='densenet121-res224-all', cache_dir=cache_dir)
         model.to(device).eval()
     except Exception as e:
         return None, False, f'XRV load failed: {e}'
@@ -857,83 +868,205 @@ def _build_xrv_predictor(card: ModelCard, device: str):
     return predict, True, ''
 
 
-def _build_hf_predictor(card: ModelCard, device: str):
-    try:
-        from transformers import AutoImageProcessor, AutoModelForImageClassification
-        import torch
-    except ImportError as e:
-        return None, False, f'transformers not installed: {e}'
+# Generic fallback processors — used when a repo only ships weights without a
+# preprocessor_config.json. Both ViT-B and ResNet-50 work fine with these.
+GENERIC_PROCESSORS = [
+    'google/vit-base-patch16-224',
+    'microsoft/resnet-50',
+]
 
-    # Prefer a locally fine-tuned model if one exists for this modality.
-    # training/finetune_brain_classifier.py writes to models/<modality>_finetuned/
-    # (and the legacy models/brain_finetuned/). If present, use it FIRST so the
-    # clinic's own fine-tune overrides the public weights.
-    from pathlib import Path as _P
-    _repo_root = _P(__file__).parent.parent.parent
-    # The per-modality fine-tune dir applies to ANY modality (brain, head_ct, …).
-    local_candidates = [_repo_root / 'models' / f'{card.modality}_finetuned']
+
+def _hf_cache_root() -> Path:
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        return Path(HF_HUB_CACHE)
+    except Exception:
+        return Path.home() / '.cache' / 'huggingface' / 'hub'
+
+
+def resolve_xrv_weights(name: str = 'densenet121-res224-all'):
+    """(cache_dir, weights_path) for a torchxrayvision weight set WITHOUT
+    downloading: models/xrv/ (offline bundle) first, then ~/.torchxrayvision.
+    weights_path is None when neither has the file — the caller decides whether
+    a download is allowed (never when OFFLINE)."""
+    try:
+        import torchxrayvision as xrv
+        url = xrv.models.model_urls[name]['weights_url']
+        fname = os.path.basename(url)
+    except Exception:
+        return None, None
+    for d in (XRV_MODELS_DIR, Path.home() / '.torchxrayvision' / 'models_data'):
+        if (d / fname).exists():
+            return str(d), d / fname
+    return str(XRV_MODELS_DIR), None
+
+
+def _is_model_dir(d: Path) -> bool:
+    """A loadable HF classifier dir: config.json + plaintext or encrypted weights."""
+    if not (d.is_dir() and (d / 'config.json').exists()):
+        return False
+    from src.utils.model_crypto import plaintext_weight_files, encrypted_weight_files
+    return bool(plaintext_weight_files(d) or encrypted_weight_files(d))
+
+
+def local_model_dirs(card: ModelCard) -> list[Path]:
+    """Local directories tried (in order) BEFORE any HuggingFace repo id:
+
+      1. SENTINEL_MODEL_DIR_OVERRIDE_<KEY> — an explicit dir (tests, A/B of a
+         candidate release). When set it is the ONLY candidate, so a typo can
+         never silently fall back to other weights.
+      2. models/<modality>_finetuned      — the clinic's own fine-tune
+         (+ legacy models/brain_finetuned for the tumor model only)
+      3. models/hf/<org>__<name>          — offline bundle of repo_id / fallbacks
+         (scripts/download_all_models.py)
+    Only dirs that actually hold config.json + weights are returned. When a
+    returned dir fails to load, the loader does NOT fall back to repo ids."""
+    override = os.environ.get(f'SENTINEL_MODEL_DIR_OVERRIDE_{card.modality.upper()}', '').strip()
+    if override:
+        d = Path(override).expanduser()
+        return [d] if _is_model_dir(d) else []
+    cands = [MODELS_DIR / f'{card.modality}_finetuned']
     # Legacy: the tumor fine-tune script wrote to models/brain_finetuned/. Only
     # use it for the TUMOR model — never as a fallback for stroke/dementia/etc.,
     # or they'd silently load the tumor weights.
     if card.modality in ('brain_tumor_class', 'brain_2d'):
-        local_candidates.append(_repo_root / 'models' / 'brain_finetuned')
-    local_dirs = [str(d) for d in local_candidates
-                  if d.exists() and (d / 'config.json').exists()]
+        cands.append(MODELS_DIR / 'brain_finetuned')
+    for repo in [card.repo_id] + (card.fallback_repos or []):
+        if repo:
+            cands.append(hf_bundle_dir(repo))
+    return [d for d in cands if _is_model_dir(d)]
 
-    repos = local_dirs + [card.repo_id] + (card.fallback_repos or [])
+
+def _load_image_processor(source, local_only: bool):
+    """The repo's/dir's own processor, else a generic one (bundle dir, then
+    cache/hub). Raises when nothing is available."""
+    from transformers import AutoImageProcessor
+    try:
+        return AutoImageProcessor.from_pretrained(str(source), local_files_only=local_only)
+    except Exception:
+        pass
+    for generic in GENERIC_PROCESSORS:
+        for cand, lo in ((hf_bundle_dir(generic), True), (generic, local_only)):
+            if lo is True and isinstance(cand, Path) and not (cand / 'preprocessor_config.json').exists():
+                continue
+            try:
+                proc = AutoImageProcessor.from_pretrained(str(cand), local_files_only=lo)
+                logger.info(f"Using {generic} processor for {source} (no config in repo)")
+                return proc
+            except Exception:
+                continue
+    raise RuntimeError('No image processor available')
+
+
+def load_hf_classifier_dir(model_dir, device: str = 'cpu'):
+    """(processor, model) for a LOCAL classifier dir — plaintext
+    (model.safetensors) or encrypted-at-rest (model.safetensors.enc, see
+    src/utils/model_crypto.py). Encrypted weights are decrypted straight into
+    memory and loaded via from_config + load_state_dict; plaintext never
+    touches disk. Shared by the registry and scripts/eval_study_level.py."""
+    from transformers import AutoConfig, AutoModelForImageClassification
+    from src.utils.model_crypto import plaintext_weight_files, encrypted_weight_files, decrypt_file_to_bytes
+    model_dir = Path(model_dir)
+    # The dir's own processor is a path lookup either way; local_only only
+    # governs the generic-processor fallback (cache-only when OFFLINE).
+    processor = _load_image_processor(model_dir, local_only=OFFLINE)
+    if plaintext_weight_files(model_dir):
+        model = AutoModelForImageClassification.from_pretrained(str(model_dir), local_files_only=True)
+    else:
+        enc_files = encrypted_weight_files(model_dir)
+        if not enc_files:
+            raise FileNotFoundError(f'no weights in {model_dir}')
+        enc = enc_files[0]
+        if not enc.name.startswith('model.safetensors'):
+            raise RuntimeError(f'encrypted {enc.name}: only model.safetensors.enc is supported for in-memory load')
+        from safetensors.torch import load as _st_load
+        config = AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
+        model = AutoModelForImageClassification.from_config(config)
+        raw = decrypt_file_to_bytes(enc)          # InvalidTag on wrong key / tampering
+        state = _st_load(raw)
+        del raw
+        model.load_state_dict(state, strict=True)
+        del state
+        logger.info(f"Loaded encrypted-at-rest weights from {model_dir} (decrypted in memory)")
+    model.to(device).eval()
+    return processor, model
+
+
+def _make_hf_predictor(model, processor, device: str, source: str):
+    import torch
+    id2label = {int(k): v for k, v in (model.config.id2label or {}).items()}
+
+    def predict(image: np.ndarray, _model=model, _proc=processor, _i2l=id2label) -> dict:
+        from PIL import Image
+        if image.ndim == 2:
+            img = (image * 255).clip(0, 255).astype(np.uint8)
+            pil = Image.fromarray(img).convert('RGB')
+        else:
+            pil = Image.fromarray(image.astype(np.uint8)).convert('RGB')
+        inputs = _proc(images=pil, return_tensors='pt').to(device)
+        with torch.no_grad():
+            logits = _model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+        return {_i2l.get(i, f'class_{i}'): float(p) for i, p in enumerate(probs)}
+
+    predict.weights_source = source   # local dir or HF repo id — used by get_model_identity
+    return predict
+
+
+def build_predictor_from_dir(model_dir, device: str = 'cpu'):
+    """Predictor for an explicit local classifier dir (plaintext or encrypted),
+    bypassing the registry's search order. Same callable the registry hands
+    out, so results are directly comparable."""
+    processor, model = load_hf_classifier_dir(model_dir, device)
+    return _make_hf_predictor(model, processor, device, str(Path(model_dir)))
+
+
+def _build_hf_predictor(card: ModelCard, device: str):
+    try:
+        from transformers import AutoModelForImageClassification
+        import torch  # noqa: F401
+    except ImportError as e:
+        return None, False, f'transformers not installed: {e}'
+
+    # Local dirs FIRST (override / clinic fine-tune / offline bundle), then the
+    # HF repo ids. In OFFLINE mode a repo id is resolved strictly from the local
+    # HF cache (local_files_only) — never a download.
+    local_dirs = local_model_dirs(card)
+    repos = [card.repo_id] + (card.fallback_repos or [])
     repos = [r for r in repos if r]
 
-    # Generic fallback processor — used when a repo only ships weights without
-    # a preprocessor_config.json. Both ViT-B and ResNet-50 work fine with this.
-    GENERIC_PROCESSORS = [
-        'google/vit-base-patch16-224',
-        'microsoft/resnet-50',
-    ]
-
     last_err = None
+    for d in local_dirs:
+        try:
+            processor, model = load_hf_classifier_dir(d, device)
+            logger.info(f"Loaded {card.modality} from {d}")
+            return _make_hf_predictor(model, processor, device, str(d)), True, f'loaded from {d}'
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Local model dir {d} failed: {e}")
+            continue
+    if local_dirs:
+        # A local dir exists but could not be loaded (wrong decryption key,
+        # corrupt file, ...). NEVER fall back to the public repo weights: that
+        # would silently swap the clinic's validated fine-tune for something
+        # else. Degrade with the reason instead.
+        return None, False, f'local model dir failed ({local_dirs[-1]}): {last_err}'
+
     for repo in repos:
         try:
-            # Try the repo's own processor first
-            try:
-                processor = AutoImageProcessor.from_pretrained(repo)
-            except Exception:
-                # Fall back to a generic processor that matches the input size
-                processor = None
-                for generic in GENERIC_PROCESSORS:
-                    try:
-                        processor = AutoImageProcessor.from_pretrained(generic)
-                        logger.info(f"Using {generic} processor for {repo} (no config in repo)")
-                        break
-                    except Exception:
-                        continue
-                if processor is None:
-                    raise RuntimeError("No processor available")
-
-            model = AutoModelForImageClassification.from_pretrained(repo)
+            processor = _load_image_processor(repo, local_only=OFFLINE)
+            model = AutoModelForImageClassification.from_pretrained(repo, local_files_only=OFFLINE)
             model.to(device).eval()
-            id2label = {int(k): v for k, v in (model.config.id2label or {}).items()}
             logger.info(f"Loaded {card.modality} from {repo}")
-
-            def predict(image: np.ndarray, _model=model, _proc=processor, _i2l=id2label) -> dict:
-                from PIL import Image
-                if image.ndim == 2:
-                    img = (image * 255).clip(0, 255).astype(np.uint8)
-                    pil = Image.fromarray(img).convert('RGB')
-                else:
-                    pil = Image.fromarray(image.astype(np.uint8)).convert('RGB')
-                inputs = _proc(images=pil, return_tensors='pt').to(device)
-                with torch.no_grad():
-                    logits = _model(**inputs).logits
-                    probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
-                return {_i2l.get(i, f'class_{i}'): float(p) for i, p in enumerate(probs)}
-
-            predict.weights_source = repo   # local dir or HF repo id — used by get_model_identity
-            return predict, True, f'loaded from {repo}'
+            return _make_hf_predictor(model, processor, device, repo), True, f'loaded from {repo}'
         except Exception as e:
             last_err = e
             logger.debug(f"Repo {repo} failed: {e}")
             continue
 
+    if OFFLINE:
+        looked = [str(MODELS_DIR / f'{card.modality}_finetuned')] + [str(hf_bundle_dir(r)) for r in repos]
+        return None, False, missing_model_reason(card.modality, looked)
     return None, False, f'No HF repo available. Last error: {last_err}'
 
 
@@ -945,12 +1078,15 @@ def _build_sam_predictor(card: ModelCard, device: str):
     except ImportError as e:
         return None, False, f'transformers not installed: {e}'
 
+    repo = card.repo_id
+    source = str(hf_bundle_dir(repo)) if (hf_bundle_dir(repo) / 'config.json').exists() else repo
     try:
-        repo = card.repo_id
-        processor = SamProcessor.from_pretrained(repo)
-        model = SamModel.from_pretrained(repo).to(device).eval()
-        logger.info(f"Loaded MedSAM from {repo}")
+        processor = SamProcessor.from_pretrained(source, local_files_only=OFFLINE)
+        model = SamModel.from_pretrained(source, local_files_only=OFFLINE).to(device).eval()
+        logger.info(f"Loaded MedSAM from {source}")
     except Exception as e:
+        if OFFLINE:
+            return None, False, missing_model_reason(card.modality, [str(hf_bundle_dir(repo))])
         return None, False, f'MedSAM load failed: {e}'
 
     def predict(image: np.ndarray, prompt_box=None, prompt_points=None) -> dict:
@@ -1003,11 +1139,13 @@ def _build_medgemma_predictor(card: ModelCard, device: str):
     lora_dir = os.environ.get('MEDGEMMA_LORA')
     last_err = None
     for repo in repos:
+        source = str(hf_bundle_dir(repo)) if (hf_bundle_dir(repo) / 'config.json').exists() else repo
         try:
-            processor = AutoProcessor.from_pretrained(repo)
+            processor = AutoProcessor.from_pretrained(source, local_files_only=OFFLINE)
             model = AutoModelForImageTextToText.from_pretrained(
-                repo,
+                source,
                 torch_dtype=torch.float16 if device != 'cpu' else torch.float32,
+                local_files_only=OFFLINE,
             ).to(device).eval()
             if lora_dir and os.path.isdir(lora_dir):
                 try:
@@ -1050,6 +1188,8 @@ def _build_medgemma_predictor(card: ModelCard, device: str):
             logger.debug(f"MedGemma repo {repo} failed: {e}")
             continue
 
+    if OFFLINE:
+        return None, False, missing_model_reason(card.modality, [str(hf_bundle_dir(r)) for r in repos])
     return None, False, f'MedGemma unavailable. Last error: {last_err}'
 
 
@@ -1070,7 +1210,8 @@ _identity_cache: dict[str, dict] = {}
 
 def _resolve_weight_files(source: str) -> list[Path]:
     """Map a predictor's weights_source (local dir or HF repo id) to the
-    weight file(s) actually on disk, so we can hash them."""
+    PLAINTEXT weight file(s) actually on disk, so we can hash them. An
+    encrypted-at-rest dir returns [] — see weights_sha256_for_source."""
     if not source:
         return []
     p = Path(source)
@@ -1078,13 +1219,14 @@ def _resolve_weight_files(source: str) -> list[Path]:
         cands = [p / 'model.safetensors', p / 'pytorch_model.bin', p / 'model.pt']
         return [c for c in cands if c.exists()]
     if '/' not in source or ':' in source:
-        return []   # not an HF repo id (e.g. 'torchxrayvision:...')
-    try:
-        from huggingface_hub.constants import HF_HUB_CACHE
-        hf_root = Path(HF_HUB_CACHE)
-    except Exception:
-        hf_root = Path.home() / '.cache' / 'huggingface' / 'hub'
-    repo_dir = hf_root / f'models--{source.replace("/", "--")}'
+        if source.startswith('torchxrayvision:'):
+            _, wp = resolve_xrv_weights(source.split(':', 1)[1])
+            return [wp] if wp else []
+        return []   # not an HF repo id
+    bundle = hf_bundle_dir(source)
+    if bundle.is_dir():
+        return _resolve_weight_files(str(bundle))
+    repo_dir = _hf_cache_root() / f'models--{source.replace("/", "--")}'
     if not repo_dir.exists():
         return []
     for name in ('model.safetensors', 'pytorch_model.bin'):
@@ -1092,6 +1234,29 @@ def _resolve_weight_files(source: str) -> list[Path]:
         if found:
             return [found[0].resolve()]
     return []
+
+
+def weights_sha256_for_source(source: str) -> Optional[str]:
+    """Full sha256 of the weights a predictor runs — hashed from the plaintext
+    file, or read from the .enc.meta.json sidecar when the dir is encrypted at
+    rest (so identity is the same on every install, whatever key encrypted it)."""
+    if not source:
+        return None
+    p = Path(source)
+    if p.is_dir():
+        from src.utils.model_crypto import plaintext_sha256_of_dir
+        return plaintext_sha256_of_dir(p)
+    return _sha256_of(_resolve_weight_files(source))
+
+
+def is_source_encrypted(source: Optional[str]) -> bool:
+    if not source:
+        return False
+    p = Path(source)
+    if not p.is_dir():
+        return False
+    from src.utils.model_crypto import is_encrypted_dir
+    return is_encrypted_dir(p)
 
 
 def _sha256_of(paths: list[Path]) -> Optional[str]:
@@ -1125,7 +1290,7 @@ def get_model_identity(modality_key: str) -> Optional[dict]:
         if not source and str(entry.get('reason', '')).startswith('loaded from '):
             source = entry['reason'][len('loaded from '):]
         try:
-            full = _sha256_of(_resolve_weight_files(source or ''))
+            full = weights_sha256_for_source(source or '')
             sha12 = full[:12] if full else None
         except Exception as e:
             logger.debug(f"sha256 for {modality_key} failed: {e}")
@@ -1137,7 +1302,8 @@ def get_model_identity(modality_key: str) -> Optional[dict]:
         'key': modality_key,
         'display_name': card.display_name,
         'source': source,
-        'sha256_12': sha12,
+        'sha256_12': sha12,                       # PLAINTEXT weights hash (stable across installs)
+        'encrypted_at_rest': is_source_encrypted(source),
         'status': card.validation_status,
         'validation_note': note,
     }

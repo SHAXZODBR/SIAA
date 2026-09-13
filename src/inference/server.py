@@ -35,9 +35,10 @@ from src.pipeline.preprocessor import preprocess_study
 from src.training.densenet_trainer import DenseNet121Classifier, get_device
 from src.training.gradcam import GradCAM
 from src.utils.config import get_config
-from src.utils.paths import DATA_DIR, LOG_DIR, CORRECTIONS_DIR, ensure_data_dirs
+from src.utils.paths import DATA_DIR, LOG_DIR, CORRECTIONS_DIR, REPO_ROOT, ensure_data_dirs
 from src.utils.logger import setup_logger
 from src.utils.auth import DEV_INSECURE, REQUIRE_AUTH
+from src.utils.offline import OFFLINE
 
 # Server/app version reported in /health and stamped on every analysis
 # (desktop-app/package.json carries the same number for the UI build).
@@ -134,6 +135,7 @@ class ModelState:
     class_names: list[str] = []
     optimal_thresholds: Optional[list] = None  # Per-class optimized thresholds
     is_xrv: bool = False  # True if using TorchXRayVision pre-trained
+    legacy_model_reason: str = ''  # why the legacy chest checkpoint is NOT loaded (/health)
     gemma_engine: Optional[object] = None  # Gemma 3 report engine
     data_collector: Optional[object] = None  # Training data collector
     config: dict = {}
@@ -185,6 +187,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"Data dir: {DATA_DIR}")
     if DEV_INSECURE:
         logger.warning("SENTINEL_DEV_INSECURE=1 — auth relaxed, OpenAPI docs exposed. NOT for a clinic.")
+    if OFFLINE:
+        logger.info("SENTINEL_OFFLINE=1 — air-gapped: models load from the local bundle only, no downloads")
+    else:
+        logger.warning("SENTINEL_OFFLINE=0 — downloads allowed (developer mode). NOT for a clinic.")
 
     # ===== License check =====
     # DEV_BYPASS_LICENSE=1 skips the check, but ONLY together with
@@ -241,6 +247,8 @@ async def lifespan(app: FastAPI):
 
     # Load DenseNet121 — supports both custom-trained and pre-trained XRV models
     checkpoint_path = Path(inference_config.get("densenet_checkpoint", "models/densenet/best_model.pt"))
+    if not checkpoint_path.is_absolute() and not checkpoint_path.exists():
+        checkpoint_path = REPO_ROOT / checkpoint_path      # config path is repo-relative, cwd may differ
     if checkpoint_path.exists():
         checkpoint = torch.load(str(checkpoint_path), map_location=state.device, weights_only=False)
         num_classes = len(checkpoint.get("class_names", state.class_names))
@@ -250,25 +258,47 @@ async def lifespan(app: FastAPI):
         is_xrv = checkpoint.get("is_pretrained", False) and checkpoint.get("source") == "torchxrayvision"
 
         if is_xrv:
+            # The XRV checkpoint carries only metadata; the weights themselves are
+            # torchxrayvision's release file, which xrv fetches from GitHub when it
+            # is not on disk. On an air-gapped box that must never be attempted:
+            # resolve the file from models/xrv/ (offline bundle) or
+            # ~/.torchxrayvision first and degrade with a reason if it is absent.
             try:
                 import torchxrayvision as xrv
+                from src.inference.model_registry import resolve_xrv_weights
+                from src.utils.offline import missing_model_reason
                 xrv_weights = checkpoint.get("xrv_weights", "densenet121-res224-all")
-                logger.info(f"Loading pre-trained TorchXRayVision: {xrv_weights}")
-                state.model = xrv.models.DenseNet(weights=xrv_weights)
-                state.model.to(state.device)
-                state.model.eval()
-                state.is_xrv = True
+                cache_dir, weights_file = resolve_xrv_weights(xrv_weights)
+                if weights_file is None and OFFLINE:
+                    state.legacy_model_reason = missing_model_reason('chest', [str(Path(cache_dir or 'models/xrv'))])
+                    logger.warning(f"Chest model not loaded: {state.legacy_model_reason}")
+                    state.model = None
+                    state.is_xrv = False
+                else:
+                    logger.info(f"Loading pre-trained TorchXRayVision: {xrv_weights} ({weights_file or 'download'})")
+                    state.model = xrv.models.DenseNet(weights=xrv_weights, cache_dir=cache_dir)
+                    state.model.to(state.device)
+                    state.model.eval()
+                    state.is_xrv = True
             except ImportError:
                 # An XRV checkpoint can ONLY be loaded by torchxrayvision — its
                 # weight namespace ('features.*') is incompatible with our custom
                 # DenseNet121Classifier wrapper ('densenet.features.*'). Trying to
                 # force-load would crash with a misleading error, so fail with an
                 # actionable message instead.
+                state.legacy_model_reason = "torchxrayvision not installed (pip install torchxrayvision)"
                 logger.error(
                     "This checkpoint is a TorchXRayVision model but torchxrayvision "
                     "is not installed. Install it (pip install torchxrayvision) and "
                     "restart. Running without the chest model."
                 )
+                state.model = None
+                state.is_xrv = False
+            except Exception as e:
+                # A failed weight download / corrupt file must degrade, never
+                # crash the server lifespan: the brain panel still works.
+                state.legacy_model_reason = f"chest weights failed to load: {e}"
+                logger.error(f"Chest model not loaded: {e}")
                 state.model = None
                 state.is_xrv = False
         else:
@@ -300,6 +330,7 @@ async def lifespan(app: FastAPI):
 
             logger.info(f"DenseNet121 loaded from {checkpoint_path} ({num_classes} classes)")
     else:
+        state.legacy_model_reason = f"no checkpoint at {checkpoint_path}"
         logger.warning(f"No model checkpoint found at {checkpoint_path}. Server running in demo mode.")
 
     # Warm the brain panel so /health can report real load status (and the
@@ -449,6 +480,8 @@ def health_check():
             'loaded': True,
             'reason': 'legacy checkpoint (' + ('torchxrayvision' if state.is_xrv else 'densenet121') + ')',
         }
+    elif not models['chest']['loaded'] and state.legacy_model_reason:
+        models['chest'] = {'loaded': False, 'reason': state.legacy_model_reason}
     status = 'ok' if models['brain_triage']['loaded'] else 'degraded'
     return {
         'status': status,
@@ -458,6 +491,7 @@ def health_check():
         'models': models,
         'llm': _probe_llm(),
         'license': {'mode': state.license_info.get('mode')},
+        'offline': OFFLINE,
         'data_dir': str(DATA_DIR),
         # legacy fields (scripts/production_smoke_test.py, start.sh)
         'model_loaded': state.model is not None,
@@ -481,6 +515,15 @@ async def orthanc_status():
         'known_studies': len(watcher.known_orthanc_ids),
         'orthanc_stats': watcher.get_orthanc_stats(),
     }
+
+
+@app.get("/audit/verify")
+async def audit_verify(admin: dict = Depends(require_admin)):
+    """Admin-only: walk the tamper-evident audit hash chain (prev_hash/row_hash)
+    and report the first broken row, if any. {ok, rows, checked, head_hash,
+    first_broken: {id, reason} | null}."""
+    from src.inference.auth_routes import db as _db
+    return _db.verify_audit_chain()
 
 
 @app.get("/audit/log")

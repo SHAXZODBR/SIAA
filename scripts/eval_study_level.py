@@ -24,6 +24,11 @@
                               --write-manifest (re)creates it from the current
                               files. The model.safetensors hash is the one
                               /analyze/study reports as model_identity.sha256_12.
+                              Encrypted-at-rest dirs (model.safetensors.enc, see
+                              src/utils/model_crypto.py) are supported: the
+                              PLAINTEXT sha comes from the .enc.meta.json sidecar
+                              (so the pin is the same as for the plaintext dir)
+                              and the .enc bytes are pinned as well.
 
   Usage:
     python scripts/eval_study_level.py --model models/brain_triage_local \
@@ -61,8 +66,26 @@ def sha256_file(fp: Path) -> str:
     return h.hexdigest()
 
 
+def _sidecar_plaintext_sha(model_dir: Path, name: str):
+    """plaintext sha256 of <name> when only <name>.enc (+ sidecar) is on disk."""
+    enc = model_dir / (name + '.enc')
+    meta = model_dir / (name + '.enc.meta.json')
+    if enc.exists() and meta.exists():
+        try:
+            return json.loads(meta.read_text()).get('plaintext_sha256')
+        except Exception:
+            return None
+    return None
+
+
 def write_manifest(model_dir: Path, manifest_path: Path) -> dict:
-    files = {name: sha256_file(model_dir / name) for name in MANIFEST_FILES if (model_dir / name).exists()}
+    files = {}
+    for name in MANIFEST_FILES:
+        if (model_dir / name).exists():
+            files[name] = sha256_file(model_dir / name)
+        elif _sidecar_plaintext_sha(model_dir, name):
+            files[name] = _sidecar_plaintext_sha(model_dir, name)          # plaintext pin (stable)
+            files[name + '.enc'] = sha256_file(model_dir / (name + '.enc'))  # ciphertext as shipped
     if not files:
         print(f"  {R}✗ no weight/config files to hash in {model_dir}{NC}")
         sys.exit(EXIT_MANIFEST_FAILED)
@@ -87,10 +110,13 @@ def check_manifest(model_dir: Path, manifest_path: Path) -> dict:
     problems = []
     for name, expected in pinned.items():
         fp = model_dir / name
-        if not fp.exists():
+        if fp.exists():
+            actual = sha256_file(fp)
+        elif not name.endswith('.enc') and _sidecar_plaintext_sha(model_dir, name):
+            actual = _sidecar_plaintext_sha(model_dir, name)   # encrypted at rest: plaintext sha via sidecar
+        else:
             problems.append(f"{name}: missing")
             continue
-        actual = sha256_file(fp)
         if actual != expected:
             problems.append(f"{name}: sha256 {actual[:12]}… != pinned {str(expected)[:12]}…")
     if problems:
@@ -132,9 +158,9 @@ def main():
         print(f"  {Y}⚠ no manifest at {manifest_path} — weights are unpinned; "
               f"run with --write-manifest to pin this release{NC}")
 
-    from transformers import AutoImageProcessor, AutoModelForImageClassification
-    processor = AutoImageProcessor.from_pretrained(args.model)
-    model = AutoModelForImageClassification.from_pretrained(args.model).to(args.device).eval()
+    # Plaintext or encrypted-at-rest dir — same loader the server uses.
+    from src.inference.model_registry import load_hf_classifier_dir
+    processor, model = load_hf_classifier_dir(model_dir, args.device)
     id2label = model.config.id2label
     abn_idx = next(i for i, l in id2label.items() if l == args.abnormal_class)
 

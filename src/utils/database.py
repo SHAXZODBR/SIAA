@@ -10,8 +10,17 @@ Schema evolution: SCHEMA_SQL only ever uses CREATE ... IF NOT EXISTS, and
 MIGRATIONS lists columns added after v1.0 as (table, column, declaration).
 _migrate() applies ALTER TABLE ADD COLUMN for whichever are missing, so an old
 pilot DB upgrades in place on first open.
+
+Tamper-evident audit log: every audit_log row carries
+    prev_hash = row_hash of the previous row (GENESIS for the first)
+    row_hash  = sha256(canonical JSON of the row's fields + prev_hash)
+so editing, reordering or removing an interior row breaks the chain, which
+verify_audit_chain() / GET /audit/verify walks and reports. SQLite triggers
+refuse UPDATE/DELETE on audit_log (append-only). Legacy rows written before the
+chain existed are back-filled once, in id order, at migration time.
 """
 
+import hashlib
 import sqlite3
 import json
 import uuid
@@ -154,7 +163,30 @@ MIGRATIONS = [
     ("reports",    "findings_json",        "TEXT"),
     ("reports",    "model_identity_json",  "TEXT"),
     ("audit_log",  "ip_address",           "TEXT"),
+    ("audit_log",  "prev_hash",            "TEXT"),
+    ("audit_log",  "row_hash",             "TEXT"),
 ]
+
+AUDIT_GENESIS = "0" * 64
+# Fields hashed, in this order (id and timestamp included so position + time
+# are pinned; details is free text so it is JSON-escaped, not concatenated).
+AUDIT_HASH_FIELDS = ("id", "user_id", "action", "entity_type", "entity_id",
+                     "details", "ip_address", "timestamp")
+
+AUDIT_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+"""
+
+
+def audit_row_hash(row: dict, prev_hash: str) -> str:
+    """sha256 over the canonical JSON of the hashed fields + the previous hash."""
+    canon = {k: ("" if row.get(k) is None else str(row.get(k))) for k in AUDIT_HASH_FIELDS}
+    canon["prev_hash"] = prev_hash
+    payload = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class ReportAlreadySignedError(Exception):
@@ -199,6 +231,31 @@ class SentinelDB:
             )
         except sqlite3.Error as e:
             logger.warning(f"Could not create signed-report unique index: {e}")
+        SentinelDB._migrate_audit_chain(conn)
+
+    @staticmethod
+    def _migrate_audit_chain(conn: sqlite3.Connection):
+        """Back-fill prev_hash/row_hash for rows written before the chain
+        existed (in id order, once), then install the append-only triggers."""
+        n_unhashed = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE row_hash IS NULL OR row_hash=''"
+        ).fetchone()[0]
+        if n_unhashed:
+            # Triggers (if present from an earlier open) would refuse the UPDATE.
+            conn.execute("DROP TRIGGER IF EXISTS audit_log_no_update")
+            conn.execute("DROP TRIGGER IF EXISTS audit_log_no_delete")
+            prev = AUDIT_GENESIS
+            rows = conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+            for r in rows:
+                d = dict(r)
+                if d.get("row_hash"):
+                    prev = d["row_hash"]
+                    continue
+                h = audit_row_hash(d, prev)
+                conn.execute("UPDATE audit_log SET prev_hash=?, row_hash=? WHERE id=?", (prev, h, d["id"]))
+                prev = h
+            logger.info(f"DB migration: hashed {n_unhashed} legacy audit_log rows into the chain")
+        conn.executescript(AUDIT_TRIGGERS_SQL)
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection.
@@ -424,7 +481,7 @@ class SentinelDB:
                 "UPDATE reports SET is_signed=1, signed_at=?, signer_id=? WHERE id=? AND is_signed=0",
                 (datetime.now().isoformat(), doctor_id, report_id),
             )
-            self.log_action(doctor_id, "sign_report", "report", report_id)
+            self.log_action(doctor_id, "sign_report", "report", report_id, conn=conn)
         logger.info(f"Report {report_id} signed by {doctor_id}")
         return True
 
@@ -569,14 +626,81 @@ class SentinelDB:
         entity_id: str = "",
         details: str = "",
         ip_address: str = "",
-    ):
-        """Record an action in the audit log (captures ip_address)."""
-        with self._connect() as conn:
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> int:
+        """Append a row to the tamper-evident audit log. Returns the row id.
+
+        The chain link (prev_hash → row_hash) is computed under the write lock
+        (BEGIN IMMEDIATE) so concurrent writers cannot both extend the same
+        head. Pass `conn` to append inside a caller's open transaction."""
+        own = conn is None
+        if own:
+            conn = self._connect()
+        try:
+            if own:
+                conn.execute("BEGIN IMMEDIATE")
+            head = conn.execute(
+                "SELECT id, row_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = (head["row_hash"] if head and head["row_hash"] else AUDIT_GENESIS)
+            next_id = (head["id"] + 1) if head else 1
+            row = {
+                "id": next_id, "user_id": user_id, "action": action,
+                "entity_type": entity_type, "entity_id": entity_id, "details": details,
+                "ip_address": ip_address, "timestamp": datetime.now().isoformat(),
+            }
+            row_hash = audit_row_hash(row, prev_hash)
             conn.execute(
-                "INSERT INTO audit_log (user_id, action, entity_type, entity_id, details, ip_address) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, action, entity_type, entity_id, details, ip_address),
+                "INSERT INTO audit_log (id, user_id, action, entity_type, entity_id, details, "
+                "ip_address, timestamp, prev_hash, row_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["id"], user_id, action, entity_type, entity_id, details, ip_address,
+                 row["timestamp"], prev_hash, row_hash),
             )
+            if own:
+                conn.commit()
+            return next_id
+        except Exception:
+            if own:
+                conn.rollback()
+            raise
+        finally:
+            if own:
+                conn.close()
+
+    def verify_audit_chain(self) -> dict:
+        """Walk audit_log in id order and re-derive every hash.
+
+        Returns {ok, rows, checked, head_hash, first_broken: {id, reason}|None}.
+        Detects: edited fields, a re-linked/removed interior row, a foreign
+        row spliced in. (Silently truncating the newest rows is not detectable
+        by the chain alone — the DELETE trigger and DB backups cover that.)"""
+        prev = AUDIT_GENESIS
+        checked = 0
+        first_broken = None
+        head_hash = None
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+            for r in rows:
+                d = dict(r)
+                if not d.get("row_hash"):
+                    first_broken = {"id": d["id"], "reason": "row has no hash (written outside log_action)"}
+                    break
+                if d.get("prev_hash") != prev:
+                    first_broken = {"id": d["id"], "reason": "prev_hash does not match previous row"}
+                    break
+                if audit_row_hash(d, prev) != d["row_hash"]:
+                    first_broken = {"id": d["id"], "reason": "row_hash does not match row contents"}
+                    break
+                prev = d["row_hash"]
+                head_hash = prev
+                checked += 1
+        return {
+            "ok": first_broken is None,
+            "rows": len(rows),
+            "checked": checked,
+            "head_hash": head_hash,
+            "first_broken": first_broken,
+        }
 
     def get_audit_log(self, limit: int = 500) -> list:
         """Return recent audit entries (admin view / compliance export)."""

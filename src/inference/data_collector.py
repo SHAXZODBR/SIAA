@@ -58,7 +58,13 @@ from src.pipeline.preprocessor import preprocess_study
 class TrainingDataCollector:
     """Collects anonymized training data from every analysis."""
 
-    def __init__(self, base_dir: str = "data/training_corpus"):
+    def __init__(self, base_dir: Optional[str] = None):
+        # Mutable state lives under DATA_DIR (src/utils/paths.py), never inside
+        # the repo checkout / app bundle — the old CWD-relative default wrote
+        # into the source tree whenever the server ran from the repo root.
+        if base_dir is None:
+            from src.utils.paths import TRAINING_CORPUS_DIR
+            base_dir = TRAINING_CORPUS_DIR
         self.base_dir = Path(base_dir)
         self.images_dir = self.base_dir / "images"
         self.labels_path = self.base_dir / "labels.jsonl"
