@@ -14,6 +14,7 @@ interface ElectronAPI {
   openDicomFolder: () => Promise<string | null>;
   getAppInfo: () => Promise<{ version: string; name: string; platform: string; arch: string }>;
   onNotification: (callback: (data: unknown) => void) => void;
+  readFileBase64?: (filePath: string) => Promise<string | null>;
   exportPDF: (
     html: string,
     filename?: string,

@@ -11,6 +11,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+if '--print-fingerprint' in sys.argv:
+    # Used by the desktop app's setup wizard / license activation (works in the
+    # PyInstaller bundle too, where there is no `python -m src.utils.license`).
+    from src.utils.license import get_machine_id
+    print(get_machine_id())
+    sys.exit(0)
+
 from src.inference.server import start_server
 
 

@@ -46,11 +46,39 @@
       {
         "from": "../scripts/install_clinic_local.sh",
         "to": "scripts/install_clinic_local.sh"
+      },
+      {
+        "from": "../packaging/dist/sentinel-backend",
+        "to": "backend/sentinel-backend"
+      },
+      {
+        "from": "../models",
+        "to": "backend/models",
+        "filter": [
+          "brain_triage_finetuned/**",
+          "brain_finetuned/**",
+          "hf/**",
+          "xrv/**",
+          "densenet/**",
+          "monai_bundles/**"
+        ]
+      },
+      {
+        "from": "../docs",
+        "to": "docs",
+        "filter": [
+          "*.md"
+        ]
       }
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.ico",
       "publisherName": "SIA Medical AI",
@@ -75,7 +103,13 @@
     },
     "mac": {
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.icns",
       "category": "public.app-category.medical",
@@ -89,12 +123,23 @@
       "background": null,
       "iconSize": 100,
       "contents": [
-        { "x": 130, "y": 220 },
-        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "Science",
       "maintainer": "SIA Medical AI <shakhzodbatirjonov@gmail.com>"
     },

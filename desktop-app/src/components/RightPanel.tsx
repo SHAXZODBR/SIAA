@@ -5,6 +5,7 @@ import { generateReport, formatFullReport } from '../services/reportGenerator';
 import { downloadPDF, downloadMultiLanguagePDF, sanitizeFilePart } from '../services/pdfExport';
 import type { PDFBaseData, PDFLanguageSection } from '../services/pdfExport';
 import { regenerateReport, signReport, saveReportCorrection, describeApiError } from '../services/api';
+import { attachReportPdf } from '../services/api';
 import { DEMO_MODE, DEMO_STUDIES, getDemoResultForStudy } from '../services/demoData';
 import {
   translateFinding, translateLocation, findingUrgency, urgencyWord, statusWord,
@@ -489,6 +490,25 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
         res = await downloadPDF({ ...base, ...section, language }, pdfFilename(language, !signed));
       }
       if (res.success) addNotification({ type: 'success', title: t('report.pdfSaved'), message: res.filePath });
+      // Signed single-language export → file the PDF on the server / PACS (Encapsulated PDF).
+      if (res.success && exportMode !== 'opened' && signed && res.filePath) {
+        const sr = signedFor(language);
+        const bridge = (window as any).electronAPI;
+        if (sr?.reportId && bridge?.readFileBase64) {
+          try {
+            const b64 = await bridge.readFileBase64(res.filePath);
+            if (b64) {
+              const r = await attachReportPdf(sr.reportId, b64, true);
+              addNotification(r.pushed
+                ? { type: 'success', title: t('report.sentToPacs') }
+                : { type: 'warning', title: t('report.pdfStoredOnServer'), message: r.error || undefined });
+            }
+          } catch (e) {
+            console.error('PACS filing failed:', e);
+            addNotification({ type: 'warning', title: t('report.pacsFailed') });
+          }
+        }
+      }
       else if (!res.canceled) addNotification({ type: 'error', title: t('report.exportFailed'), message: res.error });
     } catch (e) {
       console.error('PDF export failed:', e);

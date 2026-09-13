@@ -19,4 +19,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Help → Documentation (bundled docs/ folder, if any)
   openDocs: () => ipcRenderer.invoke('open-docs'),
+  readFileBase64: (filePath) => ipcRenderer.invoke('read-file-base64', filePath),
 });

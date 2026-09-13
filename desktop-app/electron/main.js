@@ -173,6 +173,19 @@ ipcMain.handle('read-license', async () => {
 });
 
 // Write license file (after activation)
+// Lets the renderer hand an exported (signed) PDF back to the server so it can be
+// filed to PACS as a DICOM Encapsulated PDF. Only .pdf files are readable.
+ipcMain.handle('read-file-base64', async (_, filePath) => {
+  try {
+    const p = String(filePath || '');
+    if (!p || !p.toLowerCase().endsWith('.pdf') || !fs.existsSync(p)) return null;
+    return fs.readFileSync(p).toString('base64');
+  } catch (e) {
+    console.error('read-file-base64 failed:', e);
+    return null;
+  }
+});
+
 ipcMain.handle('write-license', async (_, licenseData) => {
   try {
     const licensePath = path.join(app.getPath('userData'), 'license.dat');
@@ -213,13 +226,31 @@ ipcMain.handle('open-docs', async () => {
 // 'get-machine-id' above. The setup wizard therefore asks the server's own
 // CLI for it, so the value the clinic sends to the vendor is the one that
 // verify_license() will compare against.
+// A packaged install may ship the backend as a PyInstaller bundle
+// (resources/backend/sentinel-backend/sentinel-backend[.exe]) instead of Python
+// sources + venv. Built by packaging/build_backend.sh from packaging/sentinel_backend.spec.
+function frozenBackendExe() {
+  const resourcesPath = process.resourcesPath || path.join(__dirname, '..');
+  const exe = path.join(resourcesPath, 'backend', 'sentinel-backend',
+    process.platform === 'win32' ? 'sentinel-backend.exe' : 'sentinel-backend');
+  try { return fs.existsSync(exe) ? exe : null; } catch { return null; }
+}
+
+function bundledModelsDir() {
+  const resourcesPath = process.resourcesPath || path.join(__dirname, '..');
+  return path.join(resourcesPath, 'backend', 'models');
+}
+
 function backendPaths() {
   const resourcesPath = process.resourcesPath || path.join(__dirname, '..');
   const packagedDir = path.join(resourcesPath, 'backend');
   const devDir = path.join(__dirname, '..', '..');
   const backendDir = fs.existsSync(path.join(packagedDir, 'src', 'utils', 'license.py')) ? packagedDir
     : fs.existsSync(path.join(devDir, 'src', 'utils', 'license.py')) ? devDir : null;
-  if (!backendDir) return null;
+  if (!backendDir) {
+    const fx = frozenBackendExe();
+    return fx ? { backendDir: path.dirname(fx), pythonExe: null, frozenExe: fx } : null;
+  }
   const candidates = [
     path.join(backendDir, 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
     process.env.SENTINEL_PYTHON || '',
@@ -236,7 +267,9 @@ ipcMain.handle('get-server-fingerprint', () => new Promise((resolve) => {
   let done = false;
   const finish = (result) => { if (!done) { done = true; resolve(result); } };
   try {
-    const child = spawn(bp.pythonExe, ['-m', 'src.utils.license', 'fingerprint'], {
+    const fpCmd = bp.frozenExe || bp.pythonExe;
+    const fpArgs = bp.frozenExe ? ['--print-fingerprint'] : ['-m', 'src.utils.license', 'fingerprint'];
+    const child = spawn(fpCmd, fpArgs, {
       cwd: bp.backendDir,
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -297,6 +330,8 @@ function backendEnv() {
     ...process.env,
     SENTINEL_REQUIRE_AUTH: '1',                    // enforce auth in production
     SENTINEL_DATA_DIR: app.getPath('userData'),    // DB, audit log, license, logs
+    SENTINEL_HOSPITAL_BUILD: '1',                  // offline posture; dev bypasses ignored
+    ...(fs.existsSync(bundledModelsDir()) ? { SENTINEL_MODELS_DIR: bundledModelsDir() } : {}),
   };
 }
 
@@ -318,7 +353,8 @@ function spawnBackend() {
   ];
   const pythonExe = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || candidates[candidates.length - 1];
 
-  if (!fs.existsSync(serverScript)) {
+  const frozenExe = frozenBackendExe();
+  if (!frozenExe && !fs.existsSync(serverScript)) {
     logBackend(`server script not found: ${serverScript}`);
     dialog.showErrorBox('Backend not found',
       'The Sentinel inference server was not found in this install. ' +
@@ -329,7 +365,8 @@ function spawnBackend() {
   if (!backendLog) backendLog = openBackendLog();
 
   try {
-    const child = spawn(pythonExe, [serverScript], {
+    const child = spawn(frozenExe || pythonExe,
+      frozenExe ? ['--host', '127.0.0.1', '--port', '8000'] : [serverScript], {
       cwd: backendDir,
       env: backendEnv(),
       detached: false,

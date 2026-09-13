@@ -741,3 +741,34 @@ export function stopOrthancWatcher(): void {
     watcherInterval = null;
   }
 }
+
+
+// ----- Signed report → server / PACS -----------------------------------------
+
+export interface AttachPdfResult {
+  pushed: boolean;
+  sopInstanceUid: string | null;
+  orthancId: string | null;
+  error: string | null;
+}
+
+/** Upload the exported (signed) PDF so the server files it as a DICOM Encapsulated PDF and,
+ *  when a PACS is configured, pushes it to Orthanc (push=1). Only signed reports are accepted. */
+export async function attachReportPdf(reportId: string, pdfBase64: string, push = true): Promise<AttachPdfResult> {
+  const bin = atob(pdfBase64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const form = new FormData();
+  form.append('pdf', new Blob([bytes], { type: 'application/pdf' }), `${reportId}.pdf`);
+  const res = await inferenceAPI.post(`/report/${encodeURIComponent(reportId)}/pdf?push=${push ? 1 : 0}`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 60000,
+  });
+  const d = res.data || {};
+  return {
+    pushed: !!d.pushed,
+    sopInstanceUid: d.dicom_sop_instance_uid ?? null,
+    orthancId: d.orthanc_id ?? null,
+    error: d.push_error ?? null,
+  };
+}
