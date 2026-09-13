@@ -75,10 +75,12 @@ population it actually serves.
 
 ## Status & roadmap
 
-- ✅ **Working product** — desktop app, inference server, multilingual reporting, DICOM pipeline
-- ✅ **Brain module** — triage panel trained & validated on real local patient studies
-- 🔧 **In progress** — expanding brain findings, whole-study validation, clinic pilot
-- 🗺️ **Next** — **spine** (highest-volume MRI referral), then broader multi-organ coverage
+- ✅ **Working product** — desktop app (RU / UZ / EN interface, first-run clinic setup), inference server, whole-study DICOM ingest (thousands of files per study), multilingual reporting, PDF export
+- ✅ **Brain module** — a **locally trained normal-vs-abnormal triage model**, validated on **178 held-out Tashkent patients** (study-level sensitivity 0.90 / specificity 0.47), running alongside a public tumor classifier that is clearly labelled *pending validation*. The product **never certifies a scan as normal**.
+- ✅ **Hospital-grade plumbing** — authentication on by default, server-side report signing with a tamper-evident audit log, fully offline operation, model weights encrypted at rest, PACS auto-ingest (Orthanc) and signed reports filed back to PACS as DICOM Encapsulated PDF
+- ✅ **Quality gates** — automated test suite, a checksummed release gate a retrained model must pass before it ships, hospital documentation in RU / UZ / EN (`docs/`)
+- 🔧 **In progress** — Windows installer (self-contained backend bundle + NSIS, built via CI), clinic pilot with radiologist-adjudicated evaluation
+- 🗺️ **Next** — more local *normal* studies to raise specificity, **spine** (highest-volume MRI referral), then broader multi-organ coverage
 
 > SIAA is a clinical **decision-support** tool, not an autonomous diagnostic device.
 > A qualified radiologist reads and signs every study.
@@ -89,6 +91,8 @@ population it actually serves.
 
 **SIAA Medical AI** — building the AI radiology layer for Central Asia.
 Tashkent, Uzbekistan.
+
+Hospital documentation (user manual, admin install guide, intended use, pilot protocol) lives in [`docs/`](docs/README.md).
 
 ### → Learn more at **[www.siaa.uz](https://www.siaa.uz)**
 
