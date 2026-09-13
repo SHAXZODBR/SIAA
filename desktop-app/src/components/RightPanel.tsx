@@ -127,7 +127,7 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
 
   return (
     <div className="p-3 space-y-3">
-      <DisclaimerBanner text={result.disclaimer} />
+      <DisclaimerBanner text={t('findings.disclaimer')} />
 
       {/* Overall assessment — the server's rule; never a "normal" certificate */}
       <div className={`p-3 rounded-lg border ${flagged ? 'severity-critical' : 'border-ink-700 bg-ink-850/60 text-ink-200'}`}>
@@ -194,7 +194,7 @@ function NotAnalyzedState({ result }: { result: AIResult }) {
           {t('findings.notAnalyzed')}{reason ? `: ${reason}` : ''}
         </div>
       </div>
-      <DisclaimerBanner text={result.disclaimer} />
+      <DisclaimerBanner text={t('findings.disclaimer')} />
     </div>
   );
 }

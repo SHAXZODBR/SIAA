@@ -280,6 +280,7 @@ export const uz: Record<I18nKey, string> = {
   'findings.abnormalFlagged': 'AI topilma belgiladi — ko‘rib chiqish kerak',
   'findings.noFindingFlagged': 'AI hech qanday topilma belgilamadi — bu norma xulosasi EMAS',
   'findings.flaggedFor': 'Ko‘rib chiqish uchun belgilandi: {findings}',
+  'findings.disclaimer': 'Triaj uchun AI-yordamchi. Faqat sanab o‘tilgan topilma turlarini belgilaydi va normani TASDIQLAY OLMAYDI. «pending» holatidagi topilmalar ushbu klinika populyatsiyasida validatsiyadan o‘tmagan; «experimental» — faqat skrining ishoralari. Har bir tekshiruvni rentgenolog shifokor o‘qiydi va imzolaydi.',
   'findings.noFlagNotNormal': 'AI hech qanday topilma belgilamadi — bu norma xulosasi EMAS; rentgenolog to‘liq ko‘rib chiqishi shart',
   'findings.technicalDetail': 'Texnik tafsilot (server matni)',
   'findings.flagged': 'Belgilangan',

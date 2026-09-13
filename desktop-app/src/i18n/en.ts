@@ -277,6 +277,7 @@ export const en = {
   'findings.abnormalFlagged': 'AI flagged a finding — requires review',
   'findings.noFindingFlagged': 'No finding flagged by AI — NOT a normal read',
   'findings.flaggedFor': 'Flagged for review: {findings}',
+  'findings.disclaimer': 'AI triage assistant. It lists the finding types it can flag and CANNOT confirm a scan as normal. Findings marked “pending” are not validated on this clinic’s population; “experimental” ones are screening hints only. Every study is read and signed by the radiologist.',
   'findings.noFlagNotNormal': 'No finding flagged by AI — this is NOT a normal read; full radiologist review is required',
   'findings.technicalDetail': 'Technical detail (server text)',
   'findings.flagged': 'Flagged',
