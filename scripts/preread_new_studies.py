@@ -35,6 +35,8 @@ def main():
     ap.add_argument('--modality', default=''); ap.add_argument('--body-part', default='')
     ap.add_argument('--desc-contains', default='', help='also select when study_description contains this (case-insensitive)')
     ap.add_argument('--limit', type=int, default=0); ap.add_argument('--language', default='ru')
+    ap.add_argument('--no-select-series', action='store_true',
+                    help='upload every file instead of pre-selecting the axial brain series client-side (CT head only)')
     a = ap.parse_args()
     rows = list(csv.DictReader(open(a.index, encoding='utf-8')))
     sel = []
@@ -65,6 +67,18 @@ def main():
             rec = {'study_folder': r['study_folder'], 'patient_id': r['patient_id'], 'study_date': r['study_date'],
                    'modality': r['modality'], 'body_part': r['body_part'], 'study_description': r['study_description'],
                    'n_files': len(files)}
+            # CT head: choose the axial brain series here (same helper the server uses) and upload only
+            # that series — the server re-runs the same selection on what it receives. Cuts drive IO a lot.
+            if (not a.no_select_series) and r['modality'].upper() == 'CT' and 'HEAD' in r['body_part'].upper():
+                try:
+                    from src.pipeline.ct_head_selection import select_ct_head_slices
+                    sel = select_ct_head_slices(files)
+                    if sel is not None and sel.series.slices:
+                        files = [sl.path for sl in sel.series.slices]
+                        rec['preselected_series'] = sel.series.description
+                except Exception as e:
+                    rec['preselect_error'] = repr(e)[:120]
+            rec['n_files_uploaded'] = len(files)
             ts = time.time()
             try:
                 handles = [('files', (f.name, open(f, 'rb'), 'application/dicom')) for f in files]
