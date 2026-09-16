@@ -17,7 +17,7 @@
 """
 from __future__ import annotations
 import argparse, csv, os
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 import pydicom
 
@@ -42,38 +42,67 @@ def main():
     ap.add_argument('--images', required=True)
     ap.add_argument('--labels', default='data/hospital_reports_labels.csv')
     ap.add_argument('--out', default='data/matched_dataset.csv')
+    ap.add_argument('--index', default=None,
+                    help='study index CSV from scripts/index_new_studies.py — skips the DICOM walk (fast path)')
     args = ap.parse_args()
 
     # load labels: patient_id -> {body_part, label, ...}
-    labels = {}
+    labels_by_pid = defaultdict(list)
     with open(args.labels, encoding='utf-8') as fh:
         for r in csv.DictReader(fh):
-            labels[r['patient_id']] = r
-    print(f'Loaded {len(labels)} report labels.')
+            labels_by_pid[r['patient_id']].append(r)
+    print(f'Loaded {sum(len(v) for v in labels_by_pid.values())} report labels for {len(labels_by_pid)} patients.')
+
+    def pick_report(pid, study_date, brainy):
+        """Best report for this study: same study_date > compatible body part > only/first report."""
+        cands = labels_by_pid.get(pid) or []
+        if not cands:
+            return None, ''
+        by_date = [r for r in cands if study_date and (r.get('study_date') or '').replace('-', '') == study_date.replace('-', '')]
+        if by_date:
+            return by_date[0], 'date'
+        if len(cands) == 1:
+            return cands[0], 'pid'
+        want = 'brain' if brainy else None
+        by_bp = [r for r in cands if (r.get('body_part') == 'brain') == (want == 'brain')]
+        return (by_bp[0], 'body_part') if by_bp else (cands[0], 'pid-ambiguous')
 
     img_root = Path(args.images)
-    study_dirs = [d for d in img_root.iterdir() if d.is_dir()]
-    print(f'{len(study_dirs)} image study folders. Reading one header each…')
+    if args.index:
+        idx_rows = [r for r in csv.DictReader(open(args.index, encoding='utf-8')) if not r.get('error')]
+        print(f'{len(idx_rows)} studies from index {args.index} (no DICOM walk).')
+        study_iter = [(r['study_folder'], r['patient_id'], r['modality'], r['body_part'], '', r['study_description'], r['study_date']) for r in idx_rows]
+    else:
+        study_dirs = [d for d in img_root.iterdir() if d.is_dir()]
+        print(f'{len(study_dirs)} image study folders. Reading one header each…')
+        study_iter = None
 
     rows = []
     matched = brain_matched = no_header = unmatched = 0
     bp_counter, find_counter = Counter(), Counter()
-    for i, sd in enumerate(study_dirs):
-        f = first_dcm(sd)
-        if f is None:
+    def iter_studies():
+        if study_iter is not None:
+            for t in study_iter:
+                yield t
+            return
+        for sd in study_dirs:
+            f = first_dcm(sd)
+            if f is None:
+                yield (sd.name, None, '', '', '', '', ''); continue
+            try:
+                ds = pydicom.dcmread(str(f), stop_before_pixels=True, force=True)
+            except Exception:
+                yield (sd.name, None, '', '', '', '', ''); continue
+            yield (sd.name, str(ds.get('PatientID', '')).strip(), str(ds.get('Modality', '')), str(ds.get('BodyPartExamined', '')),
+                   str(ds.get('PatientName', '')), str(ds.get('StudyDescription', '')), str(ds.get('StudyDate', '')))
+
+    total = len(study_iter) if study_iter is not None else len(study_dirs)
+    for i, (folder, pid, modality, bp, name, desc, study_date) in enumerate(iter_studies()):
+        if pid is None:
             no_header += 1; continue
-        try:
-            ds = pydicom.dcmread(str(f), stop_before_pixels=True, force=True)
-        except Exception:
-            no_header += 1; continue
-        pid = str(ds.get('PatientID', '')).strip()
-        modality = str(ds.get('Modality', ''))
-        bp = str(ds.get('BodyPartExamined', ''))
-        name = str(ds.get('PatientName', ''))
-        desc = str(ds.get('StudyDescription', ''))
         brainy = is_brain(bp, name, desc)
-        rep = labels.get(pid)
-        row = {'study_folder': sd.name, 'patient_id': pid, 'modality': modality,
+        rep, quality = pick_report(pid, study_date, brainy)
+        row = {'study_folder': folder, 'patient_id': pid, 'modality': modality, 'study_date': study_date, 'match_quality': quality,
                'body_part_dicom': bp or ('brain' if brainy else ''), 'is_brain': 'yes' if brainy else 'no',
                'report_matched': 'yes' if rep else 'no',
                'report_body_part': rep['body_part'] if rep else '',
@@ -95,7 +124,7 @@ def main():
         else:
             unmatched += 1
         if (i + 1) % 300 == 0:
-            print(f'  …{i+1}/{len(study_dirs)}  matched={matched}')
+            print(f'  …{i+1}/{total}  matched={matched}')
 
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'w', newline='', encoding='utf-8') as fh:
