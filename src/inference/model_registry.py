@@ -97,6 +97,20 @@ class ModelCard:
     #   'pending'      — pretrained, plausible, UNVERIFIED on this clinic's population
     #   'experimental' — different task/population; screening hint only
     validation_status: str = 'pending'
+    # How the classifier's outputs are read (see _make_hf_predictor):
+    #   multi_label=False → softmax, one class per image; a class is positive
+    #                       only when its probability ≥ decision_threshold
+    #   multi_label=True  → independent sigmoids; each class is positive on its
+    #                       own when ≥ decision_threshold
+    # A loaded HF checkpoint that declares config.problem_type overrides the
+    # card's flag — the trainer knows how the logits were fitted, and softmax
+    # logits pushed through a sigmoid (or vice versa) are not probabilities.
+    multi_label: bool = False
+    decision_threshold: float = 0.5
+    # Class whose probability is the study-level abnormal flag (RSNA 'any').
+    # When the loaded checkpoint has no such class the flag falls back to
+    # "any positive non-negative class".
+    study_flag_class: Optional[str] = None
 
 
 # ============================================================================
@@ -135,6 +149,10 @@ BRAIN_TUMOR_CLASS = ModelCard(
     tier='production',
     license='Apache-2.0 / MIT (per repo)',
     notes='Single-slice 2D classifier — fast (1-2s on CPU). Use BRAIN_TUMOR_SEG for pixel-level boundaries.',
+    # Pre-existing behaviour of the registry path for this card: the top-3
+    # softmax classes ≥ 0.15 are reported and flagged. Kept as-is (the brain
+    # panel has its own protocol) so this card's outputs do not shift.
+    decision_threshold=0.15,
 )
 
 
@@ -339,12 +357,22 @@ CHEST = ModelCard(
     body_part_dicom_tags=['CHEST', 'CHEST PA', 'CHEST AP', 'THORAX'],
     tier='production',
     license='Apache-2.0',
+    multi_label=True,     # TorchXRayVision: 18 independent sigmoid outputs
 )
 
 
 HEAD_CT = ModelCard(
     modality='head_ct',
     display_name='Head CT Hemorrhage Detection (6 classes)',
+    # RSNA 2019 label set. NOTE: the checkpoint that actually loads from
+    # DifeiT/rsna-intracranial-hemorrhage-detection is a 6-way SINGLE-LABEL
+    # softmax (config.json: problem_type=single_label_classification,
+    # id2label = epidural/intraparenchymal/intraventricular/normal/
+    # subarachnoid/subdural) — it has a 'normal' class and NO 'any' class.
+    # Findings are keyed by the checkpoint's own id2label, so 'normal' shows
+    # up (never positive) and the study-level flag falls back to "any
+    # hemorrhage subtype ≥ decision_threshold" unless a fallback checkpoint
+    # really outputs 'any'.
     classes=['any', 'epidural', 'intraparenchymal', 'intraventricular',
              'subarachnoid', 'subdural'],
     classes_localized={
@@ -354,6 +382,7 @@ HEAD_CT = ModelCard(
         'intraventricular': {'ru': 'Внутрижелудочковое',     'uz': 'Qorinchalararo',      'en': 'Intraventricular'},
         'subarachnoid':     {'ru': 'Субарахноидальное',      'uz': 'Subaraxnoidal',       'en': 'Subarachnoid'},
         'subdural':         {'ru': 'Субдуральное',           'uz': 'Subdural',            'en': 'Subdural'},
+        'normal':           {'ru': 'Кровоизлияние не выявлено', 'uz': 'Qon quyilishi topilmadi', 'en': 'No hemorrhage'},
     },
     input_size=(224, 224),
     backend='huggingface',
@@ -369,6 +398,15 @@ HEAD_CT = ModelCard(
     body_part_dicom_tags=['HEAD', 'BRAIN', 'SKULL'],
     tier='beta',
     license='MIT',
+    # Card default only — the loaded checkpoint's problem_type wins (the
+    # DifeiT weights are single-label softmax, see above). A sigmoid
+    # multi-label RSNA checkpoint is detected from its config at load time.
+    multi_label=False,
+    decision_threshold=0.5,
+    study_flag_class='any',
+    notes=('Analysed per series on POST /analyze/study: up to 9 central axial brain '
+           'slices, brain window, per-class MEAN (max reported separately); '
+           'localizer/scout series are never scored.'),
 )
 
 
@@ -557,8 +595,17 @@ def get_model(modality_key: str, device: str = 'cpu') -> Optional[dict]:
         return None
 
     predictor, available, reason = _build_predictor(card, device)
-    entry = {'card': card, 'predictor': predictor,
-             'available': available, 'reason': reason}
+    entry = {
+        'card': card, 'predictor': predictor,
+        'available': available, 'reason': reason,
+        # Where the weights that actually run live (local dir, HF-cache
+        # snapshot dir, or the xrv weights file) — what model_identity hashes.
+        'source_path': getattr(predictor, 'source_path', None),
+        # Effective output semantics: the checkpoint's own problem_type when it
+        # declares one, else the card's flag.
+        'multi_label': bool(getattr(predictor, 'multi_label', card.multi_label)),
+        'activation': getattr(predictor, 'activation', None),
+    }
     _loaded_models[modality_key] = entry
     return entry
 
@@ -865,6 +912,10 @@ def _build_xrv_predictor(card: ModelCard, device: str):
         return {labels[i]: float(probs[i]) for i in range(len(labels)) if labels[i]}
 
     predict.weights_source = 'torchxrayvision:densenet121-res224-all'
+    predict.multi_label = True
+    predict.activation = 'sigmoid'
+    _, loaded_weights = resolve_xrv_weights('densenet121-res224-all')   # present after the load
+    predict.source_path = str(loaded_weights) if loaded_weights else None
     return predict, True, ''
 
 
@@ -992,11 +1043,33 @@ def load_hf_classifier_dir(model_dir, device: str = 'cpu'):
     return processor, model
 
 
-def _make_hf_predictor(model, processor, device: str, source: str):
+def effective_multi_label(model, card_multi_label: Optional[bool], source: str = '') -> bool:
+    """How to read a loaded HF classifier's logits. The checkpoint's own
+    config.problem_type is authoritative (that is how the loss was fitted);
+    the card's flag only decides when the config is silent."""
+    problem_type = getattr(getattr(model, 'config', None), 'problem_type', None)
+    if problem_type == 'multi_label_classification':
+        eff = True
+    elif problem_type == 'single_label_classification':
+        eff = False
+    else:
+        eff = bool(card_multi_label)
+    if card_multi_label is not None and eff != bool(card_multi_label):
+        logger.warning(
+            f"{source}: card declares multi_label={card_multi_label} but the checkpoint's "
+            f"problem_type is {problem_type!r} — using {'sigmoid' if eff else 'softmax'}"
+        )
+    return eff
+
+
+def _make_hf_predictor(model, processor, device: str, source: str,
+                       multi_label: Optional[bool] = None):
     import torch
     id2label = {int(k): v for k, v in (model.config.id2label or {}).items()}
+    is_multi = effective_multi_label(model, multi_label, source)
 
-    def predict(image: np.ndarray, _model=model, _proc=processor, _i2l=id2label) -> dict:
+    def predict(image: np.ndarray, _model=model, _proc=processor, _i2l=id2label,
+                _multi=is_multi) -> dict:
         from PIL import Image
         if image.ndim == 2:
             img = (image * 255).clip(0, 255).astype(np.uint8)
@@ -1006,10 +1079,17 @@ def _make_hf_predictor(model, processor, device: str, source: str):
         inputs = _proc(images=pil, return_tensors='pt').to(device)
         with torch.no_grad():
             logits = _model(**inputs).logits
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            if _multi:
+                probs = torch.sigmoid(logits).cpu().numpy()[0]
+            else:
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
         return {_i2l.get(i, f'class_{i}'): float(p) for i, p in enumerate(probs)}
 
     predict.weights_source = source   # local dir or HF repo id — used by get_model_identity
+    predict.source_path = str(source) if Path(str(source)).is_dir() else None
+    predict.multi_label = is_multi
+    predict.activation = 'sigmoid' if is_multi else 'softmax'
+    predict.class_names = [id2label[i] for i in sorted(id2label)]
     return predict
 
 
@@ -1040,7 +1120,9 @@ def _build_hf_predictor(card: ModelCard, device: str):
         try:
             processor, model = load_hf_classifier_dir(d, device)
             logger.info(f"Loaded {card.modality} from {d}")
-            return _make_hf_predictor(model, processor, device, str(d)), True, f'loaded from {d}'
+            pred = _make_hf_predictor(model, processor, device, str(d), multi_label=card.multi_label)
+            pred.source_path = str(d)
+            return pred, True, f'loaded from {d}'
         except Exception as e:
             last_err = e
             logger.warning(f"Local model dir {d} failed: {e}")
@@ -1057,8 +1139,14 @@ def _build_hf_predictor(card: ModelCard, device: str):
             processor = _load_image_processor(repo, local_only=OFFLINE)
             model = AutoModelForImageClassification.from_pretrained(repo, local_files_only=OFFLINE)
             model.to(device).eval()
-            logger.info(f"Loaded {card.modality} from {repo}")
-            return _make_hf_predictor(model, processor, device, repo), True, f'loaded from {repo}'
+            # The weights are in the HF cache now (or always were, when
+            # OFFLINE) — remember the snapshot dir they were read from so
+            # model_identity hashes THOSE files, not whatever rglob finds.
+            snapshot = hf_snapshot_dir(repo)
+            logger.info(f"Loaded {card.modality} from {repo} ({snapshot or 'snapshot dir unresolved'})")
+            pred = _make_hf_predictor(model, processor, device, repo, multi_label=card.multi_label)
+            pred.source_path = snapshot
+            return pred, True, f'loaded from {repo}'
         except Exception as e:
             last_err = e
             logger.debug(f"Repo {repo} failed: {e}")
@@ -1208,31 +1296,82 @@ def _build_monai_predictor(card: ModelCard, device: str):
 _identity_cache: dict[str, dict] = {}
 
 
+# sha256 of zero bytes — what hashing a missing/empty weight file yields.
+# model_identity must never report it as a weights hash.
+EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+_WEIGHT_FILE_NAMES = ('model.safetensors', 'pytorch_model.bin', 'model.pt')
+
+
+def _nonempty_weight_files(d: Path) -> list[Path]:
+    """The first NON-EMPTY plaintext weight file in a model dir (symlinks
+    into the HF blob store are followed). A 0-byte file — e.g. the
+    .no_exist/<rev>/model.safetensors marker huggingface_hub writes for a
+    file that is absent on the hub — is never a weight file."""
+    for name in _WEIGHT_FILE_NAMES:
+        c = Path(d) / name
+        try:
+            if c.is_file() and c.stat().st_size > 0:
+                return [c.resolve()]
+        except OSError:
+            continue
+    return []
+
+
+def hf_snapshot_dir(repo_id: str) -> Optional[str]:
+    """The local HF-cache snapshot directory a repo id resolves to — the files
+    transformers actually read — WITHOUT any download. None when the repo is
+    not in the cache."""
+    if not repo_id or '/' not in repo_id:
+        return None
+    try:
+        from huggingface_hub import snapshot_download
+        return str(Path(snapshot_download(repo_id, local_files_only=True)).resolve())
+    except Exception:
+        pass
+    try:
+        from transformers.utils import cached_file
+        cfg = cached_file(repo_id, 'config.json', local_files_only=True,
+                          _raise_exceptions_for_missing_entries=False,
+                          _raise_exceptions_for_connection_errors=False)
+        if cfg:
+            return str(Path(cfg).resolve().parent)
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_weight_files(source: str) -> list[Path]:
     """Map a predictor's weights_source (local dir or HF repo id) to the
-    PLAINTEXT weight file(s) actually on disk, so we can hash them. An
-    encrypted-at-rest dir returns [] — see weights_sha256_for_source."""
+    PLAINTEXT weight file actually on disk, so we can hash it. An
+    encrypted-at-rest dir returns [] — see weights_sha256_for_source. For a
+    repo id the snapshot the loader resolves is used; the cache entry's
+    .no_exist/ markers (0-byte files) are never picked up."""
     if not source:
         return []
     p = Path(source)
     if p.is_dir():
-        cands = [p / 'model.safetensors', p / 'pytorch_model.bin', p / 'model.pt']
-        return [c for c in cands if c.exists()]
+        return _nonempty_weight_files(p)
     if '/' not in source or ':' in source:
         if source.startswith('torchxrayvision:'):
             _, wp = resolve_xrv_weights(source.split(':', 1)[1])
-            return [wp] if wp else []
+            return [wp] if wp and Path(wp).is_file() and Path(wp).stat().st_size > 0 else []
         return []   # not an HF repo id
     bundle = hf_bundle_dir(source)
     if bundle.is_dir():
         return _resolve_weight_files(str(bundle))
-    repo_dir = _hf_cache_root() / f'models--{source.replace("/", "--")}'
-    if not repo_dir.exists():
-        return []
-    for name in ('model.safetensors', 'pytorch_model.bin'):
-        found = sorted(repo_dir.rglob(name))
+    snapshot = hf_snapshot_dir(source)
+    if snapshot:
+        found = _nonempty_weight_files(Path(snapshot))
         if found:
-            return [found[0].resolve()]
+            return found
+    # Last resort: any snapshot of the cache entry (never .no_exist/).
+    snapshots = _hf_cache_root() / f'models--{source.replace("/", "--")}' / 'snapshots'
+    if snapshots.is_dir():
+        for sd in sorted(snapshots.iterdir()):
+            found = _nonempty_weight_files(sd)
+            if found:
+                return found
     return []
 
 
@@ -1245,7 +1384,10 @@ def weights_sha256_for_source(source: str) -> Optional[str]:
     p = Path(source)
     if p.is_dir():
         from src.utils.model_crypto import plaintext_sha256_of_dir
-        return plaintext_sha256_of_dir(p)
+        full = plaintext_sha256_of_dir(p)
+        if full and full != EMPTY_SHA256:
+            return full
+        return _sha256_of(_nonempty_weight_files(p))
     return _sha256_of(_resolve_weight_files(source))
 
 
@@ -1260,14 +1402,20 @@ def is_source_encrypted(source: Optional[str]) -> bool:
 
 
 def _sha256_of(paths: list[Path]) -> Optional[str]:
+    """sha256 over the given files; None when there are none or they hold no
+    bytes (the empty-string digest is never a weights hash)."""
     import hashlib
     if not paths:
         return None
     h = hashlib.sha256()
+    total = 0
     for fp in paths:
         with open(fp, 'rb') as f:
             for chunk in iter(lambda: f.read(1 << 20), b''):
                 h.update(chunk)
+                total += len(chunk)
+    if total == 0:
+        return None
     return h.hexdigest()
 
 
@@ -1283,17 +1431,34 @@ def get_model_identity(modality_key: str) -> Optional[dict]:
         return None
     entry = _loaded_models.get(modality_key)
     source = None
+    source_path = None
     sha12 = None
     note = card.notes
     if entry and entry.get('available'):
-        source = getattr(entry.get('predictor'), 'weights_source', None)
+        predictor = entry.get('predictor')
+        source = getattr(predictor, 'weights_source', None)
         if not source and str(entry.get('reason', '')).startswith('loaded from '):
             source = entry['reason'][len('loaded from '):]
-        try:
-            full = weights_sha256_for_source(source or '')
-            sha12 = full[:12] if full else None
-        except Exception as e:
-            logger.debug(f"sha256 for {modality_key} failed: {e}")
+        # Hash the files the loader actually read (HF-cache snapshot dir /
+        # local dir / xrv weights file); the repo id is only a fallback.
+        source_path = entry.get('source_path') or getattr(predictor, 'source_path', None)
+        for cand in (source_path, source):
+            if not cand:
+                continue
+            try:
+                full = weights_sha256_for_source(str(cand))
+            except Exception as e:
+                logger.debug(f"sha256 for {modality_key} via {cand} failed: {e}")
+                continue
+            if full and full != EMPTY_SHA256:
+                sha12 = full[:12]
+                break
+        if sha12 is None:
+            where = source_path or source or '?'
+            hash_note = f'weights not hashable: no non-empty plaintext weight file under {where}'
+            note = f'{note}; {hash_note}' if note else hash_note
+            source = f'{source} [unhashed]' if source else None
+            logger.warning(f"model_identity {modality_key}: {hash_note}")
     elif entry:
         note = f"not loaded: {entry.get('reason', '')}"
     else:
@@ -1302,8 +1467,9 @@ def get_model_identity(modality_key: str) -> Optional[dict]:
         'key': modality_key,
         'display_name': card.display_name,
         'source': source,
-        'sha256_12': sha12,                       # PLAINTEXT weights hash (stable across installs)
-        'encrypted_at_rest': is_source_encrypted(source),
+        'source_path': source_path,               # dir/file the hash was taken from
+        'sha256_12': sha12,                       # PLAINTEXT weights hash (stable across installs); null when unhashable
+        'encrypted_at_rest': is_source_encrypted(source_path or source),
         'status': card.validation_status,
         'validation_note': note,
     }

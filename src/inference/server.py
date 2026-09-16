@@ -31,7 +31,10 @@ from contextlib import asynccontextmanager
 from loguru import logger
 
 from src.pipeline.dicom_loader import load_dicom, DicomStudy
-from src.pipeline.preprocessor import preprocess_study
+from src.pipeline.preprocessor import preprocess_study, resize_with_padding
+from src.pipeline.ct_head_selection import (
+    select_ct_head_slices, load_windowed_slice, aggregate_slice_probs, largest_non_localizer,
+)
 from src.training.densenet_trainer import DenseNet121Classifier, get_device
 from src.training.gradcam import GradCAM
 from src.utils.config import get_config
@@ -1235,11 +1238,22 @@ def _generate_report(findings: list[dict], language: str, modality: str,
         return None, False
 
 
-def _run_registry_model(study: DicomStudy, modality_key: str, language: str) -> dict:
-    """Core of the single-file registry path — shared by /analyze/auto and the
-    non-brain branch of /analyze/study. Blocking: call from a worker thread.
-    Never declares a study normal."""
-    from src.inference.model_registry import get_model, get_model_identity
+# Registry keys analysed as a SERIES (central axial slices) rather than one
+# file on POST /analyze/study. The RSNA hemorrhage classifier needs axial
+# brain slices, and a whole head-CT upload also carries the scout/topogram,
+# bone and reformat series — "the largest image" was the scout.
+_CT_SERIES_ROUTES = {'head_ct'}
+CT_HEAD_N_SLICES = 9
+CT_HEAD_AGGREGATION = 'mean_central_9'
+# Softmax (single-label) models report their top-3 classes at or above this
+# floor (pre-existing behaviour); whether a class is POSITIVE is decided by
+# card.decision_threshold, not by being reported.
+_SOFTMAX_REPORT_FLOOR = 0.15
+
+
+def _load_registry_entry(modality_key: str) -> dict:
+    """Loaded registry entry for a key, or HTTP 503 with the loader's reason."""
+    from src.inference.model_registry import get_model
 
     model_entry = get_model(modality_key, device=str(state.device))
     if model_entry is None or not model_entry['available']:
@@ -1248,58 +1262,113 @@ def _run_registry_model(study: DicomStudy, modality_key: str, language: str) -> 
             status_code=503,
             detail=f"Model for '{modality_key}' not available: {reason}",
         )
+    return model_entry
+
+
+def _clean_probs(raw) -> dict[str, float]:
+    return {str(k): float(v) for k, v in dict(raw).items() if not str(k).startswith('_')}
+
+
+def _decide_findings(card, modality_key: str, probs: dict[str, float], language: str, *,
+                     multi_label: Optional[bool] = None, threshold: Optional[float] = None,
+                     location: str = '', report_all: bool = False,
+                     sequence_used: Optional[str] = None) -> list[dict]:
+    """Class probabilities → findings. A class is POSITIVE only when its
+    probability ≥ the decision threshold (card.decision_threshold unless
+    overridden) and it is not a detector's explicit negative class.
+
+      multi-label (independent sigmoids): every class is reported, each
+        judged on its own — sub-threshold classes come back positive=False
+        so the UI shows them as "not flagged".
+      softmax (single-label): the top-3 classes ≥ _SOFTMAX_REPORT_FLOOR are
+        reported (as before); only those ≥ threshold are positive.
+    `report_all` reports every class regardless of mode."""
+    thr = float(card.decision_threshold if threshold is None else threshold)
+    is_multi = bool(card.multi_label if multi_label is None else multi_label)
+    localized = card.classes_localized or {}
+
+    def _finding(cls: str, prob: float) -> dict:
+        return {
+            'class_name': cls,
+            'finding': (localized.get(cls) or {}).get(language) or cls,
+            'confidence': round(prob, 4),
+            'positive': bool(prob >= thr) and cls.lower() not in _NEGATIVE_CLASSES,
+            'status': card.validation_status,
+            'detector': modality_key,
+            'sequence_used': sequence_used,
+            'heatmap_base64': '',
+            'location': location,
+        }
+
+    ranked = sorted(probs.items(), key=lambda x: -x[1])
+    if is_multi or report_all:
+        chosen = ranked
+    else:
+        chosen = [(c, p) for c, p in ranked[:3] if p >= _SOFTMAX_REPORT_FLOOR]
+    findings = [_finding(c, p) for c, p in chosen]
+    findings.sort(key=lambda f: (not f['positive'], -f['confidence']))
+    return findings
+
+
+def _study_flag(card, probs: dict[str, float], findings: list[dict],
+                threshold: Optional[float] = None) -> tuple[bool, Optional[str]]:
+    """(abnormal_flagged, flag_class). card.study_flag_class (RSNA 'any') is
+    the study-level flag when the model outputs it; otherwise any positive
+    finding flags the study."""
+    thr = float(card.decision_threshold if threshold is None else threshold)
+    cls = card.study_flag_class
+    if cls and cls in probs:
+        return bool(probs[cls] >= thr), cls
+    return any(f['positive'] for f in findings), None
+
+
+def _summarize_findings(card, probs: dict[str, float], findings: list[dict],
+                        threshold: Optional[float] = None) -> tuple[str, dict]:
+    """(impression, overall_assessment). Never declares a study normal."""
+    flagged, flag_cls = _study_flag(card, probs, findings, threshold)
+    positives = [f for f in findings if f['positive']]
+    if flagged:
+        parts = [f"{f['class_name']} ({f['confidence']:.0%})" for f in positives[:3]]
+        if flag_cls and flag_cls not in [f['class_name'] for f in positives[:3]]:
+            parts.insert(0, f"{flag_cls} ({probs[flag_cls]:.0%})")
+        impression = "Findings suggestive of: " + ", ".join(parts)
+    else:
+        impression = _NOT_NORMAL_IMPRESSION
+    overall_assessment = {
+        'abnormal_flagged': bool(flagged),
+        'flags': [f['finding'] for f in positives],
+        'text': impression,
+    }
+    if flag_cls:
+        overall_assessment['study_flag'] = {'class': flag_cls, 'confidence': round(probs[flag_cls], 4)}
+    return impression, overall_assessment
+
+
+def _run_registry_model(study: DicomStudy, modality_key: str, language: str) -> dict:
+    """Core of the single-file registry path — shared by /analyze/auto and the
+    non-brain branch of /analyze/study (chest X-ray etc.; head CT goes through
+    _run_ct_head_series first). Blocking: call from a worker thread. Never
+    declares a study normal."""
+    from src.inference.model_registry import get_model_identity
+
+    model_entry = _load_registry_entry(modality_key)
     card = model_entry['card']
     predictor = model_entry['predictor']
+    is_multi = bool(model_entry.get('multi_label', card.multi_label))
 
     # Preprocess to the model's input size; the preview is exactly what it saw.
     processed_image = preprocess_study(study, target_size=card.input_size[0])
     preview_base64 = _encode_preview(processed_image)
 
     with state.inference_lock:
-        raw_probs = predictor(processed_image)
-    raw_probs = {str(k): float(v) for k, v in raw_probs.items() if not str(k).startswith('_')}
+        raw_probs = _clean_probs(predictor(processed_image))
 
-    threshold = float(state.config.get("inference", {}).get("confidence_threshold", 0.5))
-    # Softmax (HF single-label) models: top-3 above 0.15; multi-label: threshold.
-    is_softmax = abs(sum(raw_probs.values()) - 1.0) < 0.05
-    localized = card.classes_localized or {}
-
-    def _finding(cls: str, prob: float, location: str) -> dict:
-        return {
-            'class_name': cls,
-            'finding': (localized.get(cls) or {}).get(language) or cls,
-            'confidence': round(prob, 4),
-            'positive': cls.lower() not in _NEGATIVE_CLASSES,
-            'status': card.validation_status,
-            'detector': modality_key,
-            'sequence_used': None,
-            'heatmap_base64': '',
-            'location': location,
-        }
-
-    findings = []
-    if is_softmax:
-        for cls, prob in sorted(raw_probs.items(), key=lambda x: -x[1])[:3]:
-            if prob >= 0.15:
-                findings.append(_finding(cls, prob, 'Central region'))
-    else:
-        for cls, prob in raw_probs.items():
-            if prob >= threshold:
-                findings.append(_finding(cls, prob, 'Region of interest'))
-    findings.sort(key=lambda f: (not f['positive'], -f['confidence']))
-
-    positives = [f for f in findings if f['positive']]
-    if positives:
-        impression = "Findings suggestive of: " + ", ".join(
-            f"{f['class_name']} ({f['confidence']:.0%})" for f in positives[:3]
-        )
-    else:
-        impression = _NOT_NORMAL_IMPRESSION
-    overall_assessment = {
-        'abnormal_flagged': bool(positives),
-        'flags': [f['finding'] for f in positives],
-        'text': impression,
-    }
+    threshold = float(card.decision_threshold)
+    findings = _decide_findings(
+        card, modality_key, raw_probs, language, multi_label=is_multi,
+        location='Region of interest' if is_multi else 'Central region',
+    )
+    impression, overall_assessment = _summarize_findings(card, raw_probs, findings)
 
     report_text, engine_used = _generate_report(
         findings, language, modality=study.modality,
@@ -1316,6 +1385,110 @@ def _run_registry_model(study: DicomStudy, modality_key: str, language: str) -> 
         'card': card,
         'threshold': threshold,
         'model_identity': [identity] if identity else [],
+        'activation': model_entry.get('activation') or ('sigmoid' if is_multi else 'softmax'),
+        'aggregation': 'single_image',
+        'n_slices_analyzed': 1,
+        'series_used': None,
+    }
+
+
+def _run_ct_head_series(file_paths: list[Path], modality_key: str, language: str,
+                        hdr: Optional[dict] = None,
+                        n_slices: int = CT_HEAD_N_SLICES) -> Optional[dict]:
+    """Head-CT series protocol for the head_ct route (blocking; worker thread).
+
+    Picks the axial brain series (never the scout/localizer), scores up to
+    `n_slices` central slices in the brain window, aggregates per class by
+    MEAN (max reported in per_class_max) and previews the central slice.
+    Returns None when the upload holds no analysable series (single-file
+    uploads) — the caller then falls back to the single-image path."""
+    from src.inference.model_registry import get_model_identity
+
+    sel = select_ct_head_slices(file_paths, n_slices=n_slices)
+    if sel is None:
+        return None
+    model_entry = _load_registry_entry(modality_key)
+    card = model_entry['card']
+    predictor = model_entry['predictor']
+    is_multi = bool(model_entry.get('multi_label', card.multi_label))
+    size = int(card.input_size[0])
+
+    # Decode each slice once: windowed at native resolution (the central one
+    # doubles as the preview), letter-boxed to the classifier input for scoring.
+    loaded = []
+    for idx, path in zip(sel.indices, sel.slice_paths):
+        got = load_windowed_slice(path)
+        if got is None:
+            continue
+        img, meta = got
+        loaded.append((idx, path, img, meta))
+    if not loaded:
+        logger.warning(f"head_ct: none of the {len(sel.slice_paths)} selected slices decoded")
+        return None
+
+    per_slice = []
+    with state.inference_lock:
+        for idx, path, img, meta in loaded:
+            probs = _clean_probs(predictor(resize_with_padding(img, size)))
+            per_slice.append({
+                'index': int(idx),
+                'instance_number': meta.get('instance_number'),
+                'probs': {k: round(v, 4) for k, v in probs.items()},
+            })
+    mean_probs, max_probs = aggregate_slice_probs([
+        {k: float(v) for k, v in s['probs'].items()} for s in per_slice
+    ])
+
+    threshold = float(card.decision_threshold)
+    findings = _decide_findings(
+        card, modality_key, mean_probs, language, multi_label=is_multi,
+        report_all=True, location='', sequence_used=sel.series.description or None,
+    )
+    impression, overall_assessment = _summarize_findings(card, mean_probs, findings)
+
+    # Preview: the central slice, same window the model saw, at viewer resolution.
+    central_img, central = next(((im, m) for i, p, im, m in loaded if p == sel.central_path),
+                                loaded[len(loaded) // 2][2:4])
+    preview_base64 = _encode_preview(resize_with_padding(central_img, 512))
+
+    protocol = {
+        'series_used': sel.series.description,
+        'series_uid': sel.series.uid,
+        'n_slices_analyzed': len(per_slice),
+        'n_images_in_series': sel.series.n_images,
+        'aggregation': CT_HEAD_AGGREGATION,
+        'window': {k: central.get(k) for k in ('window_center', 'window_width', 'default_brain_window')},
+        'slice_rows_cols': [central.get('rows'), central.get('cols')],
+    }
+    overall_assessment['protocol'] = protocol
+    overall_assessment['per_class_max'] = {k: round(v, 4) for k, v in max_probs.items()}
+
+    report_text, engine_used = _generate_report(
+        findings, language, modality=(hdr or {}).get('modality') or 'CT',
+        body_part=(hdr or {}).get('body_part') or 'HEAD',
+        study_date=(hdr or {}).get('study_date') or '',
+    )
+    identity = get_model_identity(modality_key)
+    logger.info(
+        f"head_ct series protocol: '{sel.series.description}' {len(per_slice)} slices "
+        f"(of {sel.series.n_images}); mean={ {k: round(v, 3) for k, v in mean_probs.items()} }"
+    )
+    return {
+        'findings': findings,
+        'impression': impression,
+        'overall_assessment': overall_assessment,
+        'preview_base64': preview_base64,
+        'report_text': report_text,
+        'gemma_available': engine_used,
+        'card': card,
+        'threshold': threshold,
+        'model_identity': [identity] if identity else [],
+        'activation': model_entry.get('activation') or ('sigmoid' if is_multi else 'softmax'),
+        **protocol,
+        'per_class_max': overall_assessment['per_class_max'],
+        'per_slice': per_slice,
+        'series_dropped': sel.dropped,
+        'series_candidates': sel.candidates,
     }
 
 
@@ -1603,11 +1776,23 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
             f"No registered model for modality '{hdr.get('modality') or '?'}' / body part "
             f"'{hdr.get('body_part') or '?'}' — study routed to radiologist review without AI analysis"
         )
-    study = load_dicom(hdr['best_path']) if hdr.get('best_path') else None
-    if study is None:
-        raise HTTPException(status_code=400, detail='Could not decode pixel data from the uploaded DICOM files')
+    run = None
+    best_path = hdr.get('best_path')
+    if modality_key in _CT_SERIES_ROUTES:
+        # Whole head-CT study: axial brain series, central slices, never the scout.
+        run = _run_ct_head_series(file_paths, modality_key, language, hdr)
+        if run is None:
+            # No series with enough images (single-file upload) — single-image
+            # path, but still never a localizer when anything else decodes.
+            best_path = largest_non_localizer(file_paths) or best_path
+            logger.warning(f"head_ct: no analysable series in {len(file_paths)} file(s); "
+                           f"falling back to single image {getattr(best_path, 'name', best_path)}")
+    if run is None:
+        study = load_dicom(best_path) if best_path else None
+        if study is None:
+            raise HTTPException(status_code=400, detail='Could not decode pixel data from the uploaded DICOM files')
+        run = _run_registry_model(study, modality_key, language)
 
-    run = _run_registry_model(study, modality_key, language)
     card = run['card']
     resp.update({
         'route': modality_key,
@@ -1621,7 +1806,16 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
         'report_text': run['report_text'],
         'gemma_available': run['gemma_available'],
         'threshold': run['threshold'],
+        'activation': run.get('activation'),
+        # Series protocol provenance (single-image runs: series_used=None, 1 slice).
+        'series_used': run.get('series_used'),
+        'n_slices_analyzed': run.get('n_slices_analyzed', 1),
+        'aggregation': run.get('aggregation', 'single_image'),
     })
+    for extra in ('series_uid', 'n_images_in_series', 'per_class_max', 'per_slice',
+                  'series_dropped', 'series_candidates', 'window', 'slice_rows_cols'):
+        if extra in run:
+            resp[extra] = run[extra]
     return resp
 
 
@@ -1820,10 +2014,14 @@ async def analyze_study(
     """Whole-study analysis — API contract v1 (POST multipart, repeated `files`).
 
     The server reads the DICOM headers and routes: brain MR → the detector
-    panel (local validated triage + pending tumor classifier); other
+    panel (local validated triage + pending tumor classifier); head CT → the
+    head_ct series protocol (axial brain series, up to 9 central slices in
+    the brain window, per-class mean — never the scout/localizer; see
+    series_used / n_slices_analyzed / aggregation / per_class_max); other
     modalities → the matching single-file registry model, or 422
     {requires_review} when no model honestly applies. The response carries the
-    real header fields, per-finding validation status, model provenance
+    real header fields, per-finding validation status (a class is positive
+    only at or above the card's decision threshold), model provenance
     (model_identity), a localized disclaimer and the actual analyzed slice.
     Persisted to the studies/ai_results tables. `normal` is ALWAYS false.
     """
