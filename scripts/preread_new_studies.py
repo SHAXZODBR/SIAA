@@ -67,15 +67,41 @@ def main():
             rec = {'study_folder': r['study_folder'], 'patient_id': r['patient_id'], 'study_date': r['study_date'],
                    'modality': r['modality'], 'body_part': r['body_part'], 'study_description': r['study_description'],
                    'n_files': len(files)}
-            # CT head: choose the axial brain series here (same helper the server uses) and upload only
-            # that series — the server re-runs the same selection on what it receives. Cuts drive IO a lot.
+            # CT head: choose the axial brain series client-side and upload only that series.
+            # Fast path: this export keeps one series per folder, so classify each folder from ONE
+            # header (description / ImageType / orientation / count) with the same rules the server
+            # uses, then read only the chosen series. Falls back to the full per-file selection.
             if (not a.no_select_series) and r['modality'].upper() == 'CT' and 'HEAD' in r['body_part'].upper():
                 try:
-                    from src.pipeline.ct_head_selection import select_ct_head_slices
-                    sel = select_ct_head_slices(files)
-                    if sel is not None and sel.series.slices:
-                        files = [sl.path for sl in sel.series.slices]
-                        rec['preselected_series'] = sel.series.description
+                    import pydicom
+                    from collections import defaultdict
+                    from src.pipeline.ct_head_selection import (SeriesInfo, SliceHeader, localizer_reason,
+                                                                choose_brain_series, select_ct_head_slices, _image_type)
+                    by_dir = defaultdict(list)
+                    for f in files: by_dir[f.parent].append(f)
+                    series = []
+                    for dd, fl in by_dir.items():
+                        try:
+                            ds = pydicom.dcmread(str(fl[0]), stop_before_pixels=True, force=True)
+                        except Exception:
+                            continue
+                        iop = getattr(ds, 'ImageOrientationPatient', None)
+                        si = SeriesInfo(uid=str(getattr(ds, 'SeriesInstanceUID', dd.name)),
+                                        description=str(getattr(ds, 'SeriesDescription', '')),
+                                        image_type=_image_type(ds),
+                                        orientation=[float(x) for x in iop] if iop is not None and len(iop) == 6 else None)
+                        rows_, cols_ = int(getattr(ds, 'Rows', 0) or 0), int(getattr(ds, 'Columns', 0) or 0)
+                        si.slices = [SliceHeader(path=pp, order=i, rows=rows_, cols=cols_) for i, pp in enumerate(sorted(fl))]
+                        series.append(si)
+                    chosen = choose_brain_series([x for x in series if not localizer_reason(x)]) if series else None
+                    if chosen is not None and chosen.slices:
+                        files = [sl.path for sl in chosen.slices]
+                        rec['preselected_series'] = chosen.description; rec['preselect_mode'] = 'per-folder'
+                    else:
+                        sel = select_ct_head_slices(files)
+                        if sel is not None and sel.series.slices:
+                            files = [sl.path for sl in sel.series.slices]
+                            rec['preselected_series'] = sel.series.description; rec['preselect_mode'] = 'per-file'
                 except Exception as e:
                     rec['preselect_error'] = repr(e)[:120]
             rec['n_files_uploaded'] = len(files)
