@@ -98,7 +98,7 @@ jobs:
             models/hf
             models/xrv
             models/densenet
-          key: public-models-${{ runner.os }}-${{ env.PUBLIC_MODEL_KEYS }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}
+          key: public-models-${{ runner.os }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}-v1
 
       - name: Download public models (${{ env.PUBLIC_MODEL_KEYS }})
         run: |
@@ -229,7 +229,7 @@ jobs:
             models/hf
             models/xrv
             models/densenet
-          key: public-models-${{ runner.os }}-${{ env.PUBLIC_MODEL_KEYS }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}
+          key: public-models-${{ runner.os }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}-v1
 
       - name: Download public models (${{ env.PUBLIC_MODEL_KEYS }})
         run: '"$PYTHON" scripts/download_all_models.py --only "$PUBLIC_MODEL_KEYS" --dest models'
