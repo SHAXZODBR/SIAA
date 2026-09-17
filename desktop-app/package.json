@@ -83,7 +83,6 @@
         }
       ],
       "icon": "build/icon.ico",
-      "publisherName": "SIA Medical AI",
       "verifyUpdateCodeSignature": false,
       "requestedExecutionLevel": "asInvoker"
     },
