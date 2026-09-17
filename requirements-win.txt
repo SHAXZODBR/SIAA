@@ -1,0 +1,76 @@
+# ============================================================================
+#  Sentinel — RUNTIME-ONLY dependencies for the frozen Windows backend
+#  (packaging\sentinel_backend.spec -> sentinel-backend.exe), Windows x64,
+#  Python 3.11. Installed by packaging\build_windows.ps1 into .\venv:
+#
+#      python -m pip install -r requirements-win.txt
+#
+#  Both indexes are declared here so ONE pip call resolves everything:
+#  torch/torchvision come from the PyTorch CPU index (no CUDA runtime ->
+#  the frozen backend stays ~1.3 GB instead of ~4 GB), everything else from
+#  PyPI. torch/torchvision are pinned to the versions
+#  .github/workflows/build-windows.yml uses (TORCH_VERSION / TORCHVISION_VERSION);
+#  bump both together and update the workflow + docs/admin_install_guide_*.md.
+#
+#  Every other pin is the exact version the macOS bundle was built and
+#  smoke-tested with (2026-09-17); each one was checked to have a
+#  cp311 / win_amd64 (or pure-python) wheel. Training / research packages
+#  (mlflow, nnunetv2, HD-BET, SimpleITK, peft, accelerate, tensorboard,
+#  jupyter, matplotlib, scikit-learn, pandas-only tooling) are deliberately
+#  NOT here: src/ imports them lazily or behind try/except
+#  (src/pipeline/brain_preprocessing.py guards SimpleITK + HD_BET;
+#  src/training/densenet_trainer.py guards mlflow/sklearn/tqdm; peft only
+#  in the MedGemma LoRA path) and the server never needs them.
+# ============================================================================
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+# --- PyTorch (CPU-only build from the PyTorch index) -------------------------
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
+
+# --- HuggingFace model stack (ViT / ResNet classifiers, local safetensors) ---
+transformers==5.6.2
+tokenizers==0.22.2
+safetensors==0.7.0
+huggingface_hub==1.11.0
+tqdm==4.67.3
+
+# --- DICOM (compressed transfer syntaxes: JPEG / JPEG2000 / JPEG-LS / RLE) ---
+pydicom==3.0.2
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.4.0
+pylibjpeg-openjpeg==2.5.0
+pylibjpeg-rle==2.2.0
+python-gdcm==3.2.6
+
+# --- Medical imaging runtime ------------------------------------------------
+monai==1.5.2
+torchxrayvision==1.4.0
+imageio==2.37.3
+nibabel==5.4.2
+pandas==2.3.3          # hard import of torchxrayvision.datasets at module load
+
+# --- Numerics / image processing ---------------------------------------------
+numpy==2.4.4
+scipy==1.17.1
+scikit-image==0.26.0
+opencv-python-headless==4.13.0.92
+pillow==12.2.0
+
+# --- Inference server --------------------------------------------------------
+fastapi==0.136.0
+starlette==1.0.0
+uvicorn[standard]==0.45.0   # [standard] = httptools/websockets/colorama; uvloop is marker-excluded on win32
+python-multipart==0.0.26
+pydantic==2.13.3
+loguru==0.7.3
+
+# --- Security (auth, JWT, license, encrypted weights) ------------------------
+cryptography==46.0.7
+bcrypt==5.0.0
+python-jose[cryptography]==3.5.0
+
+# --- Utilities ---------------------------------------------------------------
+requests==2.33.1
+pyyaml==6.0.3
