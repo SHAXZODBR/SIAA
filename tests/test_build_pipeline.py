@@ -327,3 +327,34 @@ def test_verify_only_passes_on_the_real_validated_model_if_present():
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "identity 0d559766ce58" in r.stdout    # the MANIFEST pin every document quotes
+
+
+def test_fetch_model_bundle_multipart_manifest(tmp_path):
+    """MODEL_BUNDLE_URL may be a JSON manifest of <100 MB parts (GitHub times out on big
+    single uploads): parts are concatenated in order and the whole-zip sha256 verified."""
+    import hashlib, json, subprocess, sys, zipfile
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    model_dir = tmp_path / 'src' / 'brain_triage_finetuned'; model_dir.mkdir(parents=True)
+    (model_dir / 'config.json').write_text('{"architectures":["ViTForImageClassification"]}')
+    (model_dir / 'model.safetensors').write_bytes(b'\x00' * 5000)
+    files = {n: hashlib.sha256((model_dir / n).read_bytes()).hexdigest() for n in ('config.json', 'model.safetensors')}
+    (model_dir / 'MANIFEST.json').write_text(json.dumps({'algorithm': 'sha256', 'files': files}))
+    zpath = tmp_path / 'bundle.zip'
+    with zipfile.ZipFile(zpath, 'w') as zf:
+        for f in model_dir.iterdir(): zf.write(f, f'brain_triage_finetuned/{f.name}')
+    data = zpath.read_bytes(); n = 3; step = (len(data) + n - 1) // n
+    parts = []
+    for i in range(n):
+        pp = tmp_path / f'p{i}'; pp.write_bytes(data[i * step:(i + 1) * step]); parts.append(pp.as_uri())
+    man = tmp_path / 'm.json'; man.write_text(json.dumps({'parts': parts, 'sha256': hashlib.sha256(data).hexdigest()}))
+    dest = tmp_path / 'dest'
+    r = subprocess.run([sys.executable, str(root / 'packaging' / 'fetch_model_bundle.py'), '--dest', str(dest),
+                        '--url', man.as_uri()], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (dest / 'brain_triage_finetuned' / 'model.safetensors').read_bytes() == b'\x00' * 5000
+    # tampered hash → refused
+    man.write_text(json.dumps({'parts': parts, 'sha256': '0' * 64}))
+    r = subprocess.run([sys.executable, str(root / 'packaging' / 'fetch_model_bundle.py'), '--dest', str(tmp_path / 'dest2'),
+                        '--url', man.as_uri()], capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0 and 'sha256' in (r.stdout + r.stderr)

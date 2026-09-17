@@ -132,6 +132,34 @@ def download(url: str, out: Path, token: str = '') -> None:
         shutil.copyfileobj(resp, f, 1 << 20)
 
 
+def download_multipart(manifest_url: str, out: Path, token: str = '') -> None:
+    """MODEL_BUNDLE_URL may point at a small JSON manifest instead of the zip itself —
+    GitHub's upload endpoint times out on single large assets, so the zip is shipped as
+    <100 MB parts:  {"parts": [<url>, ...], "sha256": "<hex of the whole zip>"}.
+    Parts are fetched in order (same auth), concatenated, and the whole-zip hash verified."""
+    with tempfile.TemporaryDirectory(prefix='sentinel-bundle-parts-') as td:
+        mpath = Path(td) / 'manifest.json'
+        download(manifest_url, mpath, token)
+        try:
+            manifest = json.loads(mpath.read_text(encoding='utf-8'))
+            parts = list(manifest['parts']); expected = str(manifest.get('sha256', '')).lower()
+        except Exception as e:
+            raise ValueError(f'bad bundle manifest: {e}')
+        if not parts:
+            raise ValueError('bundle manifest lists no parts')
+        with open(out, 'wb') as fout:
+            for i, purl in enumerate(parts):
+                ppath = Path(td) / f'part-{i:02d}'
+                download(purl, ppath, token)
+                with open(ppath, 'rb') as fin:
+                    shutil.copyfileobj(fin, fout, 1 << 20)
+                print(f'  part {i + 1}/{len(parts)}: {ppath.stat().st_size / 1e6:.0f} MB')
+        if expected:
+            actual = sha256_file(out)
+            if actual != expected:
+                raise ValueError(f'assembled zip sha256 {actual[:12]} != manifest {expected[:12]}')
+
+
 def _safe_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     members = []
     for info in zf.infolist():
@@ -240,7 +268,10 @@ def main(argv=None) -> int:
         with tempfile.TemporaryDirectory(prefix='sentinel-bundle-') as td:
             zip_path = Path(td) / 'bundle.zip'
             try:
-                download(url, zip_path, token)
+                if urlparse(url).path.lower().endswith('.json') or url.lower().endswith('.json'):
+                    download_multipart(url, zip_path, token)
+                else:
+                    download(url, zip_path, token)
             except Exception as e:
                 return _fail(f'download failed: {type(e).__name__}: {e}')
             print(f'  downloaded {zip_path.stat().st_size / 1e6:.0f} MB')
