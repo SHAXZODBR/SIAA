@@ -58,6 +58,7 @@ env:
 jobs:
   windows:
     name: Windows installer (NSIS x64)
+    environment: MODEL_BUNDLE_URL   # the secrets MODEL_BUNDLE_URL / MODEL_BUNDLE_TOKEN live in this GitHub environment
     runs-on: windows-latest
     timeout-minutes: 240
     defaults:
@@ -198,6 +199,7 @@ jobs:
 
   macos:
     name: macOS installer (DMG arm64)
+    environment: MODEL_BUNDLE_URL   # the secrets MODEL_BUNDLE_URL / MODEL_BUNDLE_TOKEN live in this GitHub environment
     runs-on: macos-latest      # Apple Silicon runner -> arm64 backend + arm64 DMG (an Intel DMG needs an Intel runner)
     timeout-minutes: 240
     defaults:
