@@ -102,8 +102,15 @@ jobs:
 
       - name: Download public models (${{ env.PUBLIC_MODEL_KEYS }})
         run: |
-          & $env:PYTHON scripts\download_all_models.py --only $env:PUBLIC_MODEL_KEYS --dest models
-          if ($LASTEXITCODE -ne 0) { throw "download_all_models.py failed ($LASTEXITCODE)" }
+          # the script is resumable — retry a few times so a transient HF/DNS hiccup on the runner does not fail the build
+          $ok = $false
+          foreach ($attempt in 1..3) {
+            & $env:PYTHON scripts\download_all_models.py --only $env:PUBLIC_MODEL_KEYS --dest models
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "download attempt $attempt failed (exit $LASTEXITCODE); retrying in 30 s"
+            Start-Sleep -Seconds 30
+          }
+          if (-not $ok) { throw "download_all_models.py failed after 3 attempts" }
 
       - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
         id: bundle
@@ -232,7 +239,13 @@ jobs:
           key: public-models-${{ runner.os }}-${{ hashFiles('scripts/download_all_models.py', 'src/inference/model_registry.py') }}-v1
 
       - name: Download public models (${{ env.PUBLIC_MODEL_KEYS }})
-        run: '"$PYTHON" scripts/download_all_models.py --only "$PUBLIC_MODEL_KEYS" --dest models'
+        run: |
+          # resumable script — retry so a transient HF/DNS hiccup on the runner does not fail the build
+          for attempt in 1 2 3; do
+            "$PYTHON" scripts/download_all_models.py --only "$PUBLIC_MODEL_KEYS" --dest models && exit 0
+            echo "download attempt $attempt failed; retrying in 30 s"; sleep 30
+          done
+          echo "download_all_models.py failed after 3 attempts"; exit 1
 
       - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
         id: bundle
