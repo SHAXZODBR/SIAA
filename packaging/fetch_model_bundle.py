@@ -268,10 +268,18 @@ def main(argv=None) -> int:
         with tempfile.TemporaryDirectory(prefix='sentinel-bundle-') as td:
             zip_path = Path(td) / 'bundle.zip'
             try:
-                if urlparse(url).path.lower().endswith('.json') or url.lower().endswith('.json'):
-                    download_multipart(url, zip_path, token)
-                else:
-                    download(url, zip_path, token)
+                download(url, zip_path, token)
+                # A GitHub asset URL carries no extension: sniff the bytes. A zip starts
+                # with 'PK'; anything else that parses as JSON with a 'parts' list is the
+                # multipart manifest (see download_multipart).
+                head = zip_path.read_bytes()[:4096]
+                if not head.startswith(b'PK'):
+                    try:
+                        maybe = json.loads(head.decode('utf-8', 'ignore')) if head.strip().startswith(b'{') else None
+                    except Exception:
+                        maybe = None
+                    if isinstance(maybe, dict) and 'parts' in maybe:
+                        download_multipart(url, zip_path, token)
             except Exception as e:
                 return _fail(f'download failed: {type(e).__name__}: {e}')
             print(f'  downloaded {zip_path.stat().st_size / 1e6:.0f} MB')
