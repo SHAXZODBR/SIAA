@@ -142,6 +142,47 @@ def test_smoke_steps_run_after_freeze_and_before_electron_build():
         assert smoke["env"]["SENTINEL_MODELS_DIR"].endswith("models")
 
 
+IDENTITY_STEP = "Verify bundle identity matches the code"
+PIN_SNIPPET = "import src.inference.validated_metrics as m; print(m.FALLBACK_IDENTITY)"
+
+
+def test_bundle_identity_is_checked_against_the_code_pin_in_both_jobs():
+    """The model CI restores comes from the hand-set MODEL_BUNDLE_URL secret; the numbers and
+    identity the app/docs quote come from the committed bump (validated_metrics.FALLBACK_IDENTITY).
+    Both jobs must fail when they differ, right after the restore, before anything is built."""
+    from src.inference import validated_metrics as vm
+    assert re.fullmatch(r"[0-9a-f]{12}", vm.FALLBACK_IDENTITY), vm.FALLBACK_IDENTITY
+    fetch_src = FETCH.read_text(encoding="utf-8")
+    assert "_gh_output('model_identity', identity)" in fetch_src      # the output the step compares
+    for job, fail in (("windows", 'throw "bundle identity'), ("macos", "exit 1")):
+        steps = _steps(job)
+        names = [s.get("name", s.get("uses", "")) for s in steps]
+        restore = next(i for i, n in enumerate(names) if n.startswith("Restore validated triage model"))
+        assert steps[restore]["id"] == "bundle"
+        step = steps[restore + 1]
+        assert step.get("name") == IDENTITY_STEP, (job, names)
+        assert names.count(IDENTITY_STEP) == 1, (job, names)
+        assert restore + 1 < next(i for i, n in enumerate(names) if "Smoke-test" in n)
+        assert step["if"] == "steps.bundle.outputs.have_bundle == '1'", job
+        assert step["env"] == {"BUNDLE_IDENTITY": "${{ steps.bundle.outputs.model_identity }}"}, job
+        run = step["run"]
+        assert f'-c "{PIN_SNIPPET}"' in run, (job, run)
+        # both values are printed, a mismatch is annotated and fails the job
+        assert run.count("BUNDLE_IDENTITY") >= 3 and "pinned" in run, (job, run)
+        assert "::error title=Bundle identity mismatch::" in run and fail in run, job
+    assert "set -euo pipefail" in _steps("macos")[[s.get("name") for s in _steps("macos")].index(IDENTITY_STEP)]["run"]
+
+
+def test_bundle_identity_snippet_prints_the_pin_from_the_repo_root():
+    """What the CI step executes, run the same way (cwd = checkout root, plain `python -c`)."""
+    from src.inference import validated_metrics as vm
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "SENTINEL_MODEL_DIR_OVERRIDE_BRAIN_TRIAGE")}
+    r = subprocess.run([sys.executable, "-c", PIN_SNIPPET], cwd=str(REPO), env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip().splitlines()[-1] == vm.FALLBACK_IDENTITY
+
+
 def test_secrets_are_consumed_by_the_workflow_and_documented_everywhere():
     text = WORKFLOW.read_text(encoding="utf-8")
     for name in SECRETS:
@@ -326,7 +367,8 @@ def test_verify_only_passes_on_the_real_validated_model_if_present():
     r = subprocess.run([sys.executable, str(FETCH), "--dest", str(real.parent), "--verify-only"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "identity 0d559766ce58" in r.stdout    # the MANIFEST pin every document quotes
+    from src.inference import validated_metrics as vm      # the MANIFEST pin every document quotes
+    assert f"identity {vm.load(real, strict=True).identity}" in r.stdout
 
 
 def test_fetch_model_bundle_multipart_manifest(tmp_path):

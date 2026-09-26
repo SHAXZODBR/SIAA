@@ -192,31 +192,68 @@ def test_detector_statuses_match_brain_analysis():
 
 
 def test_validated_numbers_match_eval_json_and_manifest():
-    ev = json.loads(_read("models/brain_triage_finetuned/study_level_eval.json"))
-    gate = ev["gate"]
-    assert round(gate["sens"], 2) == 0.90 and round(gate["spec"], 2) == 0.47
-    assert (gate["tp"], gate["fn"], gate["tn"], gate["fp"]) == (118, 13, 22, 25)
-    assert (gate["min_sens"], gate["min_spec"], gate["passed"]) == (0.85, 0.4, True)
-    assert ev["n_studies"] == 178 and ev["n_slices"] == 890
-    assert ev["evaluated_at"].startswith("2026-09-07")
-    man = json.loads(_read("models/brain_triage_finetuned/MANIFEST.json"))
-    assert man["files"]["model.safetensors"].startswith("0d559766ce58")
-    gate_src = _read("scripts/eval_study_level.py")
-    assert "default=0.85" in gate_src and "default=0.40" in gate_src
+    """Single source of truth: models/brain_triage_finetuned/{study_level_eval,MANIFEST}.json,
+    read by src/inference/validated_metrics.py (loaded by path — torch-free, no src package
+    import). No literal numbers here: the expectations are derived from the JSON (or from the
+    module's FALLBACK block when the model is not in this checkout, e.g. CI), and
+    scripts/bump_model_release.py --check proves every pinned copy in the docs matches."""
+    import importlib.util
+    import subprocess
+    import sys
 
+    spec = importlib.util.spec_from_file_location("_docs_validated_metrics", REPO / "src/inference/validated_metrics.py")
+    vm = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = vm     # dataclasses resolve `from __future__` annotations via sys.modules
+    spec.loader.exec_module(vm)
+    m = vm.METRICS
+
+    ev_path = REPO / "models/brain_triage_finetuned/study_level_eval.json"
+    man_path = REPO / "models/brain_triage_finetuned/MANIFEST.json"
+    if ev_path.exists() and man_path.exists():
+        assert m.source == "json", m
+        ev = json.loads(ev_path.read_text(encoding="utf-8"))
+        gate = ev["gate"]
+        assert gate["passed"] is True
+        assert (m.tp, m.fn, m.tn, m.fp) == (gate["tp"], gate["fn"], gate["tn"], gate["fp"])
+        assert (m.sens, m.spec, m.min_sens, m.min_spec) == (gate["sens"], gate["spec"], gate["min_sens"], gate["min_spec"])
+        assert (m.n_studies, m.n_slices) == (ev["n_studies"], ev["n_slices"])
+        assert ev["evaluated_at"].startswith(m.evaluated_on)
+        man = json.loads(man_path.read_text(encoding="utf-8"))
+        assert man["files"]["model.safetensors"].startswith(m.identity)
+    else:
+        assert m.source == "fallback", m
+    # internal consistency + the gate the release was shipped under
+    assert m.n_studies == m.n_abnormal + m.n_normal == m.tp + m.fn + m.tn + m.fp
+    assert m.sens >= m.min_sens and m.spec >= m.min_spec
+    assert len(m.identity) == 12 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", m.evaluated_on)
+    gate_src = _read("scripts/eval_study_level.py")
+    assert f"default={m.min_sens:.2f}" in gate_src and f"default={m.min_spec:.2f}" in gate_src
+
+    # the documents quote exactly these values (decimal comma in RU/UZ)
     for lang in LANGS:
         iu = _doc("intended_use", lang)
-        assert "178" in iu and "118" in iu and "131" in iu and "22" in iu and "890" in iu, lang
-        assert "0d559766ce58" in iu, lang
-        assert "2026-09-07" in iu, lang
+        for tok in (str(m.n_studies), str(m.tp), str(m.n_abnormal), str(m.tn), str(m.n_normal),
+                    str(m.n_slices), m.identity, m.evaluated_on, vm.ci(m.spec_ci, lang)):
+            assert tok in iu, (lang, tok)
         for stem in ("user_manual", "intended_use", "pilot_evaluation_protocol"):
             text = _doc(stem, lang)
-            assert re.search(r"0[.,]90", text) and re.search(r"0[.,]47", text) and "178" in text, (stem, lang)
+            assert vm.dec(m.sens, lang) in text and vm.dec(m.spec, lang) in text and str(m.n_studies) in text, (stem, lang)
         for stem in ("intended_use", "pilot_evaluation_protocol", "admin_install_guide"):
             text = _doc(stem, lang)
-            assert re.search(r"0[.,]85", text) and re.search(r"0[.,]40", text), (stem, lang)
+            assert vm.dec(m.min_sens, lang) in text and vm.dec(m.min_spec, lang) in text, (stem, lang)
+        assert m.identity in _doc("admin_install_guide", lang), lang
     readme = (DOCS / "README.md").read_text(encoding="utf-8")
-    assert "0.90" in readme and "0.47" in readme and "178" in readme and "0d559766ce58" in readme
+    assert vm.dec(m.sens) in readme and vm.dec(m.spec) in readme and str(m.n_studies) in readme and m.identity in readme
+
+    # the runtime strings (report templates / registry notes) are generated from the same module
+    for lang in LANGS:
+        assert vm.pct(m.sens) in vm.triage_note(lang) and vm.pct(m.spec) in vm.triage_note(lang), lang
+    assert vm.dec(m.sens) in vm.registry_notes() and str(m.n_studies) in vm.registry_notes()
+
+    # every pinned copy (12 docs, READMEs, laptop checklists, the FALLBACK block) is in sync
+    r = subprocess.run([sys.executable, str(REPO / "scripts/bump_model_release.py"), "--check"],
+                       cwd=REPO, capture_output=True, text=True)
+    assert r.returncode == 0, "stale pinned numbers — run scripts/bump_model_release.py\n" + r.stdout + r.stderr
 
 
 def test_ui_strings_quoted_in_manual_exist_in_app_dictionaries():

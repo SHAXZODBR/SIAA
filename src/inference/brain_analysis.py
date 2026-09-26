@@ -35,6 +35,7 @@ from loguru import logger
 
 from src.pipeline.brain_mri_preprocessor import (
     process_brain_study, BrainStudy, central_band_best_slice, robust_normalize_slice,
+    triage_sequence, central_slice_indices, TRIAGE_N_CENTRAL_SLICES,
 )
 
 
@@ -92,22 +93,36 @@ def _to_model_input(slc: np.ndarray) -> np.ndarray:
 
 def _triage_mean_probs(study: BrainStudy, sequence: str, predictor) -> dict:
     """Mean class-probs over up to 5 central slices of the given sequence —
-    the SAME protocol the local triage model was validated with (study-level
-    sens 0.90 / spec 0.47 on 178 held-out local patients). Single-slice
-    inference would be a different, unvalidated operating point."""
+    the SAME protocol the local triage model was trained and validated with
+    (study-level sens / spec on the held-out local patients: see
+    src/inference/validated_metrics.py, read from study_level_eval.json).
+    Single-slice inference would be a different, unvalidated operating point.
+
+    Preprocessing protocol (must stay identical to scripts/eval_study_level.py
+    and scripts/build_training_set.py, guarded by
+    tests/test_triage_protocol_parity.py):
+        native-resolution slice → registry predictor (processor bilinear
+        resize to 224).
+    The normalized slice (float [0,1], 2-D, native resolution) goes STRAIGHT
+    to the registry predictor, whose 2-D branch quantises to uint8 → RGB PIL →
+    ViTImageProcessor (bilinear resize to 224×224) — exactly what the training
+    PNGs (uint8 native-resolution, written by build_training_set.py) go through
+    at train and gate time. Do NOT route this through _to_model_input(): its
+    PIL bicubic pre-resize to 224 is a different operating point (measured on
+    the 178-patient holdout: 8 study decisions flip, spec 0.47 → 0.40)."""
     vol = study.sequences[sequence]
     if vol.ndim != 3:
         slices = [robust_normalize_slice(vol)]
     else:
-        d = vol.shape[0]; c = d // 2
-        step = max(1, d // 12)
-        idxs = sorted(set(max(0, min(d - 1, c + off))
-                          for off in range(-2 * step, 2 * step + 1, step)))[:5]
-        slices = [robust_normalize_slice(vol[i]) for i in idxs]
+        # the slice rule shared with scripts/build_training_set.central_slices
+        slices = [robust_normalize_slice(vol[i])
+                  for i in central_slice_indices(vol.shape[0], TRIAGE_N_CENTRAL_SLICES)]
     acc: dict[str, float] = {}
     n = 0
     for slc in slices:
-        probs = predictor(_to_model_input(slc))
+        # native resolution, float [0,1]: the registry predictor's 2-D branch
+        # does uint8 → RGB → processor (bilinear 224) — same as training/eval
+        probs = predictor(np.asarray(slc, dtype=np.float32))
         clean = {k: float(v) for k, v in probs.items() if not k.startswith('_')}
         if not clean:
             continue
@@ -127,8 +142,9 @@ def _interpret_triage(probs: dict) -> list[dict]:
     if p_abn >= 0.5:
         return [{'positive': True, 'class': 'abnormal', 'confidence': float(p_abn),
                  'label': 'Abnormal study — prioritize for radiologist review (local triage)'}]
+    from src.inference.validated_metrics import sensitivity_note   # 'sensitivity 90%' from the eval JSON
     return [{'positive': False, 'class': 'normal', 'confidence': float(1 - p_abn),
-             'label': 'Not flagged by local triage (sensitivity 90% — not a normal certificate)'}]
+             'label': f'Not flagged by local triage ({sensitivity_note("en")} — not a normal certificate)'}]
 
 
 def _interpret_tumor(probs: dict) -> list[dict]:
@@ -178,8 +194,8 @@ def _interpret_stroke(probs: dict) -> list[dict]:
 
 DETECTORS = [
     # Local Uzbek-trained triage — the only detector validated on local data
-    # (study-level sens 0.90 / spec 0.47, 178 held-out patients). Runs the
-    # SAME 5-central-slice mean protocol it was validated with.
+    # (study-level sens / spec on held-out patients: src/inference/validated_metrics.py).
+    # Runs the SAME 5-central-slice mean protocol it was validated with.
     Detector('triage', 'Study triage — normal vs abnormal (local)', 'validated', 'brain_triage',
              ('T1ce', 'T1', 'T2', 'FLAIR'), _interpret_triage),
     Detector('tumor_class', 'Brain tumor', 'pending', 'brain_tumor_class',
@@ -217,6 +233,7 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
 
     findings = []
     detectors_run = []
+    notes: list[str] = []
     preview_slice = None   # the routed classifier slice (full-res, [0,1]) for the viewer
     for det in DETECTORS:
         if det.status == 'experimental' and not include_experimental:
@@ -225,7 +242,20 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
         if not entry or not entry.get('available'):
             logger.debug(f"Detector {det.key} unavailable: {(entry or {}).get('reason','')}")
             continue
-        picked = _slice_for(study, det.sequence_pref)
+        if det.key == 'triage':
+            # the validated protocol only: an axial series with usable slices (the SAME rule
+            # the training set and the gate were built with). No such series → the triage is
+            # NOT run: a sagittal/coronal-only study is outside the validated population.
+            seq = triage_sequence(study)
+            if seq is None:
+                notes.append('Local triage not run: no axial series with usable slices — the '
+                             'triage model is validated on axial central slices only.')
+                continue
+            vol = study.sequences[seq]
+            slc = central_band_best_slice(vol) if vol.ndim == 3 else vol
+            picked = {'sequence': seq, 'slice': robust_normalize_slice(slc)}
+        else:
+            picked = _slice_for(study, det.sequence_pref)
         if picked is None:
             continue
         if preview_slice is None or det.key == 'tumor_class':
@@ -240,6 +270,15 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
             logger.warning(f"Detector {det.key} failed: {e}")
             continue
         detectors_run.append(det.key)
+        status = det.status
+        if det.key == 'triage':
+            from src.inference.validated_metrics import METRICS
+            if not METRICS.validated:
+                # the eval next to the model says it did NOT pass the release gate (e.g. an
+                # --allow-unvalidated demo bundle): never label its output 'validated'
+                status = 'pending'
+                notes.append(f'Local triage model is NOT a validated release '
+                             f'({METRICS.not_validated_reason}); its output is unverified.')
         for f in det.interpret(probs):
             findings.append({
                 'detector': det.key,
@@ -247,7 +286,7 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
                 'class_name': f.get('class'),
                 'confidence': round(f['confidence'], 4),
                 'positive': f['positive'],
-                'status': det.status,         # pending / experimental / validated
+                'status': status,             # pending / experimental / validated
                 'sequence_used': picked['sequence'],
             })
 
@@ -278,6 +317,7 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
         'findings': findings,
         'overall_assessment': overall_assessment,
         'has_brats_quartet': study.has_brats_quartet,
+        'notes': notes,
         'patient_id': study.patient_id,
         'study_uid': study.study_uid,
         # numpy array — callers must pop this before JSON-serialising the result

@@ -235,6 +235,9 @@ def _multiframe_spacing(ds, n_frames: int) -> tuple:
     return (1.0, 1.0, 1.0)
 
 
+SECONDARY_CAPTURE_SOP_PREFIX = '1.2.840.10008.5.1.4.1.1.7'   # SC image storage family
+
+
 def load_volume_from_series(series: BrainSeries) -> Optional[np.ndarray]:
     """Stack a series' DICOM into a 3D volume (D, H, W).
 
@@ -255,6 +258,12 @@ def load_volume_from_series(series: BrainSeries) -> Optional[np.ndarray]:
             if 'PixelData' not in ds:
                 logger.debug(f"Skipping (no pixels) {fp}")
                 continue
+            samples = int(getattr(ds, 'SamplesPerPixel', 1) or 1)
+            if samples > 1 and str(getattr(ds, 'SOPClassUID', '')).startswith(SECONDARY_CAPTURE_SOP_PREFIX):
+                # a colour Secondary Capture is a rendered screenshot / processed image (3-D
+                # render, annotated key image), not an acquired slice — never part of a volume
+                logger.debug(f"Skipping colour secondary capture {fp.name}")
+                continue
             try:
                 arr = ds.pixel_array.astype(np.float32)
             except Exception as decode_err:
@@ -265,6 +274,11 @@ def load_volume_from_series(series: BrainSeries) -> Optional[np.ndarray]:
                     f"(transfer syntax {getattr(getattr(ds,'file_meta',None),'TransferSyntaxUID','?')}): "
                     f"{decode_err}. Install pylibjpeg/gdcm for compressed DICOM.")
                 continue
+            if samples > 1 and arr.ndim >= 3 and arr.shape[-1] == samples:
+                # colour: single frame (H, W, S) / multi-frame (F, H, W, S) → luminance. Without
+                # this a single-frame RGB (H, W, 3) array was taken for a 3-D multi-frame volume
+                # and every "slice" became a (W, 3) strip (review round 2).
+                arr = arr.mean(axis=-1)
             slope = float(getattr(ds, 'RescaleSlope', 1.0) or 1.0)
             intercept = float(getattr(ds, 'RescaleIntercept', 0.0) or 0.0)
             arr = arr * slope + intercept
@@ -375,6 +389,47 @@ def resample_to_isotropic(volume: np.ndarray, current_spacing: tuple,
 # sequence — NOT FLAIR, which was the old default and a big driver of the
 # glioma over-calling on real Philips data. Preference order, best first:
 CLASSIFIER_SEQUENCE_PREFERENCE = ['T1ce', 'T1', 'T2', 'FLAIR']
+
+# ---- the brain-triage input rule, shared by production (src/inference/brain_analysis.py),
+# the training-set builder (scripts/build_training_set.py) and so the release gate: ONE place
+# decides which series and which slices the validated model sees.
+TRIAGE_N_CENTRAL_SLICES = 5
+# an in-plane side this small is a colour-channel axis or a thumbnail, never a brain slice
+MIN_SLICE_SIDE = 16
+MAX_SLICE_ASPECT = 4.0
+
+
+def is_usable_slice_shape(shape: tuple) -> bool:
+    """True for a 2-D (H, W) in-plane shape a slice-level classifier can be fed."""
+    if len(shape) != 2:
+        return False
+    lo, hi = min(shape), max(shape)
+    return lo >= MIN_SLICE_SIDE and hi / lo <= MAX_SLICE_ASPECT
+
+
+def triage_sequence(study: 'BrainStudy') -> Optional[str]:
+    """The series the brain-triage protocol scores: the first CLASSIFIER_SEQUENCE_PREFERENCE
+    series that is axial, else any axial series — only volumes with a usable in-plane shape.
+    None when the study has no such series: the triage model was trained and gated on AXIAL
+    central slices only (build_training_set.central_slices), so a sagittal/coronal-only study
+    is outside the validated population and must not get a 'validated' verdict."""
+    def ok(key: str) -> bool:
+        if (study.seq_meta.get(key, {}).get('orientation') or 'axial') != 'axial':
+            return False
+        vol = study.sequences[key]
+        return is_usable_slice_shape(vol.shape[1:] if vol.ndim == 3 else vol.shape)
+    for pref in CLASSIFIER_SEQUENCE_PREFERENCE:
+        if pref in study.sequences and ok(pref):
+            return pref
+    return next((k for k in study.sequences if ok(k)), None)
+
+
+def central_slice_indices(depth: int, k: int = TRIAGE_N_CENTRAL_SLICES) -> list[int]:
+    """Up to k central slice indices, step = depth // 12 (the validated protocol)."""
+    c = depth // 2
+    step = max(1, depth // 12)
+    offs = range(-(k // 2) * step, (k // 2 + 1) * step, step)
+    return sorted(set(max(0, min(depth - 1, c + off)) for off in offs))[:k]
 
 
 def robust_normalize_slice(slc: np.ndarray) -> np.ndarray:

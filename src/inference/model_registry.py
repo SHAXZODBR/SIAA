@@ -243,6 +243,8 @@ BRAIN_DEMENTIA = ModelCard(
 )
 
 
+from src.inference import validated_metrics as _validated_metrics  # torch-free; reads study_level_eval.json
+
 BRAIN_TRIAGE = ModelCard(
     modality='brain_triage',
     display_name='Study Triage — Normal vs Abnormal (local, Uzbek-trained)',
@@ -266,9 +268,9 @@ BRAIN_TRIAGE = ModelCard(
     tier='beta',
     license='proprietary',
     validation_status='validated',
-    notes='Trained AND validated on local patient studies: study-level sensitivity 0.90 / '
-          'specificity 0.47 at mean-prob 0.5 over 178 held-out local patients. Triage aid — '
-          'prioritizes studies for radiologist review; never certifies a scan as normal.',
+    # Numbers come from models/brain_triage_finetuned/study_level_eval.json via
+    # src/inference/validated_metrics.py — never typed here (they went stale).
+    notes=_validated_metrics.registry_notes(),
 )
 
 

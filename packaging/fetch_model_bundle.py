@@ -34,7 +34,13 @@ Environment:
     GITHUB_TOKEN          used automatically for api.github.com URLs when no
                           MODEL_BUNDLE_TOKEN is given (assets of the building repo itself)
     GITHUB_OUTPUT / GITHUB_STEP_SUMMARY   written when present:
-                          have_bundle=0|1, model_identity=<sha256_12>
+                          have_bundle=0|1, model_identity=<sha256_12>,
+                          bundle_validated=0|1 (multipart manifests only: 0 when the
+                          publisher marked the bundle "validated": false — demo builds)
+
+Multipart manifest detection: a download that does not start with 'PK' is sniffed (first
+64 KiB) and, when it looks like JSON, parsed whole — a manifest of any size up to 1 MiB is
+accepted (MANIFEST_MAX_BYTES; packaging/publish_model_bundle.py refuses to publish a bigger one).
 """
 from __future__ import annotations
 
@@ -55,6 +61,8 @@ MODEL_DIR_NAME = 'brain_triage_finetuned'
 MANIFEST_NAME = 'MANIFEST.json'
 _JUNK_PREFIXES = ('__MACOSX/',)
 _JUNK_NAMES = ('.DS_Store', 'Thumbs.db')
+MANIFEST_SNIFF_BYTES = 64 * 1024        # bytes looked at to tell a JSON manifest from a zip
+MANIFEST_MAX_BYTES = 1024 * 1024        # largest multipart manifest accepted (publish enforces it too)
 
 
 # ----------------------------------------------------------------------------
@@ -132,16 +140,42 @@ def download(url: str, out: Path, token: str = '') -> None:
         shutil.copyfileobj(resp, f, 1 << 20)
 
 
-def download_multipart(manifest_url: str, out: Path, token: str = '') -> None:
+def sniff_manifest(path: Path) -> dict | None:
+    """Return the parsed multipart manifest when `path` holds one, else None (a zip or
+    anything else). Looks at the first MANIFEST_SNIFF_BYTES: a zip starts with 'PK'; a
+    manifest starts with '{'. A JSON-looking file larger than MANIFEST_MAX_BYTES is an
+    error, not a zip (the old 4096-byte sniff silently handed an 18-part manifest to
+    zipfile -> 'File is not a zip file')."""
+    with open(path, 'rb') as f:
+        head = f.read(MANIFEST_SNIFF_BYTES)
+    if head.startswith(b'PK'):
+        return None
+    if not head.lstrip(b'\xef\xbb\xbf \t\r\n').startswith(b'{'):
+        return None
+    size = path.stat().st_size
+    if size > MANIFEST_MAX_BYTES:
+        raise ValueError(f'bundle manifest is {size} bytes (> {MANIFEST_MAX_BYTES}); re-publish with '
+                         f'larger parts (packaging/publish_model_bundle.py --part-mb)')
+    try:
+        maybe = json.loads(path.read_bytes().decode('utf-8-sig', 'ignore'))
+    except ValueError:
+        return None
+    return maybe if isinstance(maybe, dict) and 'parts' in maybe else None
+
+
+def download_multipart(manifest_url: str, out: Path, token: str = '') -> dict:
     """MODEL_BUNDLE_URL may point at a small JSON manifest instead of the zip itself —
     GitHub's upload endpoint times out on single large assets, so the zip is shipped as
     <100 MB parts:  {"parts": [<url>, ...], "sha256": "<hex of the whole zip>"}.
-    Parts are fetched in order (same auth), concatenated, and the whole-zip hash verified."""
+    Parts are fetched in order (same auth), concatenated, and the whole-zip hash verified.
+    Returns the manifest (provenance: identity, validated, eval summary)."""
     with tempfile.TemporaryDirectory(prefix='sentinel-bundle-parts-') as td:
         mpath = Path(td) / 'manifest.json'
         download(manifest_url, mpath, token)
+        if mpath.stat().st_size > MANIFEST_MAX_BYTES:
+            raise ValueError(f'bundle manifest is {mpath.stat().st_size} bytes (> {MANIFEST_MAX_BYTES})')
         try:
-            manifest = json.loads(mpath.read_text(encoding='utf-8'))
+            manifest = json.loads(mpath.read_bytes().decode('utf-8-sig'))
             parts = list(manifest['parts']); expected = str(manifest.get('sha256', '')).lower()
         except Exception as e:
             raise ValueError(f'bad bundle manifest: {e}')
@@ -158,6 +192,26 @@ def download_multipart(manifest_url: str, out: Path, token: str = '') -> None:
             actual = sha256_file(out)
             if actual != expected:
                 raise ValueError(f'assembled zip sha256 {actual[:12]} != manifest {expected[:12]}')
+    return manifest
+
+
+def _warn_unvalidated(manifest: dict) -> None:
+    """The publisher marks a bundle made with --allow-unvalidated as "validated": false.
+    Such a build is for demos only — say so loudly (the build itself is not failed)."""
+    if manifest.get('validated') is not False:
+        _gh_output('bundle_validated', '1')
+        return
+    why = '; '.join(str(p) for p in manifest.get('validation_problems') or []) or 'no reason recorded'
+    banner = '!' * 78
+    print(banner)
+    print('  WARNING: this bundle was published with --allow-unvalidated ("validated": false).')
+    print(f'  Reason(s): {why}')
+    print('  DEMO BUILDS ONLY -- do NOT ship an installer made from it to a clinic.')
+    print(banner)
+    if os.environ.get('GITHUB_ACTIONS'):
+        print(f'::warning title=UNVALIDATED model bundle::published with --allow-unvalidated ({why}) - demo builds only')
+    _gh_output('bundle_validated', '0')
+    _gh_summary(f'- :warning: Model bundle is **UNVALIDATED** (published with --allow-unvalidated: {why}) — demo builds only')
 
 
 def _safe_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
@@ -270,16 +324,10 @@ def main(argv=None) -> int:
             try:
                 download(url, zip_path, token)
                 # A GitHub asset URL carries no extension: sniff the bytes. A zip starts
-                # with 'PK'; anything else that parses as JSON with a 'parts' list is the
-                # multipart manifest (see download_multipart).
-                head = zip_path.read_bytes()[:4096]
-                if not head.startswith(b'PK'):
-                    try:
-                        maybe = json.loads(head.decode('utf-8', 'ignore')) if head.strip().startswith(b'{') else None
-                    except Exception:
-                        maybe = None
-                    if isinstance(maybe, dict) and 'parts' in maybe:
-                        download_multipart(url, zip_path, token)
+                # with 'PK'; a JSON object with a 'parts' list (any size up to
+                # MANIFEST_MAX_BYTES) is the multipart manifest (see download_multipart).
+                if sniff_manifest(zip_path) is not None:
+                    _warn_unvalidated(download_multipart(url, zip_path, token))
             except Exception as e:
                 return _fail(f'download failed: {type(e).__name__}: {e}')
             print(f'  downloaded {zip_path.stat().st_size / 1e6:.0f} MB')

@@ -78,7 +78,7 @@ population it actually serves.
 - ✅ **Working product** — desktop app (RU / UZ / EN interface, first-run clinic setup), inference server, whole-study DICOM ingest (thousands of files per study), multilingual reporting, PDF export
 - ✅ **Brain module** — a **locally trained normal-vs-abnormal triage model**, validated on **178 held-out Tashkent patients** (study-level sensitivity 0.90 / specificity 0.47), running alongside a public tumor classifier that is clearly labelled *pending validation*. The product **never certifies a scan as normal**.
 - ✅ **Hospital-grade plumbing** — authentication on by default, server-side report signing with a tamper-evident audit log, fully offline operation, model weights encrypted at rest, PACS auto-ingest (Orthanc) and signed reports filed back to PACS as DICOM Encapsulated PDF
-- ✅ **Quality gates** — automated test suite, a checksummed release gate a retrained model must pass before it ships, hospital documentation in RU / UZ / EN (`docs/`)
+- ✅ **Quality gates** — automated test suite, a checksummed release gate a retrained model must pass before it ships, a one-command resumable release pipeline for new hospital batches (`scripts/release_pipeline.py`, runbook in `docs/release_runbook_en.md` / `_ru.md`), hospital documentation in RU / UZ / EN (`docs/`)
 - 🔧 **In progress** — Windows installer (self-contained backend bundle + NSIS, built via CI), clinic pilot with radiologist-adjudicated evaluation
 - 🗺️ **Next** — more local *normal* studies to raise specificity, **spine** (highest-volume MRI referral), then broader multi-organ coverage
 

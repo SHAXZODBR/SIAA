@@ -192,23 +192,26 @@ DEMENTIA_DESCRIPTIONS = {
 # LOCAL TRIAGE (brain_triage panel detector — the only locally validated one)
 # ---------------------------------------------------------------------------
 
+# The validated numbers ("чувствительность 90%, специфичность 47%") are read
+# from models/brain_triage_finetuned/study_level_eval.json by validated_metrics
+# (torch-free) so a re-trained model never ships with stale figures in reports.
+from src.inference.validated_metrics import triage_note as _triage_note, sensitivity_note as _sens_note
+
 TRIAGE_DESCRIPTIONS = {
     'abnormal': {
-        'ru': ('Локальная модель триажа (валидирована на данных клиники: чувствительность 90%, '
-               'специфичность 47%) отнесла исследование к категории «патологические изменения» — '
-               'приоритетный просмотр рентгенологом.'),
-        'uz': ("Mahalliy triaj modeli (klinika ma'lumotlarida validatsiya qilingan: sezuvchanlik 90%, "
-               "spetsifiklik 47%) tekshiruvni «patologik o'zgarishlar» toifasiga kiritdi — "
-               "rentgenolog tomonidan ustuvor ko'rib chiqish."),
-        'en': ('The local triage model (validated on this clinic\'s data: sensitivity 90%, '
-               'specificity 47%) flagged this study as ABNORMAL — prioritize for radiologist review.'),
+        'ru': (f'Локальная модель триажа ({_triage_note("ru")}) отнесла исследование к категории '
+               '«патологические изменения» — приоритетный просмотр рентгенологом.'),
+        'uz': (f"Mahalliy triaj modeli ({_triage_note('uz')}) tekshiruvni «patologik o'zgarishlar» "
+               "toifasiga kiritdi — rentgenolog tomonidan ustuvor ko'rib chiqish."),
+        'en': (f'The local triage model ({_triage_note("en")}) flagged this study as ABNORMAL — '
+               'prioritize for radiologist review.'),
     },
     'normal': {
-        'ru': ('Локальная модель триажа не отметила исследование (чувствительность 90%) — '
+        'ru': (f'Локальная модель триажа не отметила исследование ({_sens_note("ru")}) — '
                'это НЕ заключение о норме.'),
-        'uz': ("Mahalliy triaj modeli tekshiruvni belgilamadi (sezuvchanlik 90%) — "
+        'uz': (f"Mahalliy triaj modeli tekshiruvni belgilamadi ({_sens_note('uz')}) — "
                "bu norma xulosasi EMAS."),
-        'en': ('The local triage model did not flag this study (sensitivity 90%) — '
+        'en': (f'The local triage model did not flag this study ({_sens_note("en")}) — '
                'this is NOT a normal read.'),
     },
 }
