@@ -4,7 +4,9 @@ packaging/ scripts it runs, plus unit tests of packaging/fetch_model_bundle.py.
 Nothing here needs Windows, Node, PyInstaller or the network: the workflow is validated as
 data (it parses, every repo file it references exists, every `npm run` script exists, model
 keys are registry keys, artifact paths match electron-builder's output dir, the versions it
-pins are the ones the admin guides quote) and the bundle restorer is exercised against
+pins are the ones the admin guides quote, the `tests` job gates both installer jobs, artifacts
+expire after one day, the clinic-flavour dispatch input skips only the model restore) and the
+bundle restorer is exercised against
 synthetic zips through file:// URLs. The PowerShell scripts can only be checked by
 inspection on this machine — they are covered for the invariants that must stay in sync
 with their bash twins.
@@ -63,9 +65,14 @@ def test_workflow_parses_with_expected_triggers_and_runners():
     assert on["push"]["tags"] == ["v*"]
     assert wf["jobs"]["windows"]["runs-on"] == "windows-latest"
     assert wf["jobs"]["macos"]["runs-on"] == "macos-latest"
+    assert wf["jobs"]["tests"]["runs-on"] == "ubuntu-latest"
     assert wf["jobs"]["windows"]["defaults"]["run"]["shell"] == "pwsh"
     assert wf["jobs"]["macos"]["defaults"]["run"]["shell"] == "bash"
     assert wf["permissions"] == {"contents": "write"}
+
+
+# Build outputs the workflow names (PyInstaller dist/work dirs): git-ignored, absent on a fresh checkout.
+BUILD_OUTPUT_DIRS = {"packaging/dist", "packaging/build"}
 
 
 def test_workflow_references_only_existing_repo_files():
@@ -73,12 +80,39 @@ def test_workflow_references_only_existing_repo_files():
     text = "\n".join(l for l in WORKFLOW.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
     refs = set(re.findall(r"(?:packaging|scripts)[\\/][A-Za-z0-9_.]+", text))
     assert refs, "workflow references no packaging/ or scripts/ files"
-    missing = [r for r in refs if not (REPO / r.replace("\\", "/")).exists()]
+    # PyInstaller's output dirs are produced BY the build (git-ignored), so a fresh CI
+    # checkout never has them — they must not count as missing repo files.
+    norm = {r.replace("\\", "/") for r in refs}
+    outputs = norm & BUILD_OUTPUT_DIRS
+    gitignore = (REPO / ".gitignore").read_text(encoding="utf-8").splitlines()
+    for out in outputs:
+        assert f"{out}/" in gitignore, f"{out} is referenced as build output but not git-ignored"
+    missing = sorted(r for r in norm - BUILD_OUTPUT_DIRS if not (REPO / r).exists())
     assert not missing, missing
     # both freeze twins and both smoke twins are wired in
     for name in ("build_backend.ps1", "build_backend.sh", "smoke_backend.ps1", "smoke_backend.sh",
                  "fetch_model_bundle.py"):
         assert any(r.endswith(name) for r in refs), name
+
+
+def test_workflow_refs_exist_on_a_fresh_checkout():
+    """The CI `tests` job runs on a FRESH checkout (no git-ignored files): every packaging/ or
+    scripts/ path the workflow names, other than the build's own output dirs, must be tracked
+    (or at least not ignored) — a path that only exists on the developer Mac breaks CI."""
+    try:
+        r = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=REPO,
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        pytest.skip(f"git unavailable: {e}")
+    if r.returncode != 0:
+        pytest.skip(f"not a git checkout: {r.stderr.strip()[:200]}")
+    files = set(r.stdout.splitlines())
+    dirs = {str(Path(f).parent.as_posix()) for f in files}
+    dirs |= {p for d in list(dirs) for p in (str(x.as_posix()) for x in Path(d).parents)}
+    text = "\n".join(l for l in WORKFLOW.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
+    refs = {x.replace("\\", "/") for x in re.findall(r"(?:packaging|scripts)[\\/][A-Za-z0-9_.]+", text)}
+    absent = sorted(x for x in refs - BUILD_OUTPUT_DIRS if x not in files and x not in dirs)
+    assert not absent, f"not in a fresh checkout: {absent}"
 
 
 def test_workflow_npm_scripts_exist_in_package_json():
@@ -124,7 +158,13 @@ def test_torch_is_cpu_pinned_and_versions_match_the_docs():
     assert re.fullmatch(r"\d+\.\d+\.\d+", env["TORCHVISION_VERSION"])
     assert env["PYTHON_VERSION"] == "3.11" and env["NODE_VERSION"] == "20"
     text = WORKFLOW.read_text(encoding="utf-8")
-    assert text.count("--index-url $env:TORCH_INDEX_URL") == 1 and text.count('--index-url "$TORCH_INDEX_URL"') == 1
+    assert text.count("--index-url $env:TORCH_INDEX_URL") == 1 and text.count('--index-url "$TORCH_INDEX_URL"') == 2
+    # one CPU-torch install per job, every one from the pinned index with the pinned versions
+    for job, frag in (("windows", "--index-url $env:TORCH_INDEX_URL"), ("macos", '--index-url "$TORCH_INDEX_URL"'),
+                      ("tests", '--index-url "$TORCH_INDEX_URL"')):
+        runs = "\n".join(str(s.get("run", "")) for s in _steps(job))
+        assert runs.count(frag) == 1, job
+        assert "TORCH_VERSION" in runs and "TORCHVISION_VERSION" in runs, job
     for lang in LANGS:
         g = _guide(lang)
         assert f"PyTorch {env['TORCH_VERSION']}" in g and f"torchvision {env['TORCHVISION_VERSION']}" in g, lang
@@ -239,6 +279,15 @@ def test_spec_is_windows_aware_and_matches_electron_launcher():
     assert "'backend', 'sentinel-backend'" in main_js   # resources/backend/sentinel-backend/<exe>
     extra = _package_json()["build"]["extraResources"]
     assert any(e["from"] == "../packaging/dist/sentinel-backend" and e["to"] == "backend/sentinel-backend" for e in extra)
+
+
+def test_spec_ships_the_bundle_extractor_the_server_loads():
+    """POST /models/import uses packaging/fetch_model_bundle.extract_bundle via
+    REPO_ROOT/packaging/… — the frozen backend must carry that file."""
+    spec = _text("packaging/sentinel_backend.spec")
+    assert "(os.path.join(ROOT, 'packaging', 'fetch_model_bundle.py'), 'packaging')" in spec
+    server = _text("src/inference/server.py")
+    assert "REPO_ROOT / 'packaging' / 'fetch_model_bundle.py'" in server
 
 
 def test_smoke_scripts_share_the_health_contract():
@@ -400,3 +449,178 @@ def test_fetch_model_bundle_multipart_manifest(tmp_path):
     r = subprocess.run([sys.executable, str(root / 'packaging' / 'fetch_model_bundle.py'), '--dest', str(tmp_path / 'dest2'),
                         '--url', man.as_uri()], capture_output=True, text=True, timeout=120)
     assert r.returncode != 0 and 'sha256' in (r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------- v1.1.0 CI gate / retention / clinic flavour
+
+BUILDERS = ("windows", "macos")
+RESTORE_IF = "github.event_name != 'workflow_dispatch' || inputs.include_validated_model"
+SKIP_IF = "github.event_name == 'workflow_dispatch' && !inputs.include_validated_model"
+
+
+def test_tests_job_runs_the_suite_and_gates_both_installer_jobs():
+    """D7: the suite runs before any installer is built; a red suite produces no installer."""
+    wf = _workflow()
+    job = wf["jobs"]["tests"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job.get("permissions") == {"contents": "read"}, "the test job needs no write token"
+    assert "environment" not in job, "the test job must not see the MODEL_BUNDLE_URL environment secrets"
+    assert job["env"] == {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}, "the CI test run must be hermetic"
+    for name in BUILDERS:
+        assert wf["jobs"][name]["needs"] in ("tests", ["tests"]), name
+    steps = job["steps"]
+    setup = next(s for s in steps if str(s.get("uses", "")).startswith("actions/setup-python"))
+    assert setup["with"]["python-version"] == "${{ env.PYTHON_VERSION }}"
+    assert setup["with"]["cache"] == "pip"
+    assert "requirements.txt" in setup["with"]["cache-dependency-path"]
+    runs = [str(s.get("run", "")) for s in steps]
+    install = next(r for r in runs if "pip install" in r)
+    assert '"torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" --index-url "$TORCH_INDEX_URL"' in install
+    assert "-r requirements.txt -r requirements-dev.txt --extra-index-url \"$TORCH_INDEX_URL\"" in install
+    assert 'expected $TORCH_VERSION' in install and "set -euo pipefail" in install
+    assert '"$PYTHON" -m pytest -q -m "not slow"' in runs
+    assert '"$PYTHON" -m pytest -q docs/test_docs_consistency.py docs/sales/test_sales_docs.py' in runs
+    # the desktop half of the suite runs in the same gate (node --test + tsc), without the Electron binary
+    desktop = next(s for s in steps if s.get("working-directory") == "desktop-app")
+    assert all(cmd in desktop["run"] for cmd in ("npm ci", "npm run type-check", "npm test")), desktop["run"]
+    assert desktop["env"] == {"ELECTRON_SKIP_BINARY_DOWNLOAD": "1"}
+    assert _package_json()["scripts"]["test"].startswith("node --test")
+    node = next(s for s in steps if str(s.get("uses", "")).startswith("actions/setup-node"))
+    assert node["with"]["node-version"] == "${{ env.NODE_VERSION }}" and node["with"]["cache"] == "npm"
+    # no secrets and no artifacts from the test job
+    job_text = yaml.safe_dump(job)
+    assert "secrets." not in job_text
+    assert not any(str(s.get("uses", "")).startswith("actions/upload-artifact") for s in steps)
+    # requirements-dev.txt really carries pytest (what the job relies on)
+    assert re.search(r"^pytest\b", _text("requirements-dev.txt"), re.M)
+    assert "slow:" in _text("pytest.ini"), "the -m 'not slow' filter needs the registered marker"
+
+
+def test_installer_artifacts_expire_after_one_day():
+    """D7: the code repository is public — installers must not stay downloadable."""
+    uploads = [s for job in BUILDERS for s in _steps(job)
+               if str(s.get("uses", "")).startswith("actions/upload-artifact")]
+    assert len(uploads) == 2
+    for s in uploads:
+        assert s["with"]["retention-days"] == 1, s["with"]
+    # tag builds still only create DRAFT releases
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("gh release create") == 2 and text.count("--draft") == 2
+    assert "gh release edit" not in text and "--draft=false" not in text
+
+
+def test_dispatch_input_include_validated_model_skips_only_the_restore_step():
+    """D3/D7: Run workflow with include_validated_model=false builds the clinic flavour
+    (...-NO-VALIDATED-MODEL); tag pushes keep restoring the model as before. Besides the
+    restore + notice, only the draft-release attach depends on the input (full flavour only)."""
+    wf = _workflow()
+    on = wf.get("on") or wf.get(True)
+    inp = on["workflow_dispatch"]["inputs"]["include_validated_model"]
+    assert inp["type"] == "boolean" and inp["default"] is True
+    assert on["push"] == {"tags": ["v*"]}, "tag pushes are unchanged"
+    for job in BUILDERS:
+        steps = _steps(job)
+        names = [s.get("name", s.get("uses", "")) for s in steps]
+        restore = next(i for i, n in enumerate(names) if n.startswith("Restore validated triage model"))
+        assert steps[restore]["if"] == RESTORE_IF, job
+        # a visible notice replaces it in the clinic flavour, and nothing else is conditional on the input
+        note = next(i for i, n in enumerate(names) if n.startswith("Validated model excluded"))
+        assert steps[note]["if"] == SKIP_IF and note < restore, job
+        assert "provision_clinic.py" in steps[note]["run"] and "GITHUB_STEP_SUMMARY" in steps[note]["run"], job
+        conditional = [n for s, n in zip(steps, names) if "include_validated_model" in str(s.get("if", ""))]
+        attach = next(i for i, n in enumerate(names) if n.startswith("Attach to draft GitHub Release"))
+        assert sorted(conditional) == sorted([names[restore], names[note], names[attach]]), (job, conditional)
+        # with the restore skipped, have_bundle is empty -> the artifact falls back to NO-VALIDATED-MODEL,
+        # the identity check is skipped and the smoke test does not demand 'ok'
+        upload = next(s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact"))
+        assert upload["with"]["name"].endswith("|| 'NO-VALIDATED-MODEL' }}"), upload["with"]["name"]
+        ident = next(s for s in steps if s.get("name") == IDENTITY_STEP)
+        assert ident["if"] == "steps.bundle.outputs.have_bundle == '1'"
+    assert "${REQUIRE_VALIDATED:-0}" in _text("packaging/smoke_backend.sh")
+    assert "$env:REQUIRE_VALIDATED -eq '1'" in _text("packaging/smoke_backend.ps1")
+
+
+def _eval_if(expr: str, *, event: str, ref: str, include: bool) -> bool:
+    """Evaluate the small subset of GitHub expressions the attach/restore guards use."""
+    py = (expr.replace("&&", " and ").replace("||", " or ").replace("!inputs.", " not inputs.")
+          .replace("github.event_name", repr(event)).replace("inputs.include_validated_model", repr(include))
+          .replace("startsWith(github.ref, 'refs/tags/v')", repr(ref.startswith("refs/tags/v"))))
+    return bool(eval(py, {"__builtins__": {}}, {}))                       # noqa: S307 - test-only, fixed input
+
+
+@pytest.mark.parametrize("event,ref,include,attach", [
+    ("push", "refs/tags/v1.1.0", None, True),                 # tag push: full flavour attached
+    ("workflow_dispatch", "refs/tags/v1.1.0", True, True),    # full flavour dispatched on a tag
+    ("workflow_dispatch", "refs/tags/v1.1.0", False, False),  # clinic flavour on a tag: never clobbers
+    ("workflow_dispatch", "refs/heads/main", True, False),    # branch build: no release
+])
+def test_clinic_flavour_dispatched_on_a_tag_never_replaces_the_release_installer(event, ref, include, attach):
+    for job in BUILDERS:
+        step = next(s for s in _steps(job) if s.get("name", "").startswith("Attach to draft GitHub Release"))
+        assert _eval_if(step["if"], event=event, ref=ref, include=include) is attach, (job, event, ref, include)
+        assert "--clobber" in step["run"]              # same file names in both flavours → the guard is what protects it
+    group = _workflow()["concurrency"]["group"]
+    assert "github.event_name" in group and "inputs.include_validated_model" in group, group
+
+
+def _load_checker():
+    spec = importlib.util.spec_from_file_location("_check_bundle_release", PACKAGING / "check_bundle_release.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _release_dir(tmp_path: Path, *, evaluated_at: str, identity: str | None = None) -> Path:
+    from src.inference import validated_metrics as vm
+    d = tmp_path / "brain_triage_finetuned"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "MANIFEST.json").write_text(json.dumps({"algorithm": "sha256", "files": {
+        "model.safetensors": (identity or vm.FALLBACK_IDENTITY) + "0" * 52}}))
+    (d / "study_level_eval.json").write_text(json.dumps({
+        "gate": {"name": "gate mean @0.50", "sens": vm.FALLBACK_SENS, "spec": vm.FALLBACK_SPEC,
+                 "acc": vm.FALLBACK_ACC, "tp": vm.FALLBACK_TP, "fn": vm.FALLBACK_FN, "tn": vm.FALLBACK_TN,
+                 "fp": vm.FALLBACK_FP, "min_sens": vm.FALLBACK_MIN_SENS, "min_spec": vm.FALLBACK_MIN_SPEC,
+                 "passed": True},
+        "n_studies": vm.FALLBACK_N_STUDIES, "n_slices": vm.FALLBACK_N_SLICES, "evaluated_at": evaluated_at}))
+    return d
+
+
+def test_bundle_release_record_check_catches_a_re_dated_eval(tmp_path, capsys):
+    """Same weights (identity) re-evaluated: the bundle's eval date must equal the bumped pin."""
+    from src.inference import validated_metrics as vm
+    chk = _load_checker()
+    ok = _release_dir(tmp_path / "ok", evaluated_at=f"{vm.FALLBACK_EVALUATED_ON}T03:02:43")
+    assert chk.main(["--model-dir", str(ok)]) == 0
+    stale = _release_dir(tmp_path / "stale", evaluated_at="2031-01-15T10:00:00")
+    assert chk.main(["--model-dir", str(stale)]) == 1
+    out = capsys.readouterr().out
+    assert "MISMATCH: evaluated_on" in out and "::error title=Bundle release mismatch::" in out
+    other = _release_dir(tmp_path / "other", evaluated_at=f"{vm.FALLBACK_EVALUATED_ON}T00:00:00",
+                         identity="abcdefabcdef")
+    assert chk.compare(other)[0] == 1
+    assert chk.main(["--model-dir", str(tmp_path / "missing")]) == 2
+
+
+def test_both_jobs_check_the_release_record_after_the_identity():
+    for job in BUILDERS:
+        steps = _steps(job)
+        names = [s.get("name", "") for s in steps]
+        i = names.index(IDENTITY_STEP)
+        rec = names.index("Verify bundle release record matches the code")
+        assert rec == i + 1, (job, names)
+        assert steps[rec]["if"] == "steps.bundle.outputs.have_bundle == '1'"
+        assert "check_bundle_release.py --model-dir models" in steps[rec]["run"]
+        assert rec < next(k for k, n in enumerate(names) if "Smoke-test" in n)
+
+
+def test_admin_guides_describe_ci_gate_retention_and_flavours():
+    """The §13 build instructions follow the workflow: tests gate, 1-day artifacts, the input."""
+    for lang in LANGS:
+        g = _guide(lang)
+        tail = g[g.index("\n## 13. "):]
+        assert "include_validated_model" in tail, lang
+        assert "retention-days: 1" in tail, lang
+        assert "pytest -q -m \"not slow\"" in tail, lang
+        assert not re.search(r"\b14 (days|дней|kun)\b", tail), f"{lang}: stale 14-day retention in §13"
+        assert "NO-VALIDATED-MODEL" in g[:g.index("\n## 4. ")], f"{lang}: §3 must name the clinic flavour"
+

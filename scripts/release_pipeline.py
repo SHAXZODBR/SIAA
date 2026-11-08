@@ -60,6 +60,22 @@
     next combine; if that set is gone or was rebuilt, combine refuses to run without an
     explicit --train-lock (it never silently drops the lock).
 
+  CANDIDATES (--candidates warm,fresh; default warm — decision D6 of docs/dev/finish_line_contract.md)
+    warm   starts from --base-model (default the current release models/brain_triage_finetuned)
+    fresh  starts from the public ViT base: models/hf/google__vit-base-patch16-224 when that offline copy
+           exists, else the hub id google/vit-base-patch16-224 from the local Hugging Face cache (the
+           pre-train guard refuses 'fresh base not available offline' when neither holds it — nothing
+           is downloaded; every stage runs with HF_HUB_OFFLINE=1 unless the caller set it) and passes
+           --base-model-fresh.
+    With the default (warm only) every path and command is exactly the single-candidate pipeline:
+    models/brain_triage_candidate_<tag>. With more than warm, each candidate trains into
+    models/brain_triage_candidate_<tag>_<cand>, the gate evaluates EACH with --compare-with the current
+    release, and promote moves the best candidate that PASSED the gate with promotion.promote = true,
+    by balanced accuracy (a tie goes to warm). state.json 'candidates' holds per-candidate paths, base,
+    train/gate exit codes and gate numbers; 'candidate_choice' records the choice and the ranking. A
+    candidate whose train record is done with unchanged inputs is not retrained on --resume. When no
+    candidate qualifies, the gate stops the release before promote (same message as one candidate).
+
   EXIT CODES
     0 ok · 1 usage or guard rail failed · 2 a stage command failed
 ================================================================================
@@ -113,6 +129,11 @@ GITHUB_MODELS_REPO = 'SHAXZODBR/SIAA-models'
 BASE_MODEL = 'models/brain_triage_finetuned'        # the release dir: compare-with, promote dest, bump, bundle
 PUBLIC_VIT_BASE = 'models/hf/google__vit-base-patch16-224'   # offline copy of google/vit-base-patch16-224
 PUBLIC_VIT_HUB_ID = 'google/vit-base-patch16-224'
+HF_WEIGHT_FILES = ('model.safetensors', 'pytorch_model.bin')
+HF_REQUIRED_FILES = ('config.json', 'preprocessor_config.json')
+CANDIDATE_KINDS = ('warm', 'fresh')                  # preference order: a balanced-accuracy tie → warm
+DEFAULT_CANDIDATES = ['warm']
+BALANCED_TIE_EPS = 1e-9
 DEFAULT_HOLDOUT = 'data/holdout_patients_v1.txt'
 LATEST_FILE = 'data/release/LATEST'
 VENV_PYTHON = '/Users/shakhzodbtr/venv/bin/python'
@@ -128,6 +149,7 @@ OPTION_DEFAULTS: dict[str, object] = {
     'base_model': BASE_MODEL, 'skip_benchmark': False, 'skip_tests': False, 'label_llm': None,
     'llm_labels': None, 'github': GITHUB_MODELS_REPO, 'local_bundle': False,
     'min_normals': MIN_NORMALS_DEFAULT, 'min_disk_gb': MIN_DISK_GB_DEFAULT,
+    'candidates': DEFAULT_CANDIDATES,
 }
 
 
@@ -154,6 +176,8 @@ class Config:
     llm_labels: Optional[str] = None
     min_normals: int = MIN_NORMALS_DEFAULT
     min_disk_gb: float = MIN_DISK_GB_DEFAULT
+    candidates: list[str] = field(default_factory=lambda: list(DEFAULT_CANDIDATES))
+    chosen: Optional[str] = None                      # candidate the gate chose (multi-candidate runs)
     dry_run: bool = False
     resume: bool = False
     tag_source: str = '--tag'
@@ -177,6 +201,28 @@ class Config:
     @property
     def release_dir(self) -> str: return f'data/release/{self.tag}'
     @property
+    def multi(self) -> bool:
+        """True unless the candidate set is the default (warm only): the single-candidate pipeline
+        keeps its historical paths and commands byte for byte."""
+        return list(self.candidates) != DEFAULT_CANDIDATES
+
+    def candidate_path(self, cand: str) -> str:
+        """Output dir of one candidate: the historical path for the default warm-only run, else
+        models/brain_triage_candidate_<tag>_<cand>."""
+        return self.candidate if not self.multi else f'{self.candidate}_{cand}'
+
+    def candidate_base(self, cand: str) -> str:
+        """The model a candidate starts from (warm: --base-model; fresh: the public ViT base)."""
+        return self.base_model if cand == 'warm' else fresh_base(self.repo)
+
+    @property
+    def promote_candidate(self) -> str:
+        """The candidate dir promote moves: the only candidate of a single run, else the one the gate
+        chose (a '<chosen>' placeholder before the gate has run — `plan` shows it)."""
+        if not self.multi:
+            return self.candidate
+        return self.candidate_path(self.chosen) if self.chosen else f'{self.candidate}_<chosen>'
+    @property
     def state_path(self) -> Path: return self.repo / self.release_dir / 'state.json'
     @property
     def logs_dir(self) -> Path: return self.repo / self.release_dir / 'logs'
@@ -199,6 +245,7 @@ class Config:
             'skip_tests': self.skip_tests, 'label_llm': self.label_llm, 'llm_labels': self.llm_labels,
             'github': self.github or GITHUB_MODELS_REPO, 'local_bundle': self.github is None,
             'min_normals': self.min_normals, 'min_disk_gb': self.min_disk_gb,
+            'candidates': list(self.candidates),
         }
 
 
@@ -343,6 +390,85 @@ def train_lock_problem(repo: Path, release_set: str) -> Optional[str]:
                 f'the model was trained on. Restore the original set, or pass --train-lock <ids.txt> '
                 f'listing the patients it was trained on')
     return None
+
+
+def parse_candidates(value: str) -> list[str]:
+    """'warm,fresh' → ['warm', 'fresh'] in preference order (warm first); argparse type."""
+    names = [x.strip().lower() for x in str(value).split(',') if x.strip()]
+    unknown = sorted(set(names) - set(CANDIDATE_KINDS))
+    if not names or unknown:
+        raise argparse.ArgumentTypeError(
+            f'--candidates takes a comma-separated subset of {",".join(CANDIDATE_KINDS)}'
+            + (f' (unknown: {",".join(unknown)})' if unknown else ''))
+    if len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError('--candidates lists a candidate twice')
+    return [c for c in CANDIDATE_KINDS if c in names]
+
+
+def fresh_base(repo: Path) -> str:
+    """The 'fresh' candidate's start point: the offline copy when present, else the hub id."""
+    return PUBLIC_VIT_BASE if (repo / PUBLIC_VIT_BASE).is_dir() else PUBLIC_VIT_HUB_ID
+
+
+def hf_hub_cache_dir() -> Path:
+    """The Hugging Face hub cache the trainer subprocess will read (same env resolution as
+    huggingface_hub: HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE > HF_HOME/hub > ~/.cache/huggingface/hub)."""
+    for var in ('HF_HUB_CACHE', 'HUGGINGFACE_HUB_CACHE'):
+        if os.environ.get(var):
+            return Path(os.environ[var]).expanduser()
+    if os.environ.get('HF_HOME'):
+        return Path(os.environ['HF_HOME']).expanduser() / 'hub'
+    xdg = os.environ.get('XDG_CACHE_HOME')
+    return (Path(xdg).expanduser() if xdg else Path.home() / '.cache') / 'huggingface' / 'hub'
+
+
+def _snapshot_complete(snap: Path) -> bool:
+    return all((snap / f).is_file() for f in HF_REQUIRED_FILES) and \
+        any((snap / w).is_file() for w in HF_WEIGHT_FILES)
+
+
+def hf_cache_has_model(hub_id: str, cache_dir: Optional[Path] = None) -> bool:
+    """True when the hub cache holds a complete snapshot (config, preprocessor config, weights) of
+    `hub_id` at the revision `main` resolves to — what from_pretrained(hub_id) loads offline.
+    Uses huggingface_hub.try_to_load_from_cache; scans models--<org>--<name>/snapshots when the
+    library is unavailable. Never touches the network."""
+    cache = Path(cache_dir) if cache_dir else hf_hub_cache_dir()
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:                                   # library missing / broken: scan the layout
+        snaps = cache / ('models--' + hub_id.replace('/', '--')) / 'snapshots'
+        return snaps.is_dir() and any(_snapshot_complete(s) for s in snaps.iterdir() if s.is_dir())
+    try:
+        found = try_to_load_from_cache(hub_id, 'config.json', cache_dir=str(cache))
+    except Exception:
+        return False
+    return isinstance(found, str) and _snapshot_complete(Path(found).parent)
+
+
+def fresh_base_problem(repo: Path, python: str = VENV_PYTHON) -> Optional[str]:
+    """Why the 'fresh' candidate cannot start offline (None = it can). Checked by the pre-train
+    guard, so a missing base stops the release BEFORE hours of training of the other candidate."""
+    local = repo / PUBLIC_VIT_BASE
+    if local.is_dir():
+        if _snapshot_complete(local):
+            return None
+        missing = [f for f in HF_REQUIRED_FILES if not (local / f).is_file()]
+        if not any((local / w).is_file() for w in HF_WEIGHT_FILES):
+            missing.append(' or '.join(HF_WEIGHT_FILES))
+        return (f'fresh base not available offline: {PUBLIC_VIT_BASE} is incomplete (missing '
+                f'{", ".join(missing)}) — delete it and copy it again (download hint: {_fresh_download_hint(python)})')
+    if hf_cache_has_model(PUBLIC_VIT_HUB_ID):
+        return None
+    return (f'fresh base not available offline: neither {PUBLIC_VIT_BASE} nor the Hugging Face cache '
+            f'({hf_hub_cache_dir()}) holds {PUBLIC_VIT_HUB_ID}. On a machine with internet run: '
+            f'{_fresh_download_hint(python)} — then copy {PUBLIC_VIT_BASE}/ into this repo '
+            '(or drop "fresh" from --candidates)')
+
+
+def _fresh_download_hint(python: str) -> str:
+    code = (f"from huggingface_hub import snapshot_download; snapshot_download('{PUBLIC_VIT_HUB_ID}', "
+            f"local_dir='{PUBLIC_VIT_BASE}', allow_patterns=['*.json', 'model.safetensors'])")
+    return f'{shlex.quote(python)} -c {shlex.quote(code)}'
 
 
 def sha256_file(fp: Path) -> str:
@@ -549,6 +675,23 @@ def build_stages(cfg: Config) -> list[Stage]:
     if cfg.github:
         bundle_cmd += ['--github', cfg.github, '--tag', cfg.tag]
 
+    # train / gate: one command per candidate (the default warm-only run has exactly one, at the
+    # historical candidate path). promote: the candidate the gate chose (cfg.promote_candidate).
+    train_cmds = [train_command(cfg, c) for c in cfg.candidates]
+    gate_cmds = [[py, 'scripts/eval_study_level.py', '--model', cfg.candidate_path(c),
+                  '--data', f'{cfg.release_set}/val', '--write-manifest',
+                  '--min-sens', f'{GATE_MIN_SENS:.2f}', '--min-spec', f'{GATE_MIN_SPEC:.2f}',
+                  '--compare-with', BASE_MODEL, '--device', cfg.device] for c in cfg.candidates]
+    cand_paths = [cfg.candidate_path(c) for c in cfg.candidates]
+    train_title = (f'Fine-tune the candidate from {cfg.base_model}' if not cfg.multi else
+                   'Fine-tune the candidates: ' + ', '.join(f'{c} from {cfg.candidate_base(c)}'
+                                                            for c in cfg.candidates))
+    gate_title = ('Study-level gate + comparison with the current release' if not cfg.multi else
+                  'Study-level gate + comparison with the current release, per candidate; '
+                  'choose the best that passed (balanced accuracy, tie → warm)')
+    promote_title = ('Move the candidate into models/brain_triage_finetuned (old → _prev_<id>)' if not cfg.multi
+                     else 'Move the chosen candidate into models/brain_triage_finetuned (old → _prev_<id>)')
+
     return [
         Stage('index', 'Index the drive (one row per study)',
               [[py, 'scripts/index_new_studies.py', '--root', root, '--out', cfg.index_csv]],
@@ -576,27 +719,21 @@ def build_stages(cfg: Config) -> list[Stage]:
               [combine_cmd], inputs=combine_inputs,
               outputs=[cfg.release_set, manifest],
               good='0 train/val/tune overlap, all 178 holdout patients in val, tune/ written, per-batch counts printed'),
-        Stage('train', f'Fine-tune the candidate from {cfg.base_model}',
-              [[py, 'training/finetune_brain_classifier.py', '--data', cfg.release_set,
-                '--classes', 'abnormal,normal', '--base-model', cfg.base_model, '--balance',
-                '--unfreeze-last-blocks', '3', '--epochs', str(cfg.epochs), '--device', cfg.device,
-                '--select-split', 'tune', '--output', cfg.candidate]],
+        Stage('train', train_title, train_cmds,
               # opt:* = option VALUES that shape the weights: a new --base-model / --epochs (the
               # retrain-from-the-public-ViT fallback) re-runs train on --resume
-              inputs=[manifest, 'opt:base_model', 'opt:epochs'],
-              outputs=[cfg.candidate, f'{cfg.candidate}/model.safetensors'],
+              inputs=[manifest, 'opt:base_model', 'opt:epochs', *(['opt:candidates'] if cfg.multi else [])],
+              outputs=[o for p in cand_paths for o in (p, f'{p}/model.safetensors')],
               good='val loss falls then plateaus; checkpoint selected on tune/ (not on the gate set); '
                    'training_metrics.json written'),
-        Stage('gate', 'Study-level gate + comparison with the current release',
-              [[py, 'scripts/eval_study_level.py', '--model', cfg.candidate, '--data', f'{cfg.release_set}/val',
-                '--write-manifest', '--min-sens', f'{GATE_MIN_SENS:.2f}', '--min-spec', f'{GATE_MIN_SPEC:.2f}',
-                '--compare-with', BASE_MODEL, '--device', cfg.device]],
-              inputs=[f'{cfg.candidate}/model.safetensors', manifest],
-              outputs=[f'{cfg.candidate}/study_level_eval.json', f'{cfg.candidate}/MANIFEST.json'],
-              good=f'sens ≥ {GATE_MIN_SENS}, spec ≥ {GATE_MIN_SPEC}, promotion.promote = true'),
-        Stage('promote', 'Move the candidate into models/brain_triage_finetuned (old → _prev_<id>)',
-              [[py, 'scripts/promote_model.py', '--candidate', cfg.candidate, '--dest', BASE_MODEL]],
-              inputs=[f'{cfg.candidate}/study_level_eval.json'],
+        Stage('gate', gate_title, gate_cmds,
+              inputs=[*(f'{p}/model.safetensors' for p in cand_paths), manifest],
+              outputs=[o for p in cand_paths for o in (f'{p}/study_level_eval.json', f'{p}/MANIFEST.json')],
+              good=f'sens ≥ {GATE_MIN_SENS}, spec ≥ {GATE_MIN_SPEC}, promotion.promote = true'
+                   + ('' if not cfg.multi else ' for at least one candidate')),
+        Stage('promote', promote_title,
+              [[py, 'scripts/promote_model.py', '--candidate', cfg.promote_candidate, '--dest', BASE_MODEL]],
+              inputs=[f'{cfg.promote_candidate}/study_level_eval.json'],
               outputs=[f'{BASE_MODEL}/study_level_eval.json', f'{BASE_MODEL}/MANIFEST.json'],
               good='new identity printed, registry loads the dir, old release kept as _prev_'),
         Stage('bump', 'Rewrite every pinned number / identity / date in code and docs',
@@ -608,6 +745,17 @@ def build_stages(cfg: Config) -> list[Stage]:
               outputs=[f'{cfg.release_dir}/manifest.json'],
               good='manifest asset API URL printed; restore with fetch_model_bundle.py verified'),
     ]
+
+
+def train_command(cfg: Config, cand: str) -> list[str]:
+    """finetune_brain_classifier.py argv of one candidate. warm = the historical command; fresh adds
+    --base-model-fresh (new 2-class head on the ImageNet ViT)."""
+    argv = [cfg.python, 'training/finetune_brain_classifier.py', '--data', cfg.release_set,
+            '--classes', 'abnormal,normal', '--base-model', cfg.candidate_base(cand)]
+    if cand == 'fresh':
+        argv.append('--base-model-fresh')
+    return argv + ['--balance', '--unfreeze-last-blocks', '3', '--epochs', str(cfg.epochs),
+                   '--device', cfg.device, '--select-split', 'tune', '--output', cfg.candidate_path(cand)]
 
 
 def stage_names(stages: list[Stage]) -> list[str]:
@@ -638,12 +786,20 @@ def archived_candidate(state: dict) -> Optional[str]:
     return rec.get('archived_candidate') if rec.get('status') == 'done' else None
 
 
+def promoted_candidate(cfg: Config, state: dict) -> str:
+    """The candidate dir promote moved (recorded by _archive_candidate; the historical single
+    candidate path for a state written before multi-candidate runs existed)."""
+    rec = state.get('stages', {}).get('promote') or {}
+    return rec.get('promoted_candidate') or cfg.candidate
+
+
 def resolve_path(cfg: Config, state: dict, p: str) -> str:
-    """A candidate path after promote moved the candidate: models/brain_triage_candidate_<tag>/x
-    → <archived dest>/x. Everything else unchanged."""
+    """A candidate path after promote moved the candidate: models/brain_triage_candidate_<tag>[_<cand>]/x
+    → <archived dest>/x. Everything else (incl. a candidate that was NOT chosen) unchanged."""
     dest = archived_candidate(state)
-    if dest and (p == cfg.candidate or p.startswith(cfg.candidate + '/')):
-        return dest + p[len(cfg.candidate):]
+    moved = promoted_candidate(cfg, state)
+    if dest and (p == moved or p.startswith(moved + '/')):
+        return dest + p[len(moved):]
     return p
 
 
@@ -666,8 +822,13 @@ def stage_env() -> dict[str, str]:
     """Environment of every stage / guard command.
     PYTHONUNBUFFERED: a child python block-buffers stdout when it is a pipe, so a 5-hour train
     stage would show (and log) nothing for minutes at a time. LOGURU_LEVEL=INFO: the repo's
-    loguru logging stays readable in the tee'd logs (no DEBUG flood, no hidden INFO)."""
-    return {**os.environ, 'PYTHONUNBUFFERED': '1', 'LOGURU_LEVEL': 'INFO'}
+    loguru logging stays readable in the tee'd logs (no DEBUG flood, no hidden INFO).
+    HF_HUB_OFFLINE=1 (unless the caller set it): a hub id (the fresh candidate's
+    google/vit-base-patch16-224) loads from the local cache the pre-train guard checked — the
+    pipeline never downloads weights in the middle of a release."""
+    env = {**os.environ, 'PYTHONUNBUFFERED': '1', 'LOGURU_LEVEL': 'INFO'}
+    env.setdefault('HF_HUB_OFFLINE', '1')
+    return env
 
 
 def run_command(argv: list[str], log_path: Path, cwd: Path, dry_run: bool = False) -> int:
@@ -715,6 +876,8 @@ def args_line(cfg: Config) -> str:
               '--skip-tests' if o['skip_tests'] else '--no-skip-tests']
     parts += ['--local-bundle'] if o['local_bundle'] else ['--github', o['github']]
     parts += ['--min-normals', str(o['min_normals']), '--min-disk-gb', f'{o["min_disk_gb"]:g}']
+    if cfg.multi:
+        parts += ['--candidates', ','.join(o['candidates'])]
     return shlex.join(parts)
 
 
@@ -772,7 +935,15 @@ def guard_pre_train(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
                             f'the trainer keeps is chosen on very few studies (≥ {MIN_TUNE_PATIENTS_WARN} '
                             'patients of both classes recommended — combine --min-tune-per-class)')
 
-    # 5. disk
+    # 5. fresh candidate: the public ViT base must be on this machine (never downloaded mid-release)
+    if 'fresh' in cfg.candidates:
+        problem = fresh_base_problem(repo, cfg.python)
+        if problem:
+            errors.append(problem)
+        else:
+            print(f'  fresh base: {G}{fresh_base(repo)}{NC} (offline)')
+
+    # 6. disk
     gb = free_gb(repo)
     print(f'  free disk: {gb:.1f} GB')
     if gb < cfg.min_disk_gb:
@@ -857,6 +1028,15 @@ GUARD_TEXT = {
 }
 
 
+def guard_text(cfg: Config, stage_name: str) -> list[str]:
+    """GUARD_TEXT of a stage + the checks only a multi-candidate run makes."""
+    lines = list(GUARD_TEXT.get(stage_name, []))
+    if stage_name == 'train' and 'fresh' in cfg.candidates:
+        lines.append(f'fresh base available offline ({PUBLIC_VIT_BASE} or {PUBLIC_VIT_HUB_ID} in the '
+                     'Hugging Face cache)')
+    return lines
+
+
 class _Tee:
     """stdout that also appends to a log file (colour codes stripped in the log)."""
 
@@ -881,7 +1061,7 @@ def run_guards(cfg: Config, stage_name: str, state: dict) -> bool:
         return True
     print(f'\n{B}── guard rails before {stage_name} ──{NC}')
     if cfg.dry_run:
-        for t in GUARD_TEXT[stage_name]:
+        for t in guard_text(cfg, stage_name):
             print(f'  # would check: {t}')
         return True
     log_path = cfg.logs_dir / 'guards.log'
@@ -951,10 +1131,14 @@ def inputs_changed(recorded: dict, current: dict) -> bool:
 
 
 def _archive_candidate(cfg: Config, state: dict, rec: dict) -> None:
-    """After a successful promote: the candidate dir now lives at BASE_MODEL."""
-    if (cfg.repo / cfg.candidate).exists() or not (cfg.repo / BASE_MODEL).exists():
+    """After a successful promote: the (chosen) candidate dir now lives at BASE_MODEL."""
+    moved = cfg.promote_candidate
+    if (cfg.repo / moved).exists() or not (cfg.repo / BASE_MODEL).exists():
         return
     rec['archived_candidate'] = BASE_MODEL
+    rec['promoted_candidate'] = moved
+    if cfg.multi and cfg.chosen:
+        rec['chosen_candidate'] = cfg.chosen
     for name in ('train', 'gate'):
         r = state.get('stages', {}).get(name)
         if r and r.get('status') == 'done':
@@ -962,16 +1146,41 @@ def _archive_candidate(cfg: Config, state: dict, rec: dict) -> None:
 
 
 def _gate_verdict_message(cfg: Config, rc: int) -> list[str]:
+    if cfg.multi:
+        return _gate_verdict_message_multi(cfg, rc)
     ev_path = f'{cfg.candidate}/study_level_eval.json'
     common = [f'the current release {BASE_MODEL} is untouched — promote was NOT run and will not run',
               f'read {ev_path} and {cfg.release_dir}/logs/gate.log (runbook section 7)',
               'options: keep the old model (nothing to do) · add more normal studies and retrain · '
-              f'retrain from the public ViT base: {_retrain_hint(cfg)}']
+              f'retrain from the public ViT base: {_retrain_hint(cfg)}',
+              f'or train both candidates and promote the better one: {_both_candidates_hint(cfg)}']
     if rc == EVAL_GATE_FAILED:
         return [f'GATE FAILED: the candidate is below the floors (sens ≥ {GATE_MIN_SENS:.2f}, '
                 f'spec ≥ {GATE_MIN_SPEC:.2f}) on {cfg.release_set}/val'] + common
     return ['NOT PROMOTED: the candidate passed the floors but is not better than the current release '
             '(balanced accuracy ≥ old − 0.01 and sensitivity ≥ old − 0.03 required)'] + common
+
+
+def _gate_verdict_message_multi(cfg: Config, rc: int) -> list[str]:
+    """Same headline and options as one candidate, naming every candidate's eval."""
+    evals = ', '.join(f'{cfg.candidate_path(c)}/study_level_eval.json' for c in cfg.candidates)
+    names = ' and '.join(cfg.candidates)
+    # a multi-candidate run always includes 'fresh' (the candidate set is a non-default subset of
+    # warm,fresh), so the public-ViT fallback has been tried already: more data is the way forward
+    common = [f'the current release {BASE_MODEL} is untouched — promote was NOT run and will not run',
+              f'read {evals} and {cfg.release_dir}/logs/gate.log (runbook section 7)',
+              'options: keep the old model (nothing to do) · add more normal studies and retrain']
+    if rc == EVAL_GATE_FAILED:
+        return [f'GATE FAILED: no candidate ({names}) reaches the floors (sens ≥ {GATE_MIN_SENS:.2f}, '
+                f'spec ≥ {GATE_MIN_SPEC:.2f}) on {cfg.release_set}/val'] + common
+    return [f'NOT PROMOTED: no candidate ({names}) passed the floors AND is better than the current release '
+            '(balanced accuracy ≥ old − 0.01 and sensitivity ≥ old − 0.03 required)'] + common
+
+
+def _both_candidates_hint(cfg: Config) -> str:
+    """Re-run train → gate with warm AND fresh (D6); --from train, so train really runs again."""
+    return (f'{shlex.quote(cfg.python)} scripts/release_pipeline.py run {args_line(cfg)} '
+            '--candidates warm,fresh --from train')
 
 
 def _retrain_hint(cfg: Config) -> str:
@@ -982,7 +1191,211 @@ def _retrain_hint(cfg: Config) -> str:
     return f'{shlex.quote(cfg.python)} scripts/release_pipeline.py run {line} --from train'
 
 
+# ------------------------------------------------------- multi-candidate ----
+
+def _candidate_train_fingerprint(cfg: Config, cand: str) -> dict:
+    """What shapes one candidate's weights: the release set manifest, its base, the epochs."""
+    manifest = cfg.repo / cfg.release_set / 'dataset_manifest.json'
+    return {'manifest': fingerprint(manifest), 'base_model': cfg.candidate_base(cand), 'epochs': cfg.epochs}
+
+
+def _gate_numbers(ev: dict) -> dict:
+    """Gate numbers of one candidate's study_level_eval.json (balanced = (sens+spec)/2 when the
+    eval predates the 'balanced' key)."""
+    gate = ev.get('gate') or {}
+    promo = ev.get('promotion') or {}
+    sens, spec = gate.get('sens'), gate.get('spec')
+    bal = gate.get('balanced')
+    if bal is None and isinstance(sens, (int, float)) and isinstance(spec, (int, float)):
+        bal = (sens + spec) / 2
+    return {'passed': bool(gate.get('passed')), 'promote': bool(promo.get('promote')) if promo else False,
+            'has_promotion': bool(promo), 'sens': sens, 'spec': spec, 'balanced': bal,
+            'reason': promo.get('reason', '')}
+
+
+def choose_candidate(results: dict[str, dict]) -> tuple[Optional[str], list[dict]]:
+    """(chosen candidate or None, ranking). Qualified = eval exit 0 AND gate.passed AND
+    promotion.promote. Best balanced accuracy wins; a tie (|Δ| ≤ 1e-9) goes to the candidate earlier
+    in CANDIDATE_KINDS (warm)."""
+    ranking: list[dict] = []
+    best: Optional[str] = None
+    for cand in CANDIDATE_KINDS:
+        r = results.get(cand)
+        if r is None:
+            continue
+        why = ''
+        if r.get('returncode') != 0:
+            why = {EVAL_GATE_FAILED: 'gate failed (below the floors)',
+                   EVAL_NOT_PROMOTED: 'not better than the current release'}.get(r.get('returncode'),
+                                                                                  f'eval exit {r.get("returncode")}')
+        elif not r.get('passed'):
+            why = 'gate.passed is not true'
+        elif not r.get('has_promotion'):
+            why = 'no promotion block (gate ran without --compare-with)'
+        elif not r.get('promote'):
+            why = 'promotion.promote is false'
+        elif not isinstance(r.get('balanced'), (int, float)):
+            why = 'no balanced accuracy in the eval'
+        qualified = not why
+        ranking.append({'candidate': cand, 'qualified': qualified, 'balanced': r.get('balanced'),
+                        'sens': r.get('sens'), 'spec': r.get('spec'), 'why_not': why})
+        if qualified and (best is None or
+                          r['balanced'] > results[best]['balanced'] + BALANCED_TIE_EPS):
+            best = cand
+    return best, ranking
+
+
+def _fmt(x) -> str:
+    return f'{x:.3f}' if isinstance(x, (int, float)) else '—'
+
+
+def _print_candidate_table(cfg: Config, state: dict) -> None:
+    cands = state.get('candidates') or {}
+    choice = state.get('candidate_choice') or {}
+    print(f'  candidates (promote = best balanced accuracy among those that PASSED the gate with '
+          f'promotion.promote; tie → warm):')
+    for cand in cfg.candidates:
+        c = cands.get(cand) or {}
+        tr = (c.get('train') or {})
+        gt = (c.get('gate') or {})
+        gate_s = (f'{gt.get("verdict", "?"):<13} sens {_fmt(gt.get("sens"))} spec {_fmt(gt.get("spec"))} '
+                  f'balanced {_fmt(gt.get("balanced"))}' if gt else 'gate pending')
+        print(f'    {cand:<6} base {c.get("base_model") or cfg.candidate_base(cand):<42} '
+              f'train {tr.get("status", "pending"):<8} {gate_s}  → {c.get("path") or cfg.candidate_path(cand)}')
+    if choice:
+        if choice.get('chosen'):
+            print(f'  {G}chosen: {choice["chosen"]}{NC} ({choice.get("path")})')
+        else:
+            print(f'  {R}chosen: none — no candidate qualified{NC}')
+
+
+def run_candidates_stage(cfg: Config, stage: Stage, state: dict) -> int:
+    """train / gate of a multi-candidate run: one command per candidate, per-candidate records in
+    state['candidates'], and (gate) the choice in state['candidate_choice'].
+
+    train: a candidate whose record is done with unchanged inputs and whose weights exist is
+    skipped on --resume; any non-zero exit stops the stage (fix and resume).
+    gate : eval exit 0 / 2 (gate failed) / 4 (not promoted) is a VERDICT, recorded, and the next
+    candidate is gated; any other exit (1 crash, 3 manifest) stops the stage. Afterwards the best
+    qualifying candidate is chosen; none → the stage fails with the gate verdict (stop before promote)."""
+    print(f'\n{B}═══ stage {stage.name}: {stage.title} ═══{NC}')
+    log = cfg.logs_dir / f'{stage.name}.log'
+    rec = {
+        'status': 'running', 'started': now_iso(), 'finished': None,
+        'cmd': ' && '.join(shlex.join(c) for c in stage.cmds),
+        'cmds': [shlex.join(c) for c in stage.cmds],
+        'log': cfg.rel(log), 'outputs': list(stage.outputs), 'inputs': list(stage.inputs),
+        'input_sha256s': {} if cfg.dry_run else input_fingerprints(cfg, stage, state),
+        'candidates': list(cfg.candidates),
+    }
+    state.setdefault('stages', {})[stage.name] = rec
+    cands = state.setdefault('candidates', {})
+    if stage.name == 'gate':
+        state.pop('candidate_choice', None)
+    if not cfg.dry_run:
+        save_state(cfg.state_path, state)
+
+    def fail(rc: int, argv: list[str], **extra) -> int:
+        rec.update(status='failed', finished=now_iso(), returncode=rc, failed_cmd=shlex.join(argv), **extra)
+        if not cfg.dry_run:
+            save_state(cfg.state_path, state)
+        print(f'\n{R}✗ stage {stage.name} FAILED (exit {rc}){NC}')
+        print(f'  command : {shlex.join(argv)}')
+        print(f'  log     : {cfg.rel(log)}')
+        return rc
+
+    results: dict[str, dict] = {}
+    for cand, argv in zip(cfg.candidates, stage.cmds):
+        path = cfg.candidate_path(cand)
+        crec = cands.setdefault(cand, {})
+        crec.update(path=path, base_model=cfg.candidate_base(cand), fresh_head=cand == 'fresh')
+        if stage.name == 'train':
+            fp = {} if cfg.dry_run else _candidate_train_fingerprint(cfg, cand)
+            old = crec.get('train') or {}
+            if (cfg.resume and not cfg.dry_run and old.get('status') == 'done'
+                    and old.get('input_sha256s') == fp and (cfg.repo / path / 'model.safetensors').is_file()):
+                print(f'{G}↷ candidate {cand} already trained ({path}) — skipped{NC}')
+                continue
+            print(f'{B}── candidate {cand}: train from {crec["base_model"]} → {path}{NC}')
+            crec['train'] = {'status': 'running', 'started': now_iso(), 'cmd': shlex.join(argv),
+                             'input_sha256s': fp}
+            crec.pop('gate', None)                     # new weights: an older gate result no longer applies
+            if not cfg.dry_run:
+                save_state(cfg.state_path, state)
+            rc = run_command(argv, log, cfg.repo, cfg.dry_run)
+            crec['train'].update(status='done' if rc == 0 else 'failed', returncode=rc, finished=now_iso())
+            if rc != 0:
+                return fail(rc, argv, failed_candidate=cand)
+        else:                                          # gate
+            print(f'{B}── candidate {cand}: gate {path}{NC}')
+            rc = run_command(argv, log, cfg.repo, cfg.dry_run)
+            if cfg.dry_run:
+                continue
+            if rc not in (0, EVAL_GATE_FAILED, EVAL_NOT_PROMOTED):
+                crec['gate'] = {'returncode': rc, 'verdict': 'error', 'finished': now_iso()}
+                if rc == EVAL_MANIFEST_FAILED:
+                    print(f'{R}  MANIFEST check failed: the {cand} candidate weights do not match MANIFEST.json{NC}')
+                return fail(rc, argv, failed_candidate=cand)
+            ev_path = f'{path}/study_level_eval.json'
+            ev = read_eval(cfg.repo / path)
+            if not ev:
+                crec['gate'] = {'returncode': rc, 'verdict': 'error', 'finished': now_iso(),
+                                'error': f'{ev_path} missing or unreadable'}
+                return fail(rc or 1, argv, failed_candidate=cand, error=f'{ev_path} missing or unreadable')
+            nums = _gate_numbers(ev)
+            verdict = {0: 'passed', EVAL_GATE_FAILED: 'gate_failed', EVAL_NOT_PROMOTED: 'not_promoted'}[rc]
+            crec['gate'] = {'returncode': rc, 'verdict': verdict, 'eval': ev_path, 'finished': now_iso(),
+                            **{k: nums[k] for k in ('passed', 'promote', 'sens', 'spec', 'balanced', 'reason')}}
+            results[cand] = {'returncode': rc, **nums}
+            print(f'  {cand}: {verdict} — sens {_fmt(nums["sens"])} spec {_fmt(nums["spec"])} '
+                  f'balanced {_fmt(nums["balanced"])}')
+        if not cfg.dry_run:
+            save_state(cfg.state_path, state)
+
+    if not cfg.dry_run:
+        missing = [o for o in stage.outputs if not (cfg.repo / o).exists()]
+        if missing:
+            rec.update(status='failed', finished=now_iso(), returncode=0,
+                       error=f'expected outputs missing: {missing}')
+            save_state(cfg.state_path, state)
+            print(f'{R}✗ stage {stage.name} finished but expected outputs are missing: {missing}{NC}')
+            print(f'  log     : {cfg.rel(log)}')
+            return 1
+
+    if stage.name == 'gate' and not cfg.dry_run:
+        chosen, ranking = choose_candidate(results)
+        state['candidate_choice'] = {
+            'chosen': chosen, 'path': cfg.candidate_path(chosen) if chosen else None, 'at': now_iso(),
+            'rule': 'best balanced accuracy among candidates with eval exit 0, gate.passed and '
+                    'promotion.promote; tie → warm',
+            'ranking': ranking}
+        cfg.chosen = chosen
+        _print_candidate_table(cfg, state)
+        if chosen is None:
+            all_below_floor = all(r['returncode'] == EVAL_GATE_FAILED for r in results.values())
+            rc = EVAL_GATE_FAILED if all_below_floor else EVAL_NOT_PROMOTED
+            rec.update(status='failed', finished=now_iso(), returncode=rc,
+                       verdict='gate_failed' if rc == EVAL_GATE_FAILED else 'not_promoted',
+                       failed_cmd=rec['cmds'][-1])
+            save_state(cfg.state_path, state)
+            print(f'\n{R}✗ stage gate FAILED (exit {rc}){NC}')
+            msg = _gate_verdict_message(cfg, rc)
+            print(f'{R}  {msg[0]}{NC}')
+            for m in msg[1:]:
+                print(f'  {m}')
+            print(f'  log     : {cfg.rel(log)}')
+            return rc
+
+    rec.update(status='done', finished=now_iso(), returncode=0)
+    if not cfg.dry_run:
+        save_state(cfg.state_path, state)
+    print(f'{G}✓ stage {stage.name} done{NC}' + (f'  — good: {stage.good}' if stage.good else ''))
+    return 0
+
+
 def run_stage(cfg: Config, stage: Stage, state: dict) -> int:
+    if cfg.multi and stage.name in ('train', 'gate'):
+        return run_candidates_stage(cfg, stage, state)
     print(f'\n{B}═══ stage {stage.name}: {stage.title} ═══{NC}')
     log = cfg.logs_dir / f'{stage.name}.log'
     rec = {
@@ -1055,7 +1468,12 @@ def manual_steps(cfg: Config) -> list[str]:
         'Review the bump: git status && git diff — then git add ONLY the files the bump stage listed '
         f'(never data/ or models/) && git commit -m "release: {cfg.tag} — bump validated numbers"',
         f'EVERY release bumps "version" in desktop-app/package.json (currently {ver}; a model-only release '
-        f'raises the minor version: {ver} → {nxt}) so the tag v<version> is new; commit it, then '
+        f'raises the minor version: {ver} → {nxt}) so the tag v<version> is new. Bump the SAME version in '
+        f'src/inference/server.py APP_VERSION and in the 12 hospital docs '
+        f'docs/{{user_manual,admin_install_guide,intended_use,pilot_evaluation_protocol}}_{{en,ru,uz}}.md (the "Version / Версия / '
+        f'Versiya" line, plus the /health example and the "Setup {nxt}.exe" name in the admin guides) — '
+        f'docs/test_docs_consistency.py::test_app_version_quoted_in_docs_matches_the_code fails otherwise; '
+        f'commit it, then '
         f'git tag v{nxt} && git push origin main && git push origin v{nxt}   '
         '(pushing the tag starts the "Build installers" CI workflow; its "Verify bundle identity matches '
         'the code" step fails unless the committed bump and the MODEL_BUNDLE_URL secret name the same model)',
@@ -1086,16 +1504,24 @@ def cmd_plan(cfg: Config, stages: list[Stage]) -> int:
     lock_problem = None if cfg.train_lock else train_lock_problem(cfg.repo, cfg.release_set)
     print(f'# train-locked patients (the current model was trained on them): '
           f'{cfg.train_lock or ("!! NONE — " + lock_problem if lock_problem else "(legacy train/ only)")}')
+    if cfg.multi:
+        print('# candidates: ' + '; '.join(
+            f'{c} from {cfg.candidate_base(c)}{" (--base-model-fresh)" if c == "fresh" else ""} → '
+            f'{cfg.candidate_path(c)}' for c in cfg.candidates))
+        print('# promote moves the best candidate that PASSED the gate with promotion.promote = true '
+              '(balanced accuracy, tie → warm); the runner substitutes it for <chosen>. As a shell script '
+              'this plan stops at the first gate verdict (exit 2/4).')
     print('set -e')
     print(f'cd {shlex.quote(str(cfg.repo))}')
     for i, s in enumerate(stages):
         print(f'\n# --- stage {i}: {s.name} — {s.title}')
-        for t in GUARD_TEXT.get(s.name, []):
+        for t in guard_text(cfg, s.name):
             print(f'#     guard: {t}')
         for c in s.cmds:
             print(shlex.join(c))
     print('\n# --- manual: set MODEL_BUNDLE_URL secret, commit the bump, bump desktop-app/package.json version '
-          '(every release), git tag v<new app version>, git push tag, download installer, '
+          '(every release) + server APP_VERSION + the version lines of the 12 hospital docs, '
+          'git tag v<new app version>, git push tag, download installer, '
           'run docs/windows_laptop_test_*.md, publish the release')
     return 0
 
@@ -1116,6 +1542,8 @@ def cmd_status(cfg: Config, stages: list[Stage]) -> int:
               f'{rec.get("finished") or "":<20} {rec.get("log", "")}')
         if st == 'failed':
             print(f'           {R}{rec.get("verdict") or rec.get("failed_cmd") or rec.get("error", "")}{NC}')
+    if cfg.multi or state.get('candidates'):
+        _print_candidate_table(cfg, state)
     for name, g in (state.get('guards') or {}).items():
         if isinstance(g, dict) and 'passed' in g:
             mark = f'{G}passed{NC}' if g.get('passed') else f'{R}FAILED{NC}'
@@ -1137,7 +1565,23 @@ def cmd_run(cfg: Config, stages: list[Stage], selected: list[Stage],
         write_latest(cfg.repo, cfg.tag)
     print(f'{B}release {cfg.tag} — batch {cfg.batch} — stages: {", ".join(s.name for s in selected)}'
           f'{"  [DRY RUN]" if cfg.dry_run else ""}{NC}')
+    if cfg.multi:
+        cfg.chosen = (state.get('candidate_choice') or {}).get('chosen')
+        if cfg.candidates:
+            print('candidates: ' + ', '.join(f'{c} ({cfg.candidate_base(c)})' for c in cfg.candidates)
+                  + (f' — chosen by the last gate: {cfg.chosen}' if cfg.chosen else ''))
     for s in selected:
+        if s.name == 'promote' and cfg.multi:
+            # the gate (possibly in this very run) chose the candidate: rebuild promote for it
+            cfg.chosen = (state.get('candidate_choice') or {}).get('chosen')
+            if not cfg.chosen and not archived_candidate(state) and not cfg.dry_run:
+                print(f'{R}✗ promote: the gate has not chosen a candidate (state.json candidate_choice) — '
+                      f'run the gate stage first{NC}')
+                print(f'  {_resume_hint(cfg)}')
+                return EXIT_USAGE
+            if archived_candidate(state) and not cfg.chosen:
+                cfg.chosen = (state['stages']['promote'].get('chosen_candidate'))
+            s = next(x for x in build_stages(cfg) if x.name == 'promote')
         if cfg.resume:
             done, why = stage_is_done(cfg, s, state, explicit)
             if done:
@@ -1176,6 +1620,11 @@ def cmd_run(cfg: Config, stages: list[Stage], selected: list[Stage],
             if (state['stages'].get(s.name) or {}).get('verdict'):
                 print(f'  {Y}stopped before promote.{NC} Status: {shlex.quote(cfg.python)} '
                       f'scripts/release_pipeline.py status --batch {cfg.batch} --tag {cfg.tag}')
+                # a verdict is not a crash: re-running unchanged inputs gives the same verdict, so the
+                # resume line is for AFTER new data / labels — it re-runs only the stages whose inputs
+                # changed (or that are not done), then gates again; nothing is promoted on a failed gate
+                print(f'  after adding data or relabelling, continue with (re-runs only changed stages, '
+                      f'then the gate): {_resume_hint(cfg)}')
             else:
                 print(f'  resume with: {_resume_hint(cfg)}')
             return EXIT_STAGE_FAILED
@@ -1213,6 +1662,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--base-model', default=None,
                     help=f'model the train stage starts from (default {BASE_MODEL}; fallback after a failed '
                          f'gate: {PUBLIC_VIT_BASE} or {PUBLIC_VIT_HUB_ID})')
+    ap.add_argument('--candidates', type=parse_candidates, default=None, metavar='warm[,fresh]',
+                    help='models to train + gate (default warm). warm starts from --base-model; fresh from '
+                         f'{PUBLIC_VIT_BASE} (else {PUBLIC_VIT_HUB_ID} from the HF cache) with a new head. '
+                         'promote takes the best that passed the gate by balanced accuracy (tie → warm)')
     ap.add_argument('--from', dest='from_', choices=STAGE_ORDER, help='start at this stage')
     ap.add_argument('--only', choices=STAGE_ORDER, help='run this stage only')
     ap.add_argument('--resume', action='store_true', help='skip stages recorded as done in state.json')
@@ -1271,6 +1724,7 @@ def config_from_args(a: argparse.Namespace) -> Config:
         skip_benchmark=bool(o['skip_benchmark']), skip_tests=bool(o['skip_tests']),
         github=None if o['local_bundle'] else o['github'], label_llm=o['label_llm'], llm_labels=llm_labels,
         min_normals=int(o['min_normals']), min_disk_gb=float(o['min_disk_gb']),
+        candidates=[c for c in CANDIDATE_KINDS if c in (o['candidates'] or DEFAULT_CANDIDATES)],
         dry_run=a.dry_run, resume=a.resume, tag_source=source, inherited=inherited,
     )
 

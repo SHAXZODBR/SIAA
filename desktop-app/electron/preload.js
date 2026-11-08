@@ -22,4 +22,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Language for main-process dialogs (file pickers, backend crash boxes); ru/uz/en
   setLanguage: (lang) => ipcRenderer.send('set-language', lang),
   readFileBase64: (filePath) => ipcRenderer.invoke('read-file-base64', filePath),
+
+  // Administration (Preferences): both resolve {ok, path} / {ok:false, canceled|error}
+  importModelBundle: (opts) => ipcRenderer.invoke('model-bundle:import', opts || {}),
+  saveDiagnostics: (bytes, suggestedName) => ipcRenderer.invoke('diagnostics:save', { bytes, suggestedName }),
 });

@@ -1,6 +1,6 @@
 # SIAA — Sentinel Medical AI · User Manual for Radiologists
 
-Version 1.0.0 (desktop app and AI server) · Document revision 2026-09
+Version 1.1.0 (desktop app and AI server) · Document revision 2026-11
 
 ---
 
@@ -12,7 +12,7 @@ It is **not** a diagnostic device and it is **not** a replacement for a radiolog
 
 - **A radiologist reads and signs every study.** The AI output is advisory. The signed report is the radiologist's, not the AI's.
 - **The AI never certifies a scan as normal.** When no finding is flagged, the screen says *"No finding flagged by AI — NOT a normal read"*. The AI only checks for the finding types listed in the Findings tab; anything else is invisible to it.
-- **Only one detector is validated on local patients** (the *study triage* detector). The *brain tumor* detector is a public model whose validation on this clinic's population is still pending — it is known to over-call tumors.
+- **Only one detector is validated on local patients** (the *study triage* detector). The *brain tumor* detector is a public model whose validation on this clinic's population is still pending — it is known to over-call tumors. **Since version 1.1.0 such unvalidated (pending) detectors are switched off by default**; you see their results only if your administrator has switched them on (§6.3).
 - The software has not been certified as a medical device by the Ministry of Health of the Republic of Uzbekistan or by any other regulator. Use it under the clinic's own clinical governance.
 
 Everything runs offline on the clinic PC. No image, report or patient identifier leaves the machine.
@@ -77,6 +77,7 @@ If the status line says *AI server: offline*, the upload buttons are disabled (s
 
 - **Non-brain MRI** (spine, knee, abdomen …) is rejected by the brain panel: the study is stored with **Needs review** and *Not analyzed — requires full radiologist review*. Read it as you normally would.
 - **Other modalities** (CT, X-ray, mammography) are routed to other detectors only when a matching model is installed on your server; otherwise they also come back as **Needs review**. The validated triage detector covers **brain MRI only**.
+- **Head CT in this release:** there is no validated CT detector. With the default settings a head CT is accepted into the worklist but comes back as **Needs review** — *Not analyzed — requires full radiologist review* — with the note *"This study type has no validated AI detector in this release — not analysed by AI; the radiologist reads as usual. An administrator can enable unvalidated detectors in Preferences → AI models."* It has **not** been analysed by AI: read it exactly as you normally would. (Only if your administrator has switched on pending detectors does a public hemorrhage classifier run; its output is then marked *Pending validation* and is never a finding.)
 - A study that is not readable as DICOM is refused with an error message.
 
 ---
@@ -102,6 +103,8 @@ Below the card: number of flagged findings, inference time and the decision **th
 |---|---|---|---|
 | **Study triage — normal vs abnormal (local)** | **Validated** | Trained and tested on studies from a Tashkent hospital. Averages the abnormal-probability over 5 central axial slices; flags the study when the mean is ≥ 0.50. | Study-level sensitivity 0.90 and specificity 0.47 on 178 held-out local patients. In other words: about 1 in 10 abnormal studies is **not** flagged, and about half of normal studies **are** flagged. It prioritises; it does not diagnose, localise, or rule out. |
 | **Brain tumor (glioma / meningioma / pituitary)** | **Pending validation** | Public 2D classifier trained on a Kaggle brain-tumor dataset; runs on one central slice. | **Over-calls tumors** on local scanners: many "Suspected glioma / meningioma" flags are false positives. Its "No tumor detected" line is likewise unverified. Treat every tumor flag as a prompt to look, never as a finding. |
+
+**Pending detectors are hidden by default.** In this release the *Brain tumor* detector (and any other *pending* detector) does **not run** unless an administrator has switched on *Preferences → AI models → Show unvalidated (pending) detectors*. With the default setting the Findings tab and the models list show only the validated *Study triage* result, and PDFs carry only that detector. Only a user with the **admin** role can change the setting; it applies to the next analysis, is recorded in the audit log, and while it is on the AI-models page shows a warning badge. If you see a *Brain tumor* card, the setting is on — treat that card as described in the table above. Ask your administrator if you are unsure which setting your clinic uses.
 
 Detectors marked **Experimental** (ischemic stroke on DWI, cerebral atrophy) exist in the software but are **not run** for whole-study analysis in this build. Hemorrhage, white-matter disease and hydrocephalus detection are not implemented.
 

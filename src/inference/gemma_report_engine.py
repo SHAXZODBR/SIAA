@@ -166,6 +166,38 @@ def _cloud_llm_allowed() -> bool:
     return os.environ.get('SENTINEL_ALLOW_CLOUD_LLM') == '1'
 
 
+# Section headers of the deterministic brain report (one set for both the
+# primary path in generate() and the template fallback).
+BRAIN_SECTION_TITLES: dict[str, tuple[str, ...]] = {
+    'ru': ('КЛИНИЧЕСКОЕ ПОКАЗАНИЕ', 'МЕТОДИКА', 'ОПИСАНИЕ', 'ЗАКЛЮЧЕНИЕ', 'РЕКОМЕНДАЦИИ'),
+    'uz': ('KLINIK KO‘RSATMA', 'METODIKA', 'TAVSIF', 'XULOSA', 'TAVSIYALAR'),
+    'en': ('CLINICAL INDICATION', 'TECHNIQUE', 'DESCRIPTION', 'IMPRESSION', 'RECOMMENDATIONS'),
+}
+_BRAIN_SECTION_KEYS = ('clinical_indication', 'technique', 'description', 'impression', 'recommendation')
+
+
+def _is_brain_request(modality: Optional[str], body_part: Optional[str]) -> bool:
+    """Brain/head body part, or MR with no body part (assume brain)."""
+    bp = (body_part or '').upper()
+    mod = (modality or '').upper()
+    return 'BRAIN' in bp or 'HEAD' in bp or ('MR' in mod and not bp)
+
+
+def _brain_template_report(findings: list[dict], language: str, modality: str,
+                           sequences: Optional[list[str]] = None) -> str:
+    """Render build_brain_report() sections as the plain-text report body.
+
+    Raises whatever build_brain_report raises — callers decide the fallback.
+    """
+    from src.inference.brain_report_templates import build_brain_report
+    sec = build_brain_report(findings, language=language, modality=modality, sequences=sequences)
+    titles = BRAIN_SECTION_TITLES.get(language, BRAIN_SECTION_TITLES['ru'])
+    return "\n\n".join(
+        f"{title}: {sec[key].strip()}"
+        for title, key in zip(titles, _BRAIN_SECTION_KEYS) if (sec.get(key) or '').strip()
+    )
+
+
 # ============================================================================
 # REPORT ENGINE
 # ============================================================================
@@ -485,6 +517,7 @@ class GemmaReportEngine:
         modality: str = 'CR',
         body_part: str = 'CHEST',
         study_date: str = '',
+        sequences: Optional[list[str]] = None,
     ) -> str:
         """Generate a full radiology report.
 
@@ -495,6 +528,10 @@ class GemmaReportEngine:
             modality: CR/DX/CT/MR/etc.
             body_part: CHEST/BRAIN/etc.
             study_date: YYYY-MM-DD
+            sequences: MR sequences detected in the study (canonical names, e.g.
+                ['T1', 'T1ce', 'T2', 'FLAIR'] — the study route's
+                `sequences_present`). Brain reports build the technique line
+                from them; None → generic technique without a contrast claim.
 
         Returns:
             Full structured report as string
@@ -505,37 +542,25 @@ class GemmaReportEngine:
         # multilingual brain templates rather than the small LLM. They are
         # cleaner and never emit conversational preambles or placeholders,
         # which matters for clinical reports. (Gemma is still used for chat Q&A.)
-        _bp = (body_part or '').upper()
-        _mod = (modality or '').upper()
-        if 'BRAIN' in _bp or 'HEAD' in _bp or ('MR' in _mod and not _bp):
+        if _is_brain_request(modality, body_part):
             try:
-                from src.inference.brain_report_templates import build_brain_report
-                sec = build_brain_report(findings, language=language, modality=modality)
-                labels = {
-                    'ru': ['КЛИНИЧЕСКОЕ ПОКАЗАНИЕ', 'МЕТОДИКА', 'ОПИСАНИЕ', 'ЗАКЛЮЧЕНИЕ', 'РЕКОМЕНДАЦИИ'],
-                    'uz': ['KLINIK KO‘RSATMA', 'METODIKA', 'TAVSIF', 'XULOSA', 'TAVSIYALAR'],
-                    'en': ['CLINICAL INDICATION', 'TECHNIQUE', 'DESCRIPTION', 'IMPRESSION', 'RECOMMENDATIONS'],
-                }.get(language, None)
-                keys = ['clinical_indication', 'technique', 'description', 'impression', 'recommendation']
-                if labels and isinstance(sec, dict):
-                    report = "\n\n".join(
-                        f"{lab}: {sec.get(k, '').strip()}" for lab, k in zip(labels, keys) if sec.get(k)
-                    )
-                    return self._strip_markdown(report)
+                return self._strip_markdown(
+                    _brain_template_report(findings, language, modality, sequences))
             except Exception as e:
                 logger.warning(f"brain template failed, using LLM path: {e}")
 
         # Build findings list in markdown format
         if not findings:
+            # The product never certifies normal — not even via the LLM prompt.
             findings_str = {
-                'ru': 'Патологических изменений не выявлено.',
-                'uz': "Patologik o'zgarishlar aniqlanmadi.",
-                'en': 'No pathological changes detected.',
+                'ru': 'ИИ-модель не отметила находок.',
+                'uz': 'AI modeli topilmalarni belgilamadi.',
+                'en': 'No finding flagged by the AI model.',
             }[language]
             overall_status = {
-                'ru': 'Норма',
-                'uz': 'Norma',
-                'en': 'Normal',
+                'ru': 'Находок не отмечено — это НЕ заключение о норме, требуется просмотр рентгенологом',
+                'uz': "Topilmalar belgilanmadi — bu norma xulosasi EMAS, rentgenolog ko'rigi talab qilinadi",
+                'en': 'Nothing flagged — this is NOT a normal read; radiologist review required',
             }[language]
         else:
             findings_str = '\n'.join([
@@ -582,7 +607,8 @@ class GemmaReportEngine:
         if not report or self.backend == 'template':
             report = self._fallback_template_report(
                 {'findings': findings, 'patient_info': patient_info,
-                 'modality': modality, 'body_part': body_part},
+                 'modality': modality, 'body_part': body_part,
+                 'sequences': sequences},
                 language,
             )
 
@@ -614,38 +640,23 @@ class GemmaReportEngine:
         findings = data.get('findings', [])
         modality = (data.get('modality') or '').upper()
         body_part = (data.get('body_part') or '').upper()
-        is_brain = (
-            'BRAIN' in body_part or 'HEAD' in body_part or
-            ('MR' in modality and not body_part)  # MR with no part = assume brain
-        )
 
         # Brain branch — use the rich brain-specific templates
-        if is_brain:
+        if _is_brain_request(modality, body_part):
             try:
-                from src.inference.brain_report_templates import build_brain_report
-                report = build_brain_report(findings, language=language, modality=modality)
-                section_titles = {
-                    'ru': ('КЛИНИЧЕСКОЕ ПОКАЗАНИЕ', 'МЕТОДИКА', 'ОПИСАНИЕ', 'ЗАКЛЮЧЕНИЕ', 'РЕКОМЕНДАЦИИ'),
-                    'uz': ("KLINIK KO'RSATMA", 'METODIKA', 'TAVSIF', 'XULOSA', 'TAVSIYALAR'),
-                    'en': ('CLINICAL INDICATION', 'TECHNIQUE', 'FINDINGS', 'IMPRESSION', 'RECOMMENDATIONS'),
-                }
-                titles = section_titles.get(language, section_titles['ru'])
-                return (
-                    f"{titles[0]}: {report['clinical_indication']}\n\n"
-                    f"{titles[1]}: {report['technique']}\n\n"
-                    f"{titles[2]}: {report['description']}\n\n"
-                    f"{titles[3]}: {report['impression']}\n\n"
-                    f"{titles[4]}: {report['recommendation']}"
-                )
+                return _brain_template_report(findings, language, modality, data.get('sequences'))
             except Exception as e:
-                logger.debug(f"Brain template fallback failed, using generic: {e}")
+                logger.warning(f"Brain template fallback failed, using generic: {e}")
 
-        # Generic / chest branch
+        # Generic / chest branch. Findings explicitly marked negative are not
+        # "present"; with nothing flagged the text is non-certifying (the
+        # product never declares a study normal).
+        findings = [f for f in findings if f.get('positive') is not False]
         if not findings:
             templates = {
-                'ru': "КЛИНИЧЕСКОЕ ПОКАЗАНИЕ: Плановое обследование\n\nМЕТОДИКА: Рентгенография в прямой проекции\n\nОПИСАНИЕ: Патологических изменений не выявлено.\n\nЗАКЛЮЧЕНИЕ: Норма.\n\nРЕКОМЕНДАЦИИ: Контроль по клиническим показаниям.",
-                'uz': "KLINIK KO'RSATMA: Rejali tekshiruv\n\nMETODIKA: To'g'ri proyeksiyada rentgenografiya\n\nTAVSIF: Patologik o'zgarishlar aniqlanmadi.\n\nXULOSA: Norma.\n\nTAVSIYALAR: Klinik ko'rsatmalarga muvofiq nazorat.",
-                'en': "CLINICAL INDICATION: Routine examination\n\nTECHNIQUE: PA chest radiograph\n\nFINDINGS: No pathological changes detected.\n\nIMPRESSION: Normal.\n\nRECOMMENDATIONS: Follow up per clinical indications.",
+                'ru': "КЛИНИЧЕСКОЕ ПОКАЗАНИЕ: Обследование\n\nМЕТОДИКА: Рентгенография\n\nОПИСАНИЕ: ИИ-модель не отметила находок.\n\nЗАКЛЮЧЕНИЕ: Находок ИИ не отмечено. Это НЕ заключение о норме — требуется полный просмотр рентгенологом.\n\nРЕКОМЕНДАЦИИ: Контроль по клиническим показаниям.",
+                'uz': "KLINIK KO'RSATMA: Tekshiruv\n\nMETODIKA: Rentgenografiya\n\nTAVSIF: AI modeli topilmalarni belgilamadi.\n\nXULOSA: AI topilmalarni belgilamadi. Bu norma xulosasi EMAS — rentgenolog tomonidan to'liq ko'rib chiqish talab qilinadi.\n\nTAVSIYALAR: Klinik ko'rsatmalarga muvofiq nazorat.",
+                'en': "CLINICAL INDICATION: Examination\n\nTECHNIQUE: Radiography\n\nFINDINGS: No finding flagged by the AI model.\n\nIMPRESSION: No finding flagged by the AI. This is NOT a normal read — full radiologist review is required.\n\nRECOMMENDATIONS: Follow up per clinical indications.",
             }
             return templates[language]
 

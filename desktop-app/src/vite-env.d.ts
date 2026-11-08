@@ -29,7 +29,25 @@ interface ElectronAPI {
   openDocs?: () => Promise<{ opened: boolean; path: string | null; error?: string }>;
   /** Language for main-process dialogs (file pickers, backend crash boxes). */
   setLanguage?: (lang: 'ru' | 'uz' | 'en') => void;
+  /**
+   * Admin: pick a model bundle (*.zip) and copy it to DATA_DIR/model_inbox/.
+   * dataDirHint (the server's /health data_dir) is honoured only in dev builds;
+   * a packaged app always stages under its own user-data folder. Never rejects.
+   */
+  importModelBundle?: (opts?: { dataDirHint?: string | null }) => Promise<ShellFileResult>;
+  /** Admin: save-dialog for the diagnostics zip; writes it and reveals it in the file manager. Never rejects. */
+  saveDiagnostics?: (bytes: Uint8Array, suggestedName: string) => Promise<ShellFileResult>;
 }
+
+/**
+ * Result of a shell file operation (electron/adminIpc.js). `error` is a reason
+ * code (not_a_zip, empty_file, too_large, source_unreadable, copy_failed,
+ * copy_incomplete, write_failed, invalid_payload, empty_payload, invalid_source,
+ * invalid_target, internal_error); `detail` is technical text for the console.
+ */
+type ShellFileResult =
+  | { ok: true; path: string; name?: string; bytes?: number }
+  | { ok: false; canceled?: boolean; error?: string; detail?: string };
 
 interface Window {
   electronAPI?: ElectronAPI;

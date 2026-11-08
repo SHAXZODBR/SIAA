@@ -2,7 +2,7 @@
 
 # SIAA — Sentinel Medical AI · O‘rnatish va ma’muriy boshqaruv qo‘llanmasi (kasalxona IT xizmati)
 
-Versiya 1.0.0 · Hujjat tahriri 2026-09
+Versiya 1.1.0 · Hujjat tahriri 2026-11
 
 Ushbu qo‘llanma klinikaning IT administratori uchun mo‘ljallangan. Rentgenolog shifokorlar uchun qo‘llanma — `user_manual_uz.md`.
 
@@ -47,12 +47,21 @@ CPU da bir bosh miya tekshiruvi uchun inferens vaqti — bir necha soniyadan o�
 | Komponent | Joylashuvi (Windows) | Izohlar |
 |---|---|---|
 | Ish stoli ilovasi | Program Files (yoki foydalanuvchi papkasi) — `Sentinel Medical AI` | «Пуск» menyusi va ish stoli yorliqlari. O‘rnatuvchi ikki tilli tibbiy ogohlantirishni ko‘rsatadi; uni qabul qilish shart. |
-| Python backend | `<o‘rnatish>\resources\backend\` — `run_server.py`, `src\` va o‘zining `venv\` papkasi | Ilova ishga tushganda ishga tushiriladi. Uning stdout/stderr chiqishi `<ma’lumotlar papkasi>\logs\backend.log` ga yoziladi. |
-| Modellar | `<o‘rnatish>\resources\backend\models\` (`SENTINEL_MODELS_DIR` bilan o‘zgartirish mumkin) | `brain_triage_finetuned\` (tasdiqlangan triaj, ~330 MB, `MANIFEST.json` bilan), `hf\` (ommaviy o‘sma klassifikatori to‘plami), ixtiyoriy boshqalar. |
+| Python backend | `<o‘rnatish>\resources\backend\sentinel-backend\` — bitta dasturga «muzlatilgan» AI serveri (`sentinel-backend.exe`, o‘zining Python muhiti bilan; manba koddan o‘rnatishda uning o‘rnida `run_server.py`, `src\` va `venv\`) | Ilova ishga tushganda ishga tushiriladi. Uning stdout/stderr chiqishi `<ma’lumotlar papkasi>\logs\backend.log` ga yoziladi. |
+| Modellar | `<o‘rnatish>\resources\backend\models\` (`SENTINEL_MODELS_DIR` bilan o‘zgartirish mumkin) | `brain_triage_finetuned\` (tasdiqlangan triaj, ~330 MB, `MANIFEST.json` bilan — o‘rnatuvchida faqat *to‘liq* variantda, quyida qarang), `hf\` (ommaviy o‘sma klassifikatori to‘plami), ixtiyoriy boshqalar. |
 | Ollama + Gemma 3 | Alohida o‘rnatuvchi (ollama.com); model `ollama pull gemma3:4b` bilan yuklanadi | Kompyuter internetdan uzilishidan **oldin** o‘rnatilishi shart. |
 | Ma’lumotlar papkasi | 6-bandga qarang | Birinchi ishga tushirishda yaratiladi. |
 
 macOS da mos yo‘llar `Sentinel Medical AI.app/Contents/Resources/backend` ichida.
+
+**O‘rnatuvchining ikki varianti.** Yetkazib beruvchi bitta ilovani ikki variantda yig‘adi; qaysi biri olinganini yetkazib beruvchining ilova xati ko‘rsatadi (o‘rnatuvchi fayli ikkala variantda bir xil nomlanadi):
+
+| Variant | Yig‘ish artefakti | Tasdiqlangan triaj modeli | Nima uchun |
+|---|---|---|---|
+| **To‘liq** | `sentinel-windows-x64-full` | O‘rnatuvchi ichida. Birinchi ishga tushirishda shu kompyuter uchun avtomatik shifrlanadi (8.3-band). | Yetkazib beruvchi shaxsan bajaradigan o‘rnatishlar, namoyishlar. |
+| **Klinika** | `sentinel-windows-x64-NO-VALIDATED-MODEL` | O‘rnatuvchida **yo‘q**. USB orqali alohida, *faqat shu kompyuter uchun* shifrlangan paket sifatida, juft `license.dat` bilan birga yetkaziladi (5.3, 5.4-bandlar). | Har qanday klinikaga joriy etish: o‘rnatuvchining o‘zida yetkazib beruvchining xususiy modeli yo‘q va uni erkin nusxalash mumkin. |
+
+Paket import qilinmaguncha klinika variantidagi o‘rnatish `/health` → `"status": "degraded"` deb xabar beradi va *tasdiqlangan model yuklanmadi* bannerini ko‘rsatadi — bu kutilgan holat va 5.4-banddan keyin yo‘qoladi.
 
 ---
 
@@ -95,7 +104,7 @@ Birinchi ishga tushirishda server hech narsani rad etmaydi: **amaldagi litsenziy
 
 Litsenziya — yetkazib beruvchi tomonidan RSA bilan imzolangan va **ushbu kompyuterning barmoq iziga bog‘langan** **`license.dat`** fayli (xost nomi, OT, protsessor modeli, asosiy MAC manzil, OT machine ID).
 
-1. Barmoq izini oling. Yoki *Sozlamalar → Litsenziya* da o‘qing (ilova AI serveridan so‘raydi), yoki kompyuterda bajaring:
+1. Barmoq izini oling. Yoki *Sozlamalar → Litsenziya* da o‘qing (ilova AI serveridan so‘raydi), yoki kompyuterda `<o‘rnatish>\resources\backend\sentinel-backend\sentinel-backend.exe --print-fingerprint` ni (o‘rnatuvchidan yig‘ilma) yoki manba koddan o‘rnatishda quyidagini bajaring:
    ```
    cd <o‘rnatish>\resources\backend
    venv\Scripts\python.exe -m src.utils.license fingerprint
@@ -106,6 +115,46 @@ Litsenziya — yetkazib beruvchi tomonidan RSA bilan imzolangan va **ushbu kompy
 5. Faylni qo‘lda tekshirish: `venv\Scripts\python.exe -m src.utils.license verify --license-file <yo‘l>`.
 
 Kompyuter barmoq izi o‘zgarsa (yangi tarmoq kartasi, xost nomi o‘zgartirilgan, klonlangan VM) yoki amal qilish muddati tugasa litsenziya kuchini yo‘qotadi — sababi *Sozlamalar → Litsenziya* da va jurnalda ko‘rsatiladi. Qayta berish uchun yetkazib beruvchiga murojaat qiling; bu orada dasturiy ta’minot demo rejimiga o‘tadi, to‘xtab qolmaydi.
+
+**Klinika varianti: litsenziya modelni ham ochadi.** Klinika varianti uchun yetkazib beruvchi litsenziyani `python -m src.utils.license issue … --with-model-key` buyrug‘i bilan chiqaradi (buni uning `packaging/provision_clinic.py` vositasi bajaradi). Shunda imzolangan litsenziya ushbu kompyuterning model kaliti hosil qilinadigan sirni o‘z ichiga oladi, 5.4-banddagi model paketi esa aynan shu kalit bilan shifrlangan — litsenziya va paket bitta yetkazib berishdagi **juftlik**dir. Oqibatlari:
+
+- Avval litsenziyani import qiling, ilovani qayta ishga tushiring, so‘ngra paketni import qiling (5.4-band).
+- Litsenziya kuchini yo‘qotsa (muddati tugadi, apparat yoki xost nomi o‘zgardi), tasdiqlangan modelni endi deshifrlab bo‘lmaydi: `/health` `degraded` holatiga o‘tadi va triaj detektori to‘xtaydi. **Litsenziyani muddati tugashidan kamida 30 kun oldin uzaytiring**; apparat almashtirilgandan keyin yangi barmoq izini yuboring va yetkazib beruvchi qaytargan yangi litsenziya va paketni import qiling.
+- Klinika variantidagi o‘rnatishning litsenziyasini hech qachon boshqa yetkazib berishdagi litsenziya bilan almashtirmang: boshqa kalitli litsenziya juft paket import qilinmaguncha o‘rnatilgan paketni o‘qib bo‘lmaydigan qiladi.
+- To‘liq variantdagi o‘rnatish odatda litsenziyani `--with-model-key` **siz** oladi (uning modeli birinchi ishga tushirishda o‘rnatish kaliti bilan shifrlanadi, 8.3-band). Agar baribir shunday litsenziya olsa, server keyingi ishga tushirishda modelni litsenziya kaliti bilan qayta shifrlaydi va shundan keyin model yuqorida tasvirlanganidek litsenziyaga bog‘liq bo‘ladi.
+
+### 5.4 Shifrlangan model paketini o‘rnatish (klinika varianti)
+
+Har bir kompyuter uchun yetkazib beruvchi `<klinika>_<barmoq izining dastlabki 8 belgisi>` nomli papkani topshiradi; unda `license.dat`, `brain_triage_finetuned_<identity12>_<fp8>.zip` va `README_admin_ru.txt` / `README_admin_en.txt` yo‘riqnomalari bo‘ladi. `<identity12>` — model identifikatori (`MANIFEST.json` da qayd etilgan ochiq matn SHA-256 ining dastlabki 12 ta hex belgisi); `<fp8>` *Sozlamalar → Litsenziya* da ko‘rsatilgan barmoq izining dastlabki 8 belgisiga teng bo‘lishi shart.
+
+Dastlabki shartlar: siz **admin** sifatida kirgansiz; xuddi shu papkadagi `license.dat` o‘rnatilgan (5.3-band), ilova qayta ishga tushirilgan va *Sozlamalar → Litsenziya* da *Litsenziyalangan* ko‘rsatilgan.
+
+1. Zip faylni USB tashuvchidan kompyuterga nusxalang. Uni **ochmang** (arxivdan chiqarmang).
+2. *Sozlamalar → AI modellari → Model paketini import qilish* → zip faylni tanlang. Ilova uni `<ma’lumotlar papkasi>\model_inbox\` ga nusxalaydi va AI serveridan uni o‘rnatishni so‘raydi (`POST /models/import`, faqat administrator).
+3. Server qayta ishga tushirilmasdan: fayl `model_inbox\` ichida ekanini tekshiradi; uni vaqtinchalik papkaga ochadi; `MANIFEST.json` dagi ochiq matn (`model.safetensors`) va shifrlangan matn (`model.safetensors.enc`) yozuvlarini hamda yo‘ldosh fayldagi `plaintext_sha256` ni tekshiradi; **og‘irliklarni shu kompyuter kaliti bilan sinov tariqasida deshifrlaydi**; joriy `brain_triage_finetuned\` ni `brain_triage_finetuned_prev_<eski identifikator>` ga ko‘chiradi; yangi papkani modellar papkasiga (3-band) joylaydi va detektorni qayta yuklaydi. Ochiq og‘irliklar diskka yozilmaydi. Qadam audit jurnaliga yoziladi.
+4. Bildirishnoma yangi **identifikator**ni ko‘rsatadi. U fayl nomidagi `<identity12>` ga va yetkazib beruvchi README sidagi identifikatorga teng bo‘lishi shart. So‘ngra tekshiring: `/health` → `"status": "ok"` va `models.brain_triage.loaded: true`, *Sozlamalar → AI modellari* da *Tekshiruv triaji* modeli xuddi shu identifikator bilan ko‘rsatilgan, bitta sinov tekshiruvidan keyin u PDF pastida ham chop etilgan. Identifikator va sanani klinikaning o‘zgarishlar jurnaliga yozing.
+
+Biror narsa bajarilmasa, oldingi model joyida qoladi (avtomatik orqaga qaytarish), bildirishnoma esa sababni aytadi:
+
+| Sabab kodi | Ma’nosi | Nima qilish kerak |
+|---|---|---|
+| `bundle_not_for_this_machine` | Paket boshqa kompyuter uchun shifrlangan yoki o‘rnatilgan litsenziya xuddi shu yetkazib berishdan emas (kalit mos kelmaydi). | Fayl nomidagi `<fp8>` ni *Sozlamalar → Litsenziya* bilan solishtiring; xuddi shu papkadagi litsenziyani import qilib, qayta ishga tushiring; aks holda yangi paket uchun joriy barmoq izini yetkazib beruvchiga yuboring. |
+| `license_model_key_missing` | Ushbu kompyuterda model kalitli faol litsenziya yo‘q: yetkazib berishdagi `license.dat` hali import qilinmagan yoki import qilingandan keyin ilova qayta ishga tushirilmagan. | Xuddi shu papkadagi `license.dat` ni import qiling (5.3-band), ilovani qayta ishga tushiring va paketni yana import qiling. |
+| `manifest_mismatch`, `sidecar_mismatch`, `decrypted_hash_mismatch`, `bundle_incomplete`, `bundle_invalid` | Fayl ko‘chirishda buzilgan (USB, to‘liq bo‘lmagan nusxa), o‘zgartirilgan yoki to‘liq emas. | USB tashuvchidan qaytadan nusxalang; `certutil -hashfile <zip> SHA256` natijasini yetkazib beruvchining ilova xatidagi qiymat bilan solishtiring. |
+| `path_outside_inbox`, `bundle_not_zip`, `bundle_contains_plaintext` | Fayl *Model paketini import qilish* orqali berilmagan yoki u shifrlangan Sentinel model paketi emas. | *Sozlamalar → AI modellari* dagi tugmadan foydalaning; faqat yetkazib beruvchi papkasidagi zip ni import qiling. |
+| `models_dir_not_writable`, `model_dir_overridden` | Dasturning modellar papkasiga yozib bo‘lmaydi (ilova barcha foydalanuvchilar uchun Program Files ga o‘rnatilgan) yoki `SENTINEL_MODEL_DIR_OVERRIDE_BRAIN_TRIAGE` berilgan. | Joriy foydalanuvchi uchun qayta o‘rnating (o‘rnatuvchining standart varianti) yoki import uchun ilovani bir marta *Administrator nomidan ishga tushirish* orqali oching; almashtirish o‘zgaruvchisini olib tashlang. |
+| HTTP 403 / `import_in_progress` | Kirgan foydalanuvchi administrator emas / boshqa import hali bajarilmoqda. | admin sifatida kiring / kuting va qaytadan urining. |
+
+Olingan papkani saqlang (USB tashuvchi va klinikaning zaxira nusxalari bilan birga nusxa, 6.1-band): **ilovaning har bir yangilanishidan keyin xuddi shu paketni qayta import qiling** (8.1-band) — yangilanish import qilingan model joylashgan dastur papkasini almashtiradi.
+
+### 5.5 Tasdiqlanmagan (pending) detektorlar — standart holatda o‘chiq
+
+Ommaviy *bosh miya o‘smasi* klassifikatori **tasdiqlash kutilmoqda** holatida va mahalliy tomograflarda o‘smalarni ortiqcha belgilaydi. Shu sababli 1.1.0 versiyasidan boshlab kasalxona yig‘ilmalari **pending holatidagi detektorlarni ishga tushirmaydi**; shifokorlar faqat tasdiqlangan *tekshiruv triaji* natijasini ko‘radi. Eksperimental detektorlar butun tekshiruv tahlilida hech qachon ishga tushirilmaydi.
+
+- Kalit: *Sozlamalar → AI modellari → Tasdiqlanmagan (pending) detektorlarni ko‘rsatish* (faqat administratorlar). O‘zgarish qayta ishga tushirishsiz keyingi tahlildan kuchga kiradi, `<ma’lumotlar papkasi>\settings.json` ga saqlanadi va audit jurnaliga yoziladi (kim, qachon, eski → yangi qiymat). Kalit yoqilgan paytda AI modellari sahifasida ogohlantiruvchi belgi ko‘rinadi. API: administrator tokeni bilan `GET` / `PUT /settings/ai`; `/health` → `ai_settings` joriy qiymatni va uning manbasini (`file`, `env` yoki `default`) ko‘rsatadi.
+- Boshlang‘ich qiymatni `SENTINEL_SHOW_PENDING_DETECTORS` (9-band) bilan berish mumkin; ilovada saqlangan qiymat ustun turadi.
+- Uni faqat klinikaning klinik rahbari yozma rozilik bergandan keyin yoqing (masalan, pilot davomida tadqiqot taqqoslashi uchun) va shifokorlarni ogohlantiring.
+- Ushbu relizda **bosh KT** uchun tasdiqlangan detektor yo‘q: kalit o‘chiq bo‘lsa, bosh KT tekshiruvi ish ro‘yxatiga qabul qilinadi, lekin *Ko‘rib chiqish kerak* holati va u uchun tasdiqlangan AI detektori yo‘qligi haqidagi izoh bilan qaytariladi — rentgenolog uni odatdagidek o‘qiydi. Kalit yoqilgan bo‘lsa, ommaviy qon quyilishi klassifikatori ishga tushadi va uning natijasi *tasdiqlash kutilmoqda* deb belgilanadi.
 
 ---
 
@@ -131,9 +180,11 @@ Tarkibi:
 | `doctor_corrections\` | Rentgenolog shifokorlarning AI qoralamalariga tahrirlari, faqat qo‘shiladigan JSONL (hisobot matni, tekshiruv ID, foydalanuvchi ID) | Hisobot matni |
 | `training_corpus\` | O‘quv ma’lumotlari yig‘uvchisi yozadigan **identifikatorlarsiz** miniatyuralar va yorliqlar (ismlar, ID lar, tug‘ilgan sanalar yo‘q) | Identifikatorlarsiz |
 | `dicom_cache\` | Vaqtinchalik DICOM keshi | Ha |
-| `license.dat` | Kompyuterga bog‘langan litsenziya | Yo‘q |
+| `license.dat` | Kompyuterga bog‘langan litsenziya. Klinika variantida model kalitining sirini ham saqlaydi (5.3-band) — uni maxfiy deb hisoblang va yetkazib beruvchidan boshqa hech kimga bermang. | Yo‘q |
 | `jwt_secret.key` | Kirish tokenlarini imzolaydigan sir (rejim 0600). Uni o‘chirish hammani tizimdan chiqaradi. | Yo‘q |
-| `model_key.bin` | Shifrlangan model og‘irliklari uchun har bir o‘rnatishga xos sir (reliz shifrlangan og‘irliklar bilan kelsa) | Yo‘q |
+| `model_key.bin` | Litsenziyada kalit siri bo‘lmaganda model kaliti uchun o‘rnatishga xos sir (to‘liq variant, 8.3-band). Birinchi foydalanishda yaratiladi, rejim 0600. Yo‘qolsa, shifrlangan og‘irliklarni o‘qib bo‘lmaydi. | Yo‘q |
+| `settings.json` | Administrator saqlagan AI sozlamalari (*Tasdiqlanmagan (pending) detektorlarni ko‘rsatish*, 5.5-band) | Yo‘q |
+| `model_inbox\` | *Sozlamalar → AI modellari → Model paketini import qilish* orqali import qilingan model paketlari (5.4-band) | Yo‘q |
 
 Yuklangan DICOM fayllari tahlil paytida server tanlagan nomlar bilan vaqtinchalik papkaga yoziladi va darhol o‘chiriladi; server sarlavha maydonlari va kichik oldindan ko‘rish tasvirini saqlaydi, tekshiruvning o‘zini emas.
 
@@ -142,7 +193,7 @@ Yuklangan DICOM fayllari tahlil paytida server tanlagan nomlar bilan vaqtinchali
 Ma’lumotlar bazasi **shifrlanmagan holda** saqlanadi. Kompyuterni shifrlangan diskda ishlating (BitLocker / FileVault) va zaxira nusxani quyidagicha oling:
 
 1. Ish stoli ilovasini yoping (bu serverni to‘xtatadi) yoki hech qanday tahlil bajarilmayotganiga ishonch hosil qiling.
-2. **Butun ma’lumotlar papkasini** (6-band) tashqi diskka yoki NAS ga nusxalang — kamida `sentinel.db`, `sentinel.db-wal`, `sentinel.db-shm`, `doctor_corrections\`, `license.dat`, `jwt_secret.key`, `logs\`.
+2. **Butun ma’lumotlar papkasini** (6-band) tashqi diskka yoki NAS ga nusxalang — kamida `sentinel.db`, `sentinel.db-wal`, `sentinel.db-shm`, `doctor_corrections\`, `license.dat`, `jwt_secret.key`, `model_key.bin`, `settings.json`, `model_inbox\`, `logs\`. `license.dat` / `model_key.bin` siz tiklangan o‘rnatish o‘z modelini deshifrlay olmaydi.
 3. Uchta nusxa saqlang (mahalliy, tashqi, boshqa joyda), olinadigan tashuvchilarni shifrlang va zaxira kompyuterda har oy **tiklashni sinab ko‘ring**: xuddi shu versiyani o‘rnating, papkani qaytarib nusxalang, ishga tushiring, tizimga kiring, imzolangan hisobotni oching.
 
 Yordamchi skript mavjud (`scripts\backup_restore.py backup --out <papka>`, nazorat summali `.tar.gz` yaratadi), lekin u bazani backend ning `data\` papkasi ostida kutadi; unga tayanishdan oldin u haqiqatan ham sizning ma’lumotlar papkangizni olganini tekshiring. Yuqoridagi oddiy papka nusxasi har doim to‘g‘ri.
@@ -171,7 +222,8 @@ Jurnallarni yetkazib beruvchiga yuborishda faqat `sentinel_*.log` / `backend.log
 1. Ma’lumotlar papkasining zaxira nusxasini oling (6.1-band).
 2. Yangi o‘rnatuvchini eski versiya ustidan ishga tushiring (Windows) yoki ilova paketini almashtiring (macOS). Ma’lumotlar papkasiga tegilmaydi.
 3. Ilovani bir marta administrator sifatida ishga tushiring. Ma’lumotlar bazasi **o‘zi migratsiya qiladi** (yangi ustunlar qo‘shiladi; hech narsa o‘chirilmaydi). `/health` → `version` ni va kirish ekranidagi versiyani tekshiring.
-4. Ish stoli ilovasi va server bir xil versiya raqamiga ega (ushbu tahrirda 1.0.0); versiya har bir PDF da chop etiladi.
+4. Ish stoli ilovasi va server bir xil versiya raqamiga ega (ushbu tahrirda 1.1.0); versiya har bir PDF da chop etiladi.
+5. **Klinika varianti:** yangilanish dastur papkasini import qilingan model bilan birga almashtiradi — xuddi shu model paketini qayta import qiling (5.4-band) va `/health` `"status": "ok"` qaytarishini tekshiring. To‘liq variant o‘rnatuvchisi modelni o‘zi bilan olib keladi va birinchi ishga tushirishda uni yana shifrlaydi (8.3-band).
 
 ### 8.2 Modelni yangilash — MANIFEST va reliz darvozasi
 
@@ -190,11 +242,13 @@ Model yangilanishini o‘rnatish:
 
 Model papkasi ichidagi fayllarni hech qachon tahrirlamang va nomini o‘zgartirmang: server identifikatori tasdiqlanganiga mos kelmaydigan modelni yuklaydi.
 
-### 8.3 Shifrlangan model og‘irliklari (reliz ular bilan kelsa)
+### 8.3 Shifrlangan model og‘irliklari — birinchi ishga tushirishda avtomatik
 
-Mahalliy o‘qitilgan detektor — yetkazib beruvchining intellektual mulki; reliz uni **diskda shifrlangan holda** (AES-256-GCM) yetkazishi mumkin. Bunday papkada `model.safetensors` o‘rniga `model.safetensors.enc` va `model.safetensors.enc.meta.json` bo‘ladi. Server og‘irliklarni yuklash paytida to‘g‘ridan-to‘g‘ri xotiraga deshifrlaydi; ochiq matn o‘rnatish diskiga hech qachon yozilmaydi.
+Mahalliy o‘qitilgan detektor — yetkazib beruvchining intellektual mulki; har bir klinika kompyuterida u **diskda shifrlangan holda** (AES-256-GCM) saqlanadi. Shifrlangan model papkasida `model.safetensors` o‘rniga `model.safetensors.enc` va `model.safetensors.enc.meta.json` bo‘ladi. Server og‘irliklarni yuklash paytida to‘g‘ridan-to‘g‘ri xotiraga deshifrlaydi; ochiq matn o‘rnatish diskiga hech qachon yozilmaydi.
 
-- **Kalit** yoki ma’lumotlar papkasidagi `model_key.bin` (birinchi foydalanishda yaratiladi, rejim 0600) va kompyuter barmoq izidan hosil qilinadi, yoki yetkazib beruvchi ushbu o‘rnatish uchun bergan `SENTINEL_MODEL_KEY_HEX` orqali beriladi. `model_key.bin` yo‘qolsa yoki barmoq izi o‘zgarsa, og‘irliklarni deshifrlab bo‘lmaydi — `/health` `degraded` holatini ko‘rsatadi; yetkazib beruvchiga murojaat qiling.
+- **Avtomatik shifrlash (to‘liq variant).** O‘rnatilgan Windows ilovasi serverni `SENTINEL_ENCRYPT_MODELS_AT_REST=1` bilan ishga tushiradi. Birinchi ishga tushirishda server har bir xususiy `*_finetuned` modelning ochiq og‘irliklarini joyida shu o‘rnatish kaliti bilan shifrlaydi, natijani qayta deshifrlab, ochiq matnni o‘chirishdan **oldin** uning SHA-256 ini ochiq matn bilan solishtiradi va har qanday xatoda asl holatni tiklaydi. O‘rnatish kaliti bilan allaqachon shifrlangan model, agar kalit endi litsenziyadan olinsa, xuddi shu tarzda qayta shifrlanadi. `sentinel_*.log` dagi qator (*Encryption at rest: OK …* yoki *ENCRYPTION AT REST FAILED …*) natijani har ikki holatda ham bildiradi; xatoda ham server ishga tushadi. O‘zgaruvchi berilmagan bo‘lsa (dasturchi ishga tushirishi, CI tutun testlari, manba koddan o‘rnatish), `SENTINEL_DEV_INSECURE=1` bo‘lsa va macOS da imzolangan `.app` paketi ichida hech narsa qilinmaydi (bunday DMG modelni shifrlanmagan holda saqlaydi — klinikalar uchun Windows dan foydalaning). Model identifikatori o‘zgarmaydi: u ochiq matnning SHA-256 i.
+- **Klinika varianti.** Paket shu kompyuter uchun allaqachon shifrlangan holda keladi (5.4-band); ishga tushirishda hech narsa shifrlanmaydi.
+- **Kalit** quyidagi tartibda tanlanadi: `SENTINEL_MODEL_KEY_HEX` (xom kalit, faqat yetkazib beruvchi uchun) → **amaldagi** litsenziya ichidagi `model_key_secret` (klinika varianti, 5.3-band) → ma’lumotlar papkasidagi `model_key.bin` (birinchi foydalanishda yaratiladi, rejim 0600). Oxirgi ikkitasi kompyuter barmoq izi bilan birlashtiriladi. `python -m src.utils.model_crypto keyinfo` qaysi manba ishlatilganini ko‘rsatadi. Litsenziya muddati tugasa yoki kuchini yo‘qotsa, `model_key.bin` yo‘qolsa yoki barmoq izi o‘zgarsa, og‘irliklarni deshifrlab bo‘lmaydi — `/health` `degraded` holatini ko‘rsatadi; yetkazib beruvchiga murojaat qiling.
 - **Xeshni tekshirish** 8.2-banddagi 3-qadamdan farq qiladi: `MANIFEST.json` **ochiq matn** SHA-256 ni (`model.safetensors` yozuvi — ilova ko‘rsatadigan barmoq izi) va **shifrlangan fayl** SHA-256 ni (`model.safetensors.enc` yozuvi) qayd etadi. `certutil -hashfile model.safetensors.enc SHA256` (macOS: `shasum -a 256 model.safetensors.enc`) natijasini `.enc` yozuvi bilan, `model.safetensors.enc.meta.json` ichidagi `plaintext_sha256` ni esa `model.safetensors` yozuvi bilan solishtiring.
 - Buyruq qatori vositasi (backend papkasidan): `python -m src.utils.model_crypto encrypt <model_papkasi>` (og‘irliklar → `.enc`, ochiq matn o‘chiriladi), `python -m src.utils.model_crypto decrypt <model_papkasi>` (teskari amal) va `python -m src.utils.model_crypto keyinfo` (kalit manbai va kalit barmoq izi; kalitning o‘zi emas). `encrypt`/`decrypt` — yetkazib beruvchining reliz tayyorlash qadamlari; ularni hech qachon ishlayotgan `models\` daraxtida bajarmang, faqat nusxada. Klinika kompyuterida odatda faqat `keyinfo` kerak bo‘ladi — yetkazib beruvchi so‘raganda.
 
@@ -202,7 +256,7 @@ Mahalliy o‘qitilgan detektor — yetkazib beruvchining intellektual mulki; rel
 
 ## 9. Muhit o‘zgaruvchilari
 
-Server jarayoni uchun beriladi (yig‘ilgan distributivda ish stoli qobig‘i `SENTINEL_REQUIRE_AUTH=1` va `SENTINEL_DATA_DIR` ni o‘zi o‘rnatadi).
+Server jarayoni uchun beriladi (yig‘ilgan distributivda ish stoli qobig‘i `SENTINEL_REQUIRE_AUTH=1`, `SENTINEL_DATA_DIR`, `SENTINEL_HOSPITAL_BUILD=1` va `SENTINEL_ENCRYPT_MODELS_AT_REST=1` ni o‘zi o‘rnatadi).
 
 | O‘zgaruvchi | Standart qiymat | Vazifasi |
 |---|---|---|
@@ -221,7 +275,9 @@ Server jarayoni uchun beriladi (yig‘ilgan distributivda ish stoli qobig‘i `S
 | `SENTINEL_CORS_ORIGINS` / `SENTINEL_CORS_ALLOW_ALL` | localhost + Electron manbalari / o‘chiq | Qo‘shimcha brauzer manbalari; `ALLOW_ALL=1` ishlab chiqarish uchun emas |
 | `SENTINEL_TLS_CERT`, `SENTINEL_TLS_KEY` | berilmagan | HTTPS orqali xizmat ko‘rsatish — server qachondir localhost dan tashqariga ochilsa, majburiy |
 | `SENTINEL_WORKERS` | `1` | Uvicorn ishchi jarayonlari soni |
-| `SENTINEL_MODEL_KEY_HEX` | `model_key.bin` + kompyuter barmoq izidan hosil qilinadi | Shifrlangan model og‘irliklari uchun xom AES kaliti (`.enc` og‘irliklar bilan keladigan relizlar; 8.3-band) |
+| `SENTINEL_MODEL_KEY_HEX` | berilmagan: kalit litsenziyadagi `model_key_secret` dan, aks holda `model_key.bin` dan (+ kompyuter barmoq izi) | Shifrlangan model og‘irliklari uchun xom AES kaliti; boshqa ikkala manbadan ustun (faqat yetkazib beruvchi uchun; 8.3-band) |
+| `SENTINEL_ENCRYPT_MODELS_AT_REST` | o‘rnatilgan Windows/macOS ilovasida `1` (qobiq o‘rnatadi), aks holda `0` yoki berilmagan | `1` = ishga tushirishda xususiy modellarning ochiq og‘irliklarini joyida shifrlash (o‘chirishdan oldin tekshirish, xatoda orqaga qaytarish; 8.3-band). `SENTINEL_DEV_INSECURE=1` bilan va macOS `.app` paketi ichida e’tiborga olinmaydi. Qo‘lda bermang. |
+| `SENTINEL_SHOW_PENDING_DETECTORS` | kasalxona yig‘ilmalarida (`SENTINEL_HOSPITAL_BUILD=1`) `0`, aks holda `1` | *Tasdiqlanmagan (pending) detektorlarni ko‘rsatish* ning boshlang‘ich qiymati (5.5-band); `1` pending detektorlarni, masalan ommaviy o‘sma klassifikatorini ishga tushiradi. *Sozlamalar → AI modellari* da saqlangan qiymat (`settings.json`) ustun turadi. |
 | `SENTINEL_MODEL_DIR_OVERRIDE_<KEY>` | berilmagan | Bitta detektorni boshqa papkaga yo‘naltirish (faqat yetkazib beruvchining A/B sinovlari) |
 | `SENTINEL_DEFAULT_LANG` | `ru` | Ixtiyoriy papka kuzatuvchisi uchun hisobot tili |
 | `OLLAMA_KEEP_ALIVE` (Ollama ning o‘z o‘zgaruvchisi) | — | masalan `24h` — Gemma ni xotirada ushlab turadi, kunning birinchi hisoboti sekin bo‘lmasligi uchun |
@@ -233,10 +289,11 @@ Server jarayoni uchun beriladi (yig‘ilgan distributivda ish stoli qobig‘i `S
 **`GET http://127.0.0.1:8000/health`** dan boshlang (kompyuterdagi brauzerda oching; kirish talab qilinmaydi). U quyidagini qaytaradi:
 
 ```json
-{ "status": "ok" | "degraded" | "error", "version": "1.0.0", "device": "cpu",
+{ "status": "ok" | "degraded" | "error", "version": "1.1.0", "device": "cpu",
   "auth_required": true, "offline": true,
-  "models": { "brain_triage": {"loaded": true, "reason": "…"},
-              "brain_tumor_class": {"loaded": true, "reason": "…"},
+  "ai_settings": { "show_pending_detectors": false, "source": "default" },
+  "models": { "brain_triage": {"loaded": true, "reason": "…", "identity": "<12 hex>"},
+              "brain_tumor_class": {"loaded": false, "reason": "not loaded"},
               "chest": {"loaded": false, "reason": "not loaded"} },
   "llm": { "backend": "ollama" | "template" | null, "reachable": true },
   "license": { "mode": "licensed" | "unlicensed" | "demo" | "dev" },
@@ -246,19 +303,29 @@ Server jarayoni uchun beriladi (yig‘ilgan distributivda ish stoli qobig‘i `S
 | Belgi | Qayerga qarash | Yechim |
 |---|---|---|
 | Kirish ekranida **AI serveri: ishlamayapti**; qizil banner *AI serveri ishlamayapti* | `/health` javob bermaydi. `<ma’lumotlar papkasi>\logs\backend.log` va eng yangi `sentinel_*.log` | `resources\backend\run_server.py` va uning `venv` papkasi mavjudligini; 8000 portni boshqa dastur band qilmaganini tekshiring; jurnaldagi oxirgi traceback ni o‘qing. Ish stoli qobig‘i serverni 3 marta qayta ishga tushiradi (2 s / 4 s / 8 s), so‘ngra jurnal yo‘li bilan dialog ko‘rsatadi. Ilovani qayta ishga tushiring; davom etsa, kompyuterni qayta yoqing; keyin jurnal bilan yetkazib beruvchiga murojaat qiling. |
-| Banner *AI serveri qisman ishlamoqda: tasdiqlangan model yuklanmadi* | `/health` → `status: degraded`, `models.brain_triage.loaded: false`, `reason` ni o‘qing | Odatda **model yo‘q**: `brain_triage_finetuned` papkasi yo‘q, to‘liq emas yoki ko‘chirilgan. Uni o‘rnatish tashuvchisidan / yetkazib beruvchi paketidan tiklang va qayta ishga tushiring. Ungacha panel faqat «tasdiqlash kutilmoqda» holatidagi natijalarni beradi — rentgenolog shifokorlarga unga tayanmaslikni ayting. |
-| `models.brain_tumor_class.loaded: false` | `reason` qidirilgan papkalarni ko‘rsatadi | Model to‘plamini (`models\hf\…`) o‘rnatish tashuvchisidan nusxalang. Halokatli emas: triaj detektori ishlashda davom etadi. |
+| Banner *AI serveri qisman ishlamoqda: tasdiqlangan model yuklanmadi* | `/health` → `status: degraded`, `models.brain_triage.loaded: false`, `reason` ni o‘qing | **Klinika varianti, yangi o‘rnatish yoki yangilanishdan keyin:** model paketini import qiling (5.4-band). **Litsenziya muddati tugagan / apparat almashtirilgan** (klinika varianti): model kaliti litsenziyadan olinadi — uni uzaytiring yoki yangi yetkazib berishni so‘rang (5.3-band). Aks holda odatda **model yo‘q**: `brain_triage_finetuned` papkasi yo‘q, to‘liq emas yoki ko‘chirilgan — uni o‘rnatish tashuvchisidan / yetkazib beruvchi paketidan tiklang va qayta ishga tushiring. Ungacha tasdiqlangan AI natijasi yo‘q — rentgenolog shifokorlarga AI ga tayanmaslikni ayting. |
+| `models.brain_tumor_class.loaded: false` | `ai_settings.show_pending_detectors`; `reason` qidirilgan papkalarni ko‘rsatadi | Tasdiqlanmagan detektorlar o‘chirilgan paytda bu **kutilgan holat** (5.5-band): model ishga tushishda yuklanmaydi va administrator ularni yoqqandan keyingi birinchi tekshiruvda yuklanadi. Agar ular yoqilgan bo‘lsa-yu xato qolsa, model to‘plamini (`models\hf\…`) o‘rnatish tashuvchisidan nusxalang. Halokatli emas: triaj detektori ishlashda davom etadi. `models.brain_triage.identity` — yuklangan triaj modelining 12 belgili identifikatori; uni yetkazib berish README fayli bilan solishtiring. |
 | Holat panelida **LLM: mavjud emas**; bildirishnoma *Shablon hisobot — AI yordamchisi mavjud emas* | `/health` → `llm.reachable: false` | Ollama ishlamayapti yoki Gemma modeli yo‘q: `ollama list`, `ollama serve`, `ollama pull gemma3:4b`. Topilmalar va imzolashga ta’sir qilmaydi. |
 | *Sozlamalar → Litsenziya* da **Litsenziyasiz** / **Demo rejim**; tahlillar «Demo limit reached (10 analyses/day)» bilan to‘xtaydi | `/license/status` → `info.reason` | `no license file at …` → `license.dat` ni ma’lumotlar papkasiga nusxalang; `invalid signature` → fayl buzilgan yoki tahrirlangan, yangi nusxa oling; `bound to a different machine` → apparat/xost nomi o‘zgargan, yangi barmoq izini yetkazib beruvchiga yuboring; `license expired on …` → uzaytiring. Faylni almashtirgandan keyin qayta ishga tushiring. |
 | Shifokor imzolay olmaydi: *Sizning rolingiz hisobot imzolashga ruxsat bermaydi* | `/auth/me` dagi rol | Faqat *radiologist* va *admin* imzolay oladi; laborantlar — yo‘q. Foydalanuvchini to‘g‘ri rol bilan qayta yarating. |
 | *Bu tildagi hisobot allaqachon imzolangan* (HTTP 409) | kutilgan xatti-harakat | Har bir tekshiruv va til uchun bitta imzolangan hisobot. Xato emas. |
-| Tekshiruv **Ko‘rib chiqish kerak** bilan qaytadi | «Topilmalar» yorlig‘i sababini ko‘rsatadi | Bosh miyaga oid bo‘lmagan MRT yoki modeli o‘rnatilmagan modallik. Tekshiruv AI siz o‘qilishi kerak. Nosozlik emas. |
+| Tekshiruv **Ko‘rib chiqish kerak** bilan qaytadi | «Topilmalar» yorlig‘i sababini ko‘rsatadi | Bosh miyaga oid bo‘lmagan MRT, modeli o‘rnatilmagan modallik yoki — ushbu relizda bosh KT — pending detektorlar o‘chiq bo‘lganda *tasdiqlangan* detektor yo‘q (5.5-band; izoh shuni aytadi). Tekshiruv AI siz o‘qilishi kerak. Nosozlik emas. |
+| Model importi rad etildi | *Model paketini import qilish* dan keyingi bildirishnoma; audit jurnali | 5.4-banddagi sabablar jadvaliga qarang (`bundle_not_for_this_machine`: litsenziya va paket shu kompyuter uchun bitta yetkazib berishdan emas). Oldingi model joyida qoladi. |
 | Yuklash rad etildi: *No readable DICOM file in the upload* | — | Fayllar DICOM emas (skrinshotlar, ZIP, NIfTI). Tekshiruvni tomograf/PACS dan DICOM sifatida eksport qiling. |
 | Hamma bir vaqtda tizimdan chiqib ketdi | `jwt_secret.key` o‘chirilgan yoki `SENTINEL_JWT_SECRET` o‘zgartirilgan | Bunday o‘zgarishdan keyin kutilgan holat; foydalanuvchilar shunchaki qayta kiradi. |
 | Administrator paroli unutilgan | — | Tiklash interfeysi yo‘q. Serverni to‘xtating, `sentinel.db` ning zaxira nusxasini oling va tiklash tartibi uchun yetkazib beruvchiga murojaat qiling (yangi bir martalik administrator paroli faqat administrator hisob qaydnomasi mavjud bo‘lmaganda yaratiladi). |
 | PDF eksporti bajarilmaydi | «Hisobot» yorlig‘idagi bildirishnoma *PDF eksport qilib bo‘lmadi* | Bo‘sh disk joyini va tanlangan papkaga yozish mumkinligini tekshiring; «Yuklab olishlar» papkasini sinab ko‘ring. |
 
 Server uchun pytest tekshiruv testlarini (`tests\`) so‘rov bo‘yicha yetkazib beruvchi bajarishi mumkin.
+
+**Diagnostikani eksport qilish.** Qo‘llab-quvvatlash so‘rovi uchun *Sozlamalar → Dastur haqida → Diagnostikani eksport qilish* dan foydalaning (faqat administratorlar; ilova `GET /diagnostics` ni chaqiradi va `sentinel-diagnostics-<YYYYMMDD-HHMM>.zip` ni qayerga saqlashni so‘raydi). Jurnal fayllarini qo‘lda tanlash o‘rniga yetkazib beruvchiga shu zip ni yuboring. Uning tarkibi:
+
+- `health.json` (`/health` javobi), `license.json` (faqat litsenziya holati — litsenziya faylining o‘zi hech qachon emas), `ai_settings.json`;
+- `versions.json` (ilova, Python, PyTorch, transformers, operatsion tizim) va `models.json` (har bir modelning identifikatsiya kartasi: nomi, SHA-256 barmoq izi, tasdiqlash holati);
+- `logs\backend.log` ning oxiri (so‘nggi 2 MB) va eng yangi `sentinel_*.log` ning oxiri — identifikatorlari allaqachon yashirilgan (7-band);
+- `audit_tail.jsonl` (so‘nggi 200 ta audit yozuvi, bemor ID va ismi maydonlari `<redacted>` bilan almashtirilgan) va `settings_redacted.json`.
+
+Unda tasvirlar va prevyular, ma’lumotlar bazasi, `license.dat`, `jwt_secret.key`, `model_key.bin` va model fayllari **yo‘q**. Yuborishdan oldin zip ni ochib, ko‘zdan kechiring; u bemor ma’lumotlarisiz bo‘lishi uchun loyihalangan.
 
 ---
 
@@ -294,7 +361,8 @@ Har bir shifokorga shaxsiy hisob qaydnomasi bering — hisobotdagi imzo bu uni i
 - **Bulut yo‘q.** Server hech qachon internetga murojaat qilmaydi: modellar uchun oflayn rejim, bulutli LLM o‘chirilgan, Hugging Face telemetriyasi o‘chirilgan. Yagona tarmoq qo‘shnilari — xuddi shu kompyuterdagi ish stoli ilovasi va Ollama.
 - **Portlar localhost ga bog‘langan** (`127.0.0.1:8000`, `localhost:11434`). Xostni `0.0.0.0` ga o‘zgartirmang va brandmauerga istisnolar qo‘shmang. Qachondir bir nechta kompyuterga joylashtirish talab qilinsa, TLS (`SENTINEL_TLS_*`) va yetkazib beruvchi bilan kelishilgan tarmoq sxemasidan foydalaning.
 - API hujjatlari sahifalari (`/docs`, `/redoc`) ishlab chiqarish yig‘ilmalarida o‘chirilgan.
-- **Diskni shifrlang** (BitLocker / FileVault): SQLite bazasi va jurnallar ilova tomonidan shifrlanmaydi.
+- **Diskni shifrlang** (BitLocker / FileVault): SQLite bazasi va jurnallar ilova tomonidan shifrlanmaydi. Yetkazib beruvchining xususiy model og‘irliklari esa shifrlanadi (8.3-band); ilova klinika variantidagi paketdan faqat u yaratilgan kompyuterda foydalanadi. E’tibor bering: `license.dat` zip-paket bilan birga istalgan kompyuterda og‘irliklarning kalitidir — yetkazib berish papkasini shifrlangan tashuvchida yoki yopiq zaxira nusxalarida saqlang, hech qachon umumiy papkada yoki elektron pochtada emas.
+- Tasdiqlanmagan (pending) detektorlar standart holatda o‘chiq (5.5-band); bu sozlamaning har bir o‘zgarishi audit jurnaliga yoziladi. Diagnostika zip fayli (10-band) bemor ma’lumotlari, kalitlar va litsenziya faylini o‘z ichiga olmaydi.
 - Imzolangan hisobotlar sezilmas o‘zgartirishdan himoyalangan (matn SHA-256 si, imzolagan shaxs, vaqt, model identifikatori, audit yozuvi), audit jurnali esa `GET /audit/verify` bilan tekshiriladigan xesh zanjiri (7-band) — lekin baza faylining o‘zini diskka kirish huquqi bo‘lgan har kim tahrirlashi mumkin; hisob qaydnomasi va diskni himoya qiling.
 - Yuklangan fayllar diskda hech qachon mijoz fayl nomlari bilan saqlanmaydi; vaqtinchalik fayllar tahlildan keyin o‘chiriladi.
 - Har bir foydalanuvchiga shaxsiy hisob qaydnomasi bering, ishdan ketgan xodimlarning hisob qaydnomalarini o‘chiring va bir martalik administrator parolini umumiy hujjatlarda saqlamang.
@@ -303,14 +371,14 @@ Har bir shifokorga shaxsiy hisob qaydnomasi bering — hisobotdagi imzo bu uni i
 
 ## 13. Windows o‘rnatuvchisini yig‘ish
 
-3-bandda tasvirlangan o‘rnatuvchini GitHub Actions ish jarayoni `.github/workflows/build-windows.yml` (`SHAXZODBR/SIAA` repozitoriysi) yig‘adi. U Python serverini PyInstaller yordamida «muzlatadi» (`packaging/build_backend.ps1`), ochiq modellarni yuklab oladi, validatsiyadan o‘tgan triaj modelini yopiq arxivdan tiklaydi, muzlatilgan serverni `/health` orqali tekshiradi va so‘ngra electron-builder ni ishga tushiradi (`npm run build:win`). Xuddi shu ish jarayoni macOS-runnerda macOS uchun disk tasvirini (Apple Silicon) yig‘adi.
+3-bandda tasvirlangan o‘rnatuvchini GitHub Actions ish jarayoni `.github/workflows/build-windows.yml` (`SHAXZODBR/SIAA` repozitoriysi) yig‘adi. Avval `tests` topshirig‘i butun testlar to‘plamini Linux da faqat CPU uchun PyTorch bilan ishga tushiradi (`pytest -q -m "not slow"`, hujjatlar muvofiqligi tekshiruvi hamda ish stoli ilovasining tip tekshiruvi va modul testlari); o‘rnatuvchi topshiriqlari faqat u muvaffaqiyatli o‘tgandan keyin boshlanadi. So‘ngra har bir yig‘ish topshirig‘i Python serverini PyInstaller yordamida «muzlatadi» (`packaging/build_backend.ps1`), ochiq modellarni yuklab oladi, validatsiyadan o‘tgan triaj modelini yopiq arxivdan tiklaydi, muzlatilgan serverni `/health` orqali tekshiradi va so‘ngra electron-builder ni ishga tushiradi (`npm run build:win`). Xuddi shu ish jarayoni macOS-runnerda macOS uchun disk tasvirini (Apple Silicon) yig‘adi.
 
 ### 13.1 Yig‘ishni ishga tushirish va o‘rnatuvchini olish
 
-1. GitHub → **Actions** → **Build installers** → **Run workflow** (istalgan branch) — yoki `v1.0.0` ko‘rinishidagi teg yuboring; teg bo‘yicha yig‘ishlar o‘rnatuvchilarni qo‘shimcha ravishda GitHub Release *qoralamasiga* biriktiradi.
+1. GitHub → **Actions** → **Build installers** → **Run workflow** (istalgan branch) — yoki `v1.1.0` ko‘rinishidagi teg yuboring; teg bo‘yicha yig‘ishlar o‘rnatuvchilarni qo‘shimcha ravishda GitHub Release *qoralamasiga* biriktiradi (inson uni nashr qilmaguncha u qoralama bo‘lib qoladi). *Run workflow* ning bitta parametri bor — `include_validated_model` (standart holatda belgilangan): **klinika variantini** (3-band) yig‘ish uchun belgini olib tashlang — *Restore validated triage model* qadami o‘tkazib yuboriladi va topshiriq xulosasi buni aytadi. Teg bo‘yicha yig‘ishlar har doim modelni o‘z ichiga oladi.
 2. *Windows installer (NSIS x64)* topshirig‘i tugashini kuting (bu uzoq davom etadi: faqat CPU uchun PyTorch 2.11.0 / torchvision 0.26.0 bilan Python bog‘liqliklari, PyInstaller, modellar, o‘rnatuvchini siqish).
-3. Ishga tushirish sahifasida: **Artifacts** → `sentinel-windows-x64-full` — ichida `Sentinel Medical AI Setup 1.0.0.exe` fayli bo‘lgan zip-arxiv (electron-builder uni `desktop-app/release/` papkasiga yozadi). Artefaktlar 14 kun saqlanadi.
-4. Validatsiyadan o‘tgan model mavjud bo‘lmagan bo‘lsa (13.2-ga qarang), artefakt `sentinel-windows-x64-NO-VALIDATED-MODEL` deb nomlanadi — bunday yig‘ilmani klinikaga berish mumkin emas: undan qilingan har bir o‘rnatish `/health` → `"status": "degraded"` deb xabar beradi.
+3. Ishga tushirish sahifasida: **Artifacts** → `sentinel-windows-x64-full` — ichida `Sentinel Medical AI Setup 1.1.0.exe` fayli bo‘lgan zip-arxiv (electron-builder uni `desktop-app/release/` papkasiga yozadi). Artefaktlar faqat **1 kun** saqlanadi (`retention-days: 1` — repozitoriy ochiq): o‘rnatuvchini yig‘ishdan so‘ng darhol yuklab oling va reliz hujjatlari bilan birga saqlang.
+4. Validatsiyadan o‘tgan modelsiz artefakt `sentinel-windows-x64-NO-VALIDATED-MODEL` deb nomlanadi. Agar uni ataylab yig‘gan bo‘lsangiz (`include_validated_model` belgilanmagan), bu **klinika varianti**: uni faqat aniq kompyuter uchun model paketi va litsenziya bilan birga bering (5.4-band, `docs/vendor_provisioning_ru.md`). Agar to‘liq variantni kutgan bo‘lsangiz, `MODEL_BUNDLE_URL` siri yo‘q (13.2) — bunday o‘rnatish paket import qilinmaguncha `/health` → `"status": "degraded"` deb xabar beradi.
 
 ### 13.2 Sirlar: validatsiyadan o‘tgan model va kod imzosi
 

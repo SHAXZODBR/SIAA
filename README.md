@@ -35,12 +35,12 @@ no off-the-shelf model can copy.
 
 | | |
 |---|---|
-| 🧠 **Brain triage panel** | Flags tumor, hemorrhage, stroke and atrophy — "which scans need a closer look" |
+| 🧠 **Brain triage panel** | A locally validated normal-vs-abnormal triage flag — "which scans need a closer look"; unvalidated detectors (public tumor / hemorrhage classifiers) are off by default |
 | 📝 **Auto-drafted reports** | Structured radiology reports in **RU / UZ / EN**; the doctor edits and signs |
 | 🔒 **Fully on-premise & offline** | Patient data never leaves the clinic — built for medical trust and local law |
 | 🖼️ **Robust DICOM ingestion** | Multi-frame, compressed, multi-vendor (Philips · GE · Siemens) |
 | 🩺 **Radiologist-in-the-loop** | Decision support — the physician confirms every read, never autonomous |
-| 🔑 **Machine-bound licensing** | RSA-signed, hardware-locked deployment |
+| 🔑 **Machine-bound licensing** | RSA-signed, hardware-locked deployment; the validated model is delivered per clinic, encrypted for that one PC |
 
 ---
 
@@ -75,11 +75,12 @@ population it actually serves.
 
 ## Status & roadmap
 
-- ✅ **Working product** — desktop app (RU / UZ / EN interface, first-run clinic setup), inference server, whole-study DICOM ingest (thousands of files per study), multilingual reporting, PDF export
-- ✅ **Brain module** — a **locally trained normal-vs-abnormal triage model**, validated on **178 held-out Tashkent patients** (study-level sensitivity 0.90 / specificity 0.47), running alongside a public tumor classifier that is clearly labelled *pending validation*. The product **never certifies a scan as normal**.
-- ✅ **Hospital-grade plumbing** — authentication on by default, server-side report signing with a tamper-evident audit log, fully offline operation, model weights encrypted at rest, PACS auto-ingest (Orthanc) and signed reports filed back to PACS as DICOM Encapsulated PDF
-- ✅ **Quality gates** — automated test suite, a checksummed release gate a retrained model must pass before it ships, a one-command resumable release pipeline for new hospital batches (`scripts/release_pipeline.py`, runbook in `docs/release_runbook_en.md` / `_ru.md`), hospital documentation in RU / UZ / EN (`docs/`)
-- 🔧 **In progress** — Windows installer (self-contained backend bundle + NSIS, built via CI), clinic pilot with radiologist-adjudicated evaluation
+- ✅ **Working product (v1.1.0)** — desktop app (RU / UZ / EN interface, first-run clinic setup), inference server, whole-study DICOM ingest (thousands of files per study), multilingual reporting, PDF export, Windows installer (self-contained frozen backend + NSIS) and macOS DMG built by CI
+- ✅ **Brain module** — a **locally trained normal-vs-abnormal triage model**, validated on **178 held-out Tashkent patients** (study-level sensitivity 0.90 / specificity 0.47). Unvalidated (*pending*) detectors such as the public tumor classifier are **off by default** in hospital builds and can be switched on only by an administrator (audit-logged); a head CT without a validated detector is returned as "not analysed by AI". The product **never certifies a scan as normal**.
+- ✅ **Hospital-grade plumbing** — authentication on by default, server-side report signing with a tamper-evident audit log, fully offline operation, model weights encrypted at rest automatically on first start, PACS auto-ingest (Orthanc) and signed reports filed back to PACS as DICOM Encapsulated PDF, one-click PHI-free diagnostics export for support
+- ✅ **Per-clinic delivery** — the clinic installer ships without the proprietary model; the vendor sends a licence plus a model bundle encrypted for that clinic's PC (`packaging/provision_clinic.py`, `docs/vendor_provisioning_en.md`), imported from *Preferences → AI models*
+- ✅ **Quality gates** — CI runs the test suite (`pytest -m "not slow"`) and the documentation drift guard before any installer is built; installer artifacts expire after one day and tag builds stay draft releases; a checksummed release gate a retrained model must pass before it ships; a one-command resumable release pipeline for new hospital batches (`scripts/release_pipeline.py`, runbook in `docs/release_runbook_en.md` / `_ru.md`); hospital documentation in RU / UZ / EN (`docs/`)
+- 🔧 **In progress** — code-signing certificate for the Windows installer, clinic pilot with radiologist-adjudicated evaluation
 - 🗺️ **Next** — more local *normal* studies to raise specificity, **spine** (highest-volume MRI referral), then broader multi-organ coverage
 
 > SIAA is a clinical **decision-support** tool, not an autonomous diagnostic device.

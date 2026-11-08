@@ -2,7 +2,7 @@
 
 # SIAA — Sentinel Medical AI · Rentgenolog shifokorlar uchun foydalanuvchi qo‘llanmasi
 
-Versiya 1.0.0 (ish stoli ilovasi va AI serveri) · Hujjat tahriri 2026-09
+Versiya 1.1.0 (ish stoli ilovasi va AI serveri) · Hujjat tahriri 2026-11
 
 ---
 
@@ -14,7 +14,7 @@ U **diagnostika vositasi emas** va **rentgenolog shifokorning o‘rnini bosmaydi
 
 - **Har bir tekshiruvni rentgenolog shifokor o‘qiydi va imzolaydi.** AI natijasi — faqat maslahat. Imzolangan hisobot AI niki emas, rentgenolog shifokorniki.
 - **AI hech qachon tekshiruvni norma deb tasdiqlamaydi.** Hech qanday topilma belgilanmaganda ekranda *«AI hech qanday topilma belgilamadi — bu norma xulosasi EMAS»* yozuvi chiqadi. AI faqat «Topilmalar» yorlig‘ida sanab o‘tilgan topilma turlarini tekshiradi; qolgan hamma narsa u uchun ko‘rinmas.
-- **Mahalliy bemorlarda faqat bitta detektor tasdiqlangan** (*tekshiruv triaji* detektori). *Bosh miya o‘smasi* detektori — ommaviy model bo‘lib, ushbu klinika populyatsiyasida uni tasdiqlash hali kutilmoqda; u o‘smalarni ortiqcha belgilashi ma’lum.
+- **Mahalliy bemorlarda faqat bitta detektor tasdiqlangan** (*tekshiruv triaji* detektori). *Bosh miya o‘smasi* detektori — ommaviy model bo‘lib, ushbu klinika populyatsiyasida uni tasdiqlash hali kutilmoqda; u o‘smalarni ortiqcha belgilashi ma’lum. **1.1.0 versiyasidan boshlab bunday tasdiqlanmagan (pending) detektorlar standart holatda o‘chirilgan**; ularning natijalarini faqat administrator ularni yoqqan bo‘lsa ko‘rasiz (6.3-band).
 - Dasturiy ta’minot O‘zbekiston Respublikasi Sog‘liqni saqlash vazirligi yoki boshqa biror nazorat organi tomonidan tibbiy buyum sifatida sertifikatlanmagan. Undan klinikaning o‘z klinik boshqaruvi doirasida foydalaning.
 
 Hamma narsa klinika kompyuterida, internetsiz ishlaydi. Hech qanday tasvir, hisobot yoki bemor identifikatori kompyuterdan tashqariga chiqmaydi.
@@ -79,6 +79,7 @@ Agar holat qatorida *AI serveri: ishlamayapti* yozuvi bo‘lsa, yuklash tugmalar
 
 - **Bosh miyaga oid bo‘lmagan MRT** (umurtqa, tizza, qorin bo‘shlig‘i …) bosh miya paneli tomonidan rad etiladi: tekshiruv **Ko‘rib chiqish kerak** belgisi va *Tahlil qilinmadi — rentgenolog to‘liq ko‘rib chiqishi kerak* yozuvi bilan saqlanadi. Uni odatdagidek o‘qing.
 - **Boshqa modalliklar** (KT, rentgen, mammografiya) boshqa detektorlarga faqat serveringizda mos model o‘rnatilgan bo‘lsa yo‘naltiriladi; aks holda ular ham **Ko‘rib chiqish kerak** belgisi bilan qaytadi. Tasdiqlangan triaj detektori **faqat bosh miya MRT** ni qamrab oladi.
+- **Ushbu relizda bosh KT:** KT uchun tasdiqlangan detektor yo‘q. Standart sozlamalarda bosh KT ish ro‘yxatiga qabul qilinadi, lekin **Ko‘rib chiqish kerak** holati — *Tahlil qilinmadi — rentgenolog to‘liq ko‘rib chiqishi kerak* — va *«Ushbu versiyada bu turdagi tekshiruv uchun tasdiqlangan AI detektori yo‘q — tekshiruv AI tomonidan tahlil qilinmadi; rentgenolog uni odatdagidek o‘qiydi. Administrator tasdiqlanmagan detektorlarni «Sozlamalar → AI modellari» bo‘limida yoqishi mumkin.»* izohi bilan qaytadi. Uni AI tahlil **qilmagan**: odatdagidek o‘qing. (Faqat administrator pending detektorlarni yoqqan bo‘lsa, ommaviy qon quyilishi klassifikatori ishga tushadi; uning natijasi *Tasdiqlash kutilmoqda* deb belgilanadi va hech qachon topilma hisoblanmaydi.)
 - DICOM sifatida o‘qib bo‘lmaydigan tekshiruv xato xabari bilan rad etiladi.
 
 ---
@@ -104,6 +105,8 @@ Karta ostida: belgilangan topilmalar soni, tahlil vaqti va qaror **chegarasi** (
 |---|---|---|---|
 | **Tekshiruv triaji — norma / patologiya (mahalliy)** | **Tasdiqlangan** | Toshkent klinikasi tekshiruvlarida o‘qitilgan va sinovdan o‘tkazilgan. Patologiya ehtimolini 5 ta markaziy aksial kesim bo‘yicha o‘rtachalaydi; o‘rtacha qiymat ≥ 0,50 bo‘lsa tekshiruvni belgilaydi. | 178 ta ajratib qo‘yilgan mahalliy bemorda tekshiruv darajasida sezgirlik (sensitivity) 0,90 va spetsifiklik (specificity) 0,47. Boshqacha aytganda: har 10 ta patologik tekshiruvdan taxminan 1 tasi **belgilanmaydi**, normal tekshiruvlarning esa taxminan yarmi **belgilanadi**. U ustuvorlik beradi; tashxis qo‘ymaydi, joylashuvni aniqlamaydi va patologiyani istisno qilmaydi. |
 | **Bosh miya o‘smasi (glioma / meningioma / gipofiz)** | **Tasdiqlash kutilmoqda** | Kaggle bosh miya o‘smalari to‘plamida o‘qitilgan ommaviy 2D klassifikator; bitta markaziy kesim bo‘yicha ishlaydi. | Mahalliy tomograflarda **o‘smalarni ortiqcha belgilaydi**: «Glioma / meningioma gumoni» belgilarining ko‘pchiligi yolg‘on ijobiy. Uning «O‘sma aniqlanmadi» qatori ham xuddi shunday tekshirilmagan. Har qanday o‘sma belgisini ko‘rib chiqishga da’vat deb qabul qiling, topilma deb emas. |
+
+**Pending detektorlar standart holatda yashirilgan.** Ushbu relizda *bosh miya o‘smasi* detektori (va *tasdiqlash kutilayotgan* boshqa har qanday detektor) administrator *Sozlamalar → AI modellari → Tasdiqlanmagan (pending) detektorlarni ko‘rsatish* ni yoqmaguncha **ishga tushirilmaydi**. Standart sozlamada «Topilmalar» yorlig‘i va modellar ro‘yxati faqat tasdiqlangan *tekshiruv triaji* natijasini ko‘rsatadi va PDF ga ham faqat shu detektor kiradi. Sozlamani faqat **admin** rolidagi foydalanuvchi o‘zgartira oladi; u keyingi tahlildan kuchga kiradi, audit jurnaliga yoziladi, yoqilgan paytda esa AI modellari sahifasida ogohlantiruvchi belgi ko‘rinadi. Agar *Bosh miya o‘smasi* kartasini ko‘rsangiz, sozlama yoqilgan — kartaga yuqoridagi jadvalda tasvirlanganidek munosabatda bo‘ling. Klinikangizda qaysi sozlama amal qilayotganini bilmasangiz, administratordan so‘rang.
 
 **Eksperimental** deb belgilangan detektorlar (DWI bo‘yicha ishemik insult, bosh miya atrofiyasi) dasturda mavjud, lekin ushbu yig‘ilmada butun tekshiruv tahlilida **ishga tushirilmaydi**. Qon quyilishi, oq modda zararlanishi va gidrotsefaliyani aniqlash amalga oshirilmagan.
 

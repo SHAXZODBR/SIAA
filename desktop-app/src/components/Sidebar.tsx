@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { useAppStore } from '../store/appStore';
 import type { Study, AIResult, Lang } from '../types';
 import { analyzeStudy, describeApiError } from '../services/api';
+import { rejectionReasonKey } from '../services/adminTools';
 import { DEMO_MODE, DEMO_STUDIES } from '../services/demoData';
 import { findingUrgency, translateFinding, statusWord } from '../services/findingTranslations';
 import { useT, formatDate, formatTime } from '../i18n';
@@ -144,7 +145,8 @@ export default function Sidebar() {
       }
       selectStudy(study.id);
       if (result.rejected || result.requiresReview) {
-        addNotification({ type: 'warning', title: t('worklist.notAnalyzed'), message: result.rejectionReason || undefined });
+        const reasonKey = rejectionReasonKey(result.rejectionReason);
+        addNotification({ type: 'warning', title: t('worklist.notAnalyzed'), message: reasonKey ? t(reasonKey) : (result.rejectionReason || undefined) });
       }
     } catch (e) {
       const info = describeApiError(e);
@@ -160,7 +162,8 @@ export default function Sidebar() {
         addStudy(study);
         setAIResult(studyId, reviewOnlyResult(studyId, info.detail));
         selectStudy(studyId);
-        addNotification({ type: 'warning', title: t('worklist.notAnalyzed'), message: info.detail });
+        const reasonKey = rejectionReasonKey(info.detail);
+        addNotification({ type: 'warning', title: t('worklist.notAnalyzed'), message: reasonKey ? t(reasonKey) : info.detail });
       } else if (info.code === 'network') {
         addNotification({ type: 'error', title: t('health.aiServerDown') });
       } else if (info.code === 'auth') {

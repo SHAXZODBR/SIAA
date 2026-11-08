@@ -7,6 +7,10 @@ const AUTO_DISMISS_MS = 8000;
 /**
  * Doctor-facing toast stack (bottom-right). Technical detail stays in the console;
  * these only ever show localized, actionable text.
+ *
+ * Stacked above every modal (Preferences z-90, Help z-95, palette z-100) so the
+ * result of an action taken inside a dialog — e.g. an AI-setting change or a
+ * model import in Preferences — is actually seen.
  */
 export default function Toasts() {
   const { notifications, dismissNotification } = useAppStore();
@@ -36,7 +40,7 @@ export default function Toasts() {
   };
 
   return (
-    <div className="fixed bottom-10 right-3 z-[80] w-80 space-y-2 pointer-events-none">
+    <div className="fixed bottom-10 right-3 z-[110] w-80 space-y-2 pointer-events-none">
       {visible.map((n) => (
         <div
           key={n.id}

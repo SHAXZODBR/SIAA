@@ -77,7 +77,9 @@ def test_section_structure_matches_across_languages(stem):
 
 ROUTES = ["/auth/login", "/analyze/study", "/report/sign", "/studies", "/health", "/audit/verify",
           "/audit/log", "/license/status", "/auth/register", "/auth/users", "/auth/me",
-          "/report/save_correction", "/study/{id}"]
+          "/report/save_correction", "/study/{id}",
+          # v1.1.0 (finish-line contract): AI settings, diagnostics export, per-clinic model import
+          "/settings/ai", "/diagnostics", "/models/import"]
 
 
 @pytest.mark.parametrize("route", ROUTES)
@@ -118,7 +120,8 @@ def test_env_vars_in_admin_guides_exist_in_code():
 
 
 @pytest.mark.parametrize("name", ["SENTINEL_DEV_INSECURE", "SENTINEL_ADMIN_PASSWORD", "SENTINEL_DATA_DIR",
-                                  "SENTINEL_HOSPITAL_BUILD", "SENTINEL_OFFLINE", "SENTINEL_MODEL_KEY_HEX"])
+                                  "SENTINEL_HOSPITAL_BUILD", "SENTINEL_OFFLINE", "SENTINEL_MODEL_KEY_HEX",
+                                  "SENTINEL_SHOW_PENDING_DETECTORS", "SENTINEL_ENCRYPT_MODELS_AT_REST"])
 def test_required_env_vars_documented_in_every_language(name):
     for lang in LANGS:
         assert f"`{name}`" in _doc("admin_install_guide", lang), (lang, name)
@@ -287,3 +290,174 @@ def test_audit_chain_documented():
     for lang in LANGS:
         text = _doc("admin_install_guide", lang)
         assert "/audit/verify" in text and "prev_hash" in text and "row_hash" in text, lang
+
+
+# ---------------------------------------------------------------- v1.1.0 "clinic-ready" (docs/dev/finish_line_contract.md)
+
+VENDOR_LANGS = ("en", "ru")
+DIAGNOSTICS_MEMBERS = ("health.json", "license.json", "ai_settings.json", "versions.json", "models.json",
+                       "audit_tail.jsonl", "settings_redacted.json")
+
+
+def _i18n_value(lang: str, key: str) -> str:
+    m = re.search(r"'" + re.escape(key) + r"':\s*'([^']*)'", _read(f"desktop-app/src/i18n/{lang}.ts"))
+    assert m, (lang, key)
+    return m.group(1)
+
+
+def test_app_version_quoted_in_docs_matches_the_code():
+    """Intended use identifies the software by version: the documents, the desktop app and the
+    server must quote the same one (bump all three together — desktop-app/package.json,
+    server.APP_VERSION, the version lines of the hospital documents)."""
+    pkg = json.loads(_read("desktop-app/package.json"))["version"]
+    m = re.search(r'^APP_VERSION = "([^"]+)"', _read("src/inference/server.py"), re.M)
+    assert m and m.group(1) == pkg, f"server APP_VERSION {m and m.group(1)} != desktop-app/package.json {pkg}"
+    word = {"en": "Version", "ru": "Версия", "uz": "Versiya"}
+    for lang in LANGS:
+        for stem in ("user_manual", "admin_install_guide", "intended_use", "pilot_evaluation_protocol"):
+            text = _doc(stem, lang)
+            assert f"{word[lang]} {pkg} " in text, (stem, lang, pkg)
+            stale = {v for v in re.findall(r"\b1\.\d+\.\d+\b", text) if v != pkg}
+            # the only other x.y.z tokens allowed are tag examples/torch pins, never another app version
+            assert not {v for v in stale if f"Setup {v}.exe" in text or f'"version": "{v}"' in text
+                        or f"{word[lang]} {v} " in text}, (stem, lang, stale)
+        assert f'"version": "{pkg}"' in _doc("admin_install_guide", lang), lang
+        assert f"Setup {pkg}.exe" in _doc("admin_install_guide", lang), lang
+
+
+def test_founder_checklists_and_kit_quote_the_current_version_and_d1_behaviour():
+    """The founder's Windows acceptance checklist (en/ru), the kit README and attributions.md
+    follow desktop-app/package.json, and the checklist expects the D1 default (pending detectors
+    hidden → 1 triage finding), so a correct build is never reported as broken."""
+    pkg = json.loads(_read("desktop-app/package.json"))["version"]
+    for lang in ("en", "ru"):
+        text = _read(f"docs/windows_laptop_test_{lang}.md")
+        assert f"Setup {pkg}.exe" in text, lang
+        assert not {v for v in re.findall(r"Setup (\d+\.\d+\.\d+)\.exe", text) if v != pkg}, lang
+        assert {"en": "exactly 1 finding", "ru": "ровно 1 находка"}[lang] in text, lang
+        assert {"en": "2 findings →", "ru": "2 находки →"}[lang] not in text, lang
+    kit = _read("packaging/make_windows_kit.sh")
+    assert "Setup ${APP_VERSION}.exe" in kit and not re.search(r"Setup \d+\.\d+\.\d+\.exe", kit)
+    assert f"Version {pkg} " in _read("docs/attributions.md")
+
+
+@pytest.mark.parametrize("lang", VENDOR_LANGS)
+def test_vendor_provisioning_doc_exists_and_names_the_flow(lang):
+    p = DOCS / f"vendor_provisioning_{lang}.md"
+    assert p.exists(), p
+    text = p.read_text(encoding="utf-8")
+    assert p.stat().st_size > 3000, f"{p.name} is suspiciously short"
+    for token in ("packaging/provision_clinic.py", "/models/import", "data/licenses/ledger.csv",
+                  "--with-model-key", "bundle_not_for_this_machine", "model_key_secret",
+                  "include_validated_model", "NO-VALIDATED-MODEL", "README_admin_ru.txt", "/health"):
+        assert token in text, (lang, token)
+
+
+def test_vendor_provisioning_structure_matches_across_languages():
+    counts = {}
+    for lang in VENDOR_LANGS:
+        text = (DOCS / f"vendor_provisioning_{lang}.md").read_text(encoding="utf-8")
+        counts[lang] = (len(re.findall(r"^## ", text, re.M)), len(re.findall(r"^### ", text, re.M)),
+                        len(re.findall(r"^\|", text, re.M)))
+    assert len(set(counts.values())) == 1, f"vendor_provisioning: section/table structure differs: {counts}"
+
+
+def test_vendor_provisioning_cli_flags_exist_in_the_tool():
+    """Every --flag of the provision_clinic.py command quoted in the vendor docs is a real option."""
+    tool = REPO / "packaging" / "provision_clinic.py"
+    assert tool.exists(), "packaging/provision_clinic.py (finish-line contract, vendor-tools) is missing"
+    src = tool.read_text(encoding="utf-8")
+    for lang in VENDOR_LANGS:
+        text = (DOCS / f"vendor_provisioning_{lang}.md").read_text(encoding="utf-8")
+        block = text[text.index("python packaging/provision_clinic.py"):]
+        block = block[:block.index("```")]
+        flags = set(re.findall(r"(--[a-z][a-z-]+)", block))
+        assert {"--fingerprint", "--customer", "--expires", "--out"} <= flags, (lang, flags)
+        missing = [f for f in flags if f"'{f}'" not in src and f'"{f}"' not in src]
+        assert not missing, (lang, missing)
+
+
+def test_license_issue_with_model_key_is_a_real_option():
+    lic = _read("src/utils/license.py")
+    assert "--with-model-key" in lic, "src/utils/license.py issue has no --with-model-key (finish-line contract)"
+    for lang in LANGS:
+        assert "-m src.utils.license issue … --with-model-key" in _doc("admin_install_guide", lang), lang
+
+
+def test_admin_guides_cover_clinic_flavour_import_and_diagnostics():
+    for lang in LANGS:
+        g = _doc("admin_install_guide", lang)
+        for token in ("sentinel-windows-x64-full", "sentinel-windows-x64-NO-VALIDATED-MODEL",
+                      "bundle_not_for_this_machine", "model_inbox\\", "brain_triage_finetuned_prev_",
+                      "`SENTINEL_ENCRYPT_MODELS_AT_REST=1`", "`SENTINEL_SHOW_PENDING_DETECTORS`",
+                      "settings.json", "sentinel-diagnostics-", "include_validated_model", "--print-fingerprint"):
+            assert token in g, (lang, token)
+        for member in DIAGNOSTICS_MEMBERS:
+            assert f"`{member}`" in g, (lang, member)
+        # the UI path names are the app's own labels (Preferences → AI models / About)
+        for key in ("settings.ai", "settings.about", "settings.pendingTitle", "settings.importBundle",
+                    "about.exportDiagnostics"):
+            assert _i18n_value(lang, key) in g, (lang, key)
+        # §5.4 and §5.5 exist in every language (section parity is checked separately)
+        assert "\n### 5.4 " in g and "\n### 5.5 " in g, lang
+
+
+def test_diagnostics_zip_members_quoted_in_docs_exist_in_server():
+    server = _read("src/inference/server.py")
+    for member in DIAGNOSTICS_MEMBERS:
+        assert member in server, f"admin guides list {member} in the diagnostics zip but server.py never writes it"
+
+
+def test_run_server_supports_the_documented_fingerprint_flag():
+    assert "'--print-fingerprint' in sys.argv" in _read("run_server.py")
+
+
+def test_user_manual_explains_pending_detectors_hidden_by_default():
+    marker = {"en": "Pending detectors are hidden by default", "ru": "Pending-детекторы по умолчанию скрыты",
+              "uz": "Pending detektorlar standart holatda yashirilgan"}
+    for lang in LANGS:
+        text = _doc("user_manual", lang)
+        assert marker[lang] in text, lang
+        assert _i18n_value(lang, "settings.ai") in text, lang          # Preferences → AI models
+        assert _i18n_value(lang, "settings.pendingTitle") in text, lang  # the admin's switch
+        assert _i18n_value(lang, "findings.noValidatedDetector") in text, lang  # the CT-head note, verbatim
+        assert _i18n_value(lang, "findings.notAnalyzed") in text, lang  # what a CT head shows
+        assert _i18n_value(lang, "worklist.needsReview") in text, lang
+
+
+def test_intended_use_states_unvalidated_detectors_disabled_by_default():
+    sentence = {"en": "Unvalidated (pending and experimental) detectors are disabled by default; only an administrator",
+                "ru": "Невалидированные детекторы (pending и experimental) по умолчанию отключены; включить pending-детекторы может только администратор",
+                "uz": "Tasdiqlanmagan detektorlar (pending va experimental) standart holatda o‘chirilgan; pending detektorlarni faqat administrator"}
+    for lang in LANGS:
+        assert sentence[lang] in _doc("intended_use", lang), lang
+
+
+
+
+def test_model_import_reason_codes_quoted_in_admin_guides_exist_in_server():
+    """The §5.4 table quotes the server's reason codes verbatim (the notification shows them)."""
+    server = _read("src/inference/server.py")
+    for lang in LANGS:
+        g = _doc("admin_install_guide", lang)
+        sec = g[g.index("\n### 5.4 "):g.index("\n### 5.5 ")]
+        rows = [l for l in sec.splitlines() if l.startswith("| `")]
+        codes = {c for l in rows for c in re.findall(r"`([a-z_]+)`", l.split("|")[1])}
+        assert "bundle_not_for_this_machine" in codes and len(codes) >= 8, (lang, codes)
+        missing = [c for c in codes if f"'{c}'" not in server]
+        assert not missing, (lang, missing)
+
+
+def test_provisioning_refusal_codes_quoted_in_vendor_docs_exist_in_the_tool():
+    src = (REPO / "packaging" / "provision_clinic.py").read_text(encoding="utf-8")
+    for lang in VENDOR_LANGS:
+        text = (DOCS / f"vendor_provisioning_{lang}.md").read_text(encoding="utf-8")
+        for code in ("bad_fingerprint", "bad_expiry", "model_missing", "manifest_missing", "release_check",
+                     "forced_promotion", "private_key", "output_exists"):
+            assert f"`{code}`" in text, (lang, code)
+            assert code in src, code
+        # every ledger column the docs name is one the tool writes
+        fields = re.search(r"LEDGER_FIELDS = \(([^)]*)\)", src, re.S).group(1)
+        for col in ("customer", "fp8", "identity", "issued", "expires", "tier", "features",
+                    "key_fingerprint", "bundle_sha256"):
+            assert f"`{col}`" in text and f"'{col}'" in fields, (lang, col)

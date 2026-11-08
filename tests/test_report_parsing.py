@@ -404,6 +404,96 @@ def test_docx_report(tmp_path, mod):
     _no_names(rows)
 
 
+# ------------------------------------------------------------ docx tables
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _esc(s: str) -> str:
+    return s.replace(chr(12), "").replace("&", "&amp;").replace("<", "&lt;")
+
+
+def _p(text: str) -> str:
+    return f'<w:p><w:r><w:t xml:space="preserve">{_esc(text)}</w:t></w:r></w:p>'
+
+
+def _tc(*paragraphs: str, raw: str = "") -> str:
+    return "<w:tc>" + "".join(_p(x) for x in paragraphs) + raw + "</w:tc>"
+
+
+def _tbl(*rows: list[str]) -> str:
+    return "<w:tbl><w:tblPr/>" + "".join("<w:tr>" + "".join(r) + "</w:tr>" for r in rows) + "</w:tbl>"
+
+
+def build_docx_xml(path: Path, body: str) -> None:
+    """A minimal .docx whose word/document.xml body is `body` (raw WordprocessingML)."""
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml",
+                   '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        z.writestr("word/document.xml",
+                   f'<w:document xmlns:w="{W_NS}"><w:body>{body}<w:sectPr/></w:body></w:document>')
+
+
+def test_docx_text_reads_tables_in_reading_order(tmp_path, mod):
+    nested = _tbl([_tc("вложенная"), _tc("таблица")])
+    body = (_p("до таблицы")
+            + _tbl([_tc("Область"), _tc("Дата")],
+                   [_tc("головной мозг"), _tc(), _tc("03.08.2031", "повтор")],      # empty (vMerge) cell drops out
+                   [_tc("одна ячейка", "вторая строка ячейки")],                    # layout row: one line per paragraph
+                   [_tc("внешняя", raw=nested), _tc("справа")])
+            + "<w:sdt><w:sdtContent>" + _p("в элементе управления") + "</w:sdtContent></w:sdt>"
+            + _p("после таблицы"))
+    f = tmp_path / "9000301_x.docx"
+    build_docx_xml(f, body)
+    assert mod.docx_text(f).split("\n") == [
+        "до таблицы",
+        "Область | Дата",
+        "головной мозг | 03.08.2031 повтор",
+        "одна ячейка",
+        "вторая строка ячейки",
+        "внешняя вложенная | таблица | справа",
+        "в элементе управления",
+        "после таблицы",
+    ]
+
+
+def test_docx_report_in_a_two_column_table(tmp_path, mod):
+    body = (_p("Результаты МРТ / МСКТ")
+            + _tbl([_tc("МРТ")],
+                   [_tc("МРТ головного мозга (03.08.2031)")],
+                   [_tc("Протокол"), _tc("Срединные структуры не смещены.", "Желудочки не расширены.")],
+                   [_tc("Заключение:"), _tc("МРТ-признаки церебральной микроангиопатии.", "Рекомендовано: невролог.")],
+                   [_tc(f"Результат подготовил(а): {FAKE_SIGNER}")]))
+    f = tmp_path / f"9000302_{FAKE_PATIENT}.docx"
+    build_docx_xml(f, body)
+    rows, err = mod.parse_file(f)
+    assert err == "" and len(rows) == 1
+    r = rows[0]
+    assert (r["patient_id"], r["modality"], r["body_part"], r["study_date"]) == ("9000302", "MR", "brain", "2031-08-03")
+    assert r["conclusion"].startswith("МРТ-признаки церебральной микроангиопатии")
+    assert "|" not in r["conclusion"]
+    _no_names(rows)
+
+
+def test_docx_report_inside_a_layout_table_matches_the_paragraph_version(tmp_path, mod):
+    plain = tmp_path / f"9000004_{FAKE_PATIENT}.docx"
+    build_docx(plain, MULTI_SECTION_TEXT.split("\n"))
+    boxed = tmp_path / f"9000004_{FAKE_PATIENT}_t.docx"
+    build_docx_xml(boxed, _tbl([_tc(*[x for x in MULTI_SECTION_TEXT.split("\n") if x.strip()])]))
+    want, _ = mod.parse_file(plain)
+    got, err = mod.parse_file(boxed)
+    assert err == ""
+    keys = ("modality", "body_part", "study_date", "conclusion")
+    assert [[r[k] for k in keys] for r in got] == [[r[k] for k in keys] for r in want]
+    _no_names(got)
+
+
+def test_conclusion_marker_accepts_a_table_cell_separator(mod):
+    assert mod.CONCLUSION_RE.match("Заключение: | Без патологии.").group("rest") == "Без патологии."
+    assert mod.CONCLUSION_RE.match("ЗАКЛЮЧЕНИЕ | норма").group("rest") == "норма"
+    assert mod.CONCLUSION_RE.match("ЗАКЛЮЧЕНИЕ: норма").group("rest") == "норма"
+
+
 # --------------------------------------------------------------- CLI / folder
 
 def test_cli_over_folder_writes_csv_and_summary(tmp_path, monkeypatch, mod, capsys):

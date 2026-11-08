@@ -122,8 +122,12 @@ class FakeRunner:
     """Stands in for release_pipeline.run_command: writes the contract outputs."""
 
     def __init__(self, repo: Path, n_normal: int = 400, fail_on: str | None = None,
-                 leak: bool = False, eval_rc: int = 0, no_tune: bool = False):
+                 leak: bool = False, eval_rc: int = 0, no_tune: bool = False,
+                 cand_eval: dict | None = None):
         self.repo = repo
+        # multi-candidate runs: {'warm'|'fresh': (eval exit code, balanced accuracy)}, keyed by the
+        # candidate dir suffix models/brain_triage_candidate_<tag>_<cand>
+        self.cand_eval = cand_eval or {}
         self.n_normal = n_normal
         self.fail_on = fail_on
         self.leak = leak
@@ -195,7 +199,14 @@ class FakeRunner:
             out.mkdir(parents=True, exist_ok=True)
             (out / "model.safetensors").write_bytes(b"\1" * 64)
         elif script.endswith("eval_study_level.py"):
-            _write_eval(repo / self._arg(argv, "--model"), passed=self.eval_rc != 2,
+            model = self._arg(argv, "--model")
+            cand = model.rsplit("_", 1)[-1]
+            if cand in self.cand_eval:
+                rc, bal = self.cand_eval[cand]
+                _write_eval(repo / model, passed=rc != 2, promote=rc == 0, weights=False,
+                            data=self._arg(argv, "--data"), gate={"balanced": bal})
+                return rc
+            _write_eval(repo / model, passed=self.eval_rc != 2,
                         promote=self.eval_rc == 0, weights=False, data=self._arg(argv, "--data"))
             return self.eval_rc
         elif script.endswith("promote_model.py"):
@@ -966,6 +977,10 @@ def test_manual_checklist_states_the_version_rule_and_evidence(rp, fake_repo, tm
     text = "\n".join(rp.manual_steps(cfg))
     assert "EVERY release bumps" in text and "desktop-app/package.json" in text
     assert "1.0.0 → 1.1.0" in text and "git tag v1.1.0" in text and "If this is a new app build" not in text
+    # the app version is quoted in code + 12 hospital docs; the checklist names all of them
+    assert "APP_VERSION" in text and "test_app_version_quoted_in_docs_matches_the_code" in text
+    assert "docs/{user_manual,admin_install_guide,intended_use,pilot_evaluation_protocol}_{en,ru,uz}.md" in text
+    assert "Setup 1.1.0.exe" in text
     assert "state.json" in text and "logs/guards.log" in text
     assert rp.next_minor_version("1.4.2") == "1.5.0" and rp.next_minor_version("x") == "<next version>"
 
@@ -1121,3 +1136,328 @@ def test_interrupted_stage_is_recorded_failed_with_a_resume_line(rp, fake_repo, 
     assert "INTERRUPTED" in out and "resume with:" in out
     st = json.loads((fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json").read_text())
     assert st["stages"]["index"]["status"] == "failed"
+
+
+# ------------------------------------------- D6: --candidates warm,fresh ----
+
+VIT_LOCAL = "models/hf/google__vit-base-patch16-224"
+CAND = "models/brain_triage_candidate_brain-triage-vTEST"
+
+
+def _offline_vit(repo: Path) -> Path:
+    """A (tiny, fake) complete offline copy of the public ViT base."""
+    d = repo / VIT_LOCAL
+    d.mkdir(parents=True, exist_ok=True)
+    for f in ("config.json", "preprocessor_config.json"):
+        (d / f).write_text("{}")
+    (d / "model.safetensors").write_bytes(b"\0" * 16)
+    return d
+
+
+def _fake_hf_cache(root: Path, complete: bool = True) -> Path:
+    """The huggingface_hub cache layout: models--org--name/{refs/main, snapshots/<rev>/…}."""
+    m = root / "models--google--vit-base-patch16-224"
+    (m / "refs").mkdir(parents=True)
+    (m / "refs" / "main").write_text("0123abcd")
+    snap = m / "snapshots" / "0123abcd"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    (snap / "preprocessor_config.json").write_text("{}")
+    if complete:
+        (snap / "model.safetensors").write_bytes(b"\0" * 16)
+    return root
+
+
+def _state(repo: Path) -> dict:
+    return json.loads((repo / "data" / "release" / "brain-triage-vTEST" / "state.json").read_text())
+
+
+def _cfg(rp, tmp_path, repo, *extra):
+    return rp.config_from_args(rp.build_parser().parse_args(["plan", *_base_args(tmp_path, repo), *extra]))
+
+
+def test_candidates_default_and_explicit_warm_are_the_single_candidate_pipeline(rp, fake_repo, tmp_path):
+    default = _cfg(rp, tmp_path, fake_repo)
+    explicit = _cfg(rp, tmp_path, fake_repo, "--candidates", "warm")
+    assert default.candidates == explicit.candidates == ["warm"] and not default.multi
+    assert [s.cmds for s in rp.build_stages(default)] == [s.cmds for s in rp.build_stages(explicit)]
+    by = {s.name: s for s in rp.build_stages(default)}
+    assert len(by["train"].cmds) == len(by["gate"].cmds) == 1
+    assert by["train"].cmds[0][-1] == CAND and "--base-model-fresh" not in by["train"].cmds[0]
+    assert "--candidates" not in rp.args_line(default)
+    assert default.options()["candidates"] == ["warm"]
+
+
+@pytest.mark.parametrize("bad", ["", "hot", "warm,warm", "warm,fresh,cold"])
+def test_candidates_option_rejects_unknown_or_duplicate(rp, fake_repo, tmp_path, bad):
+    with pytest.raises(SystemExit):
+        rp.build_parser().parse_args(["plan", *_base_args(tmp_path, fake_repo), "--candidates", bad])
+
+
+def test_two_candidates_train_and_gate_separately_and_plan_shows_them(rp, fake_repo, tmp_path, capsys):
+    _offline_vit(fake_repo)
+    cfg = _cfg(rp, tmp_path, fake_repo, "--candidates", "fresh,warm")       # order normalised: warm first
+    assert cfg.candidates == ["warm", "fresh"] and cfg.multi
+    by = {s.name: s for s in rp.build_stages(cfg)}
+    warm, fresh = by["train"].cmds
+    assert warm[warm.index("--base-model") + 1] == "models/brain_triage_finetuned"
+    assert warm[-1] == f"{CAND}_warm" and "--base-model-fresh" not in warm
+    assert fresh[fresh.index("--base-model") + 1] == VIT_LOCAL and "--base-model-fresh" in fresh
+    assert fresh[-1] == f"{CAND}_fresh" and "--select-split" in fresh
+    gates = [" ".join(c) for c in by["gate"].cmds]
+    assert len(gates) == 2 and all("--compare-with models/brain_triage_finetuned" in g for g in gates)
+    assert f"--model {CAND}_warm " in gates[0] and f"--model {CAND}_fresh " in gates[1]
+    assert f"{CAND}_<chosen>" in by["promote"].cmds[0]
+    assert "opt:candidates" in by["train"].inputs
+    assert "--candidates warm,fresh" in rp.args_line(cfg)
+    rp.cmd_plan(cfg, rp.build_stages(cfg))
+    out = capsys.readouterr().out
+    assert "# candidates: warm from models/brain_triage_finetuned" in out
+    assert f"fresh from {VIT_LOCAL} (--base-model-fresh) → {CAND}_fresh" in out
+    assert "fresh base available offline" in out          # the extra pre-train guard is listed
+    for ln in out.splitlines():
+        if ln and not ln.startswith("#"):
+            shlex.split(ln)
+
+
+@pytest.mark.parametrize("cand_eval,chosen", [
+    ({"warm": (2, 0.80), "fresh": (0, 0.70)}, "fresh"),      # warm fails the gate, fresh passes
+    ({"warm": (0, 0.70), "fresh": (0, 0.75)}, "fresh"),      # both pass: higher balanced accuracy wins
+    ({"warm": (0, 0.78), "fresh": (0, 0.74)}, "warm"),
+    ({"warm": (0, 0.72), "fresh": (0, 0.72)}, "warm"),       # tie → warm
+    ({"warm": (4, 0.90), "fresh": (0, 0.71)}, "fresh"),      # not promoted never wins, whatever its numbers
+])
+def test_promote_takes_the_best_candidate_that_passed(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk,
+                                                      capsys, cand_eval, chosen):
+    _offline_vit(fake_repo)
+    runner = FakeRunner(fake_repo, cand_eval=cand_eval)
+    monkeypatch.setattr(rp, "run_command", runner)
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh", "--skip-tests"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    trains = [c for c in runner.calls if c[1] == "training/finetune_brain_classifier.py"]
+    assert [c[-1] for c in trains] == [f"{CAND}_warm", f"{CAND}_fresh"]
+    promote = [c for c in runner.calls if c[1] == "scripts/promote_model.py"]
+    assert len(promote) == 1 and promote[0][promote[0].index("--candidate") + 1] == f"{CAND}_{chosen}"
+    other = "warm" if chosen == "fresh" else "fresh"
+    assert (fake_repo / f"{CAND}_{other}").is_dir() and not (fake_repo / f"{CAND}_{chosen}").exists()
+    st = _state(fake_repo)
+    choice = st["candidate_choice"]
+    assert choice["chosen"] == chosen and choice["path"] == f"{CAND}_{chosen}" and "tie → warm" in choice["rule"]
+    assert {r["candidate"]: r["qualified"] for r in choice["ranking"]} == \
+        {c: rc_bal[0] == 0 for c, rc_bal in cand_eval.items()}
+    for cand, (erc, bal) in cand_eval.items():
+        rec = st["candidates"][cand]
+        assert rec["path"] == f"{CAND}_{cand}" and rec["train"]["status"] == "done"
+        assert rec["train"]["returncode"] == 0 and rec["gate"]["returncode"] == erc
+        assert rec["gate"]["balanced"] == pytest.approx(bal)
+        assert rec["gate"]["verdict"] == {0: "passed", 2: "gate_failed", 4: "not_promoted"}[erc]
+    assert st["candidates"]["fresh"]["base_model"] == VIT_LOCAL and st["candidates"]["fresh"]["fresh_head"]
+    assert st["stages"]["promote"]["promoted_candidate"] == f"{CAND}_{chosen}"
+    assert st["stages"]["promote"]["chosen_candidate"] == chosen
+    assert st["stages"]["train"]["status"] == st["stages"]["gate"]["status"] == "archived"
+    assert st["options"]["candidates"] == ["warm", "fresh"]
+    assert f"chosen: {chosen}" in out
+    # status shows the per-candidate results and the choice
+    assert rp.main(["status", "--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vTEST"]) == 0
+    status = capsys.readouterr().out
+    assert "candidates (promote = best balanced accuracy" in status and f"chosen: {chosen}" in status
+    assert f"{CAND}_warm" in status and f"{CAND}_fresh" in status
+
+
+@pytest.mark.parametrize("cand_eval,headline,verdict,rc_want", [
+    ({"warm": (2, 0.6), "fresh": (2, 0.6)}, "GATE FAILED", "gate_failed", 2),
+    ({"warm": (4, 0.7), "fresh": (2, 0.6)}, "NOT PROMOTED", "not_promoted", 4),
+])
+def test_no_candidate_qualifies_stops_before_promote(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk,
+                                                     capsys, cand_eval, headline, verdict, rc_want):
+    _offline_vit(fake_repo)
+    runner = FakeRunner(fake_repo, cand_eval=cand_eval)
+    monkeypatch.setattr(rp, "run_command", runner)
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh"])
+    out = capsys.readouterr().out
+    assert rc == rp.EXIT_STAGE_FAILED
+    assert headline in out and "promote was NOT run" in out and "stopped before promote" in out
+    assert "keep the old model" in out and "chosen: none" in out
+    assert f"{CAND}_warm/study_level_eval.json" in out and f"{CAND}_fresh/study_level_eval.json" in out
+    assert "scripts/promote_model.py" not in _scripts(runner.calls)
+    assert len([c for c in runner.calls if c[1] == "scripts/eval_study_level.py"]) == 2   # both were gated
+    st = _state(fake_repo)
+    assert st["stages"]["gate"]["status"] == "failed" and st["stages"]["gate"]["verdict"] == verdict
+    assert st["stages"]["gate"]["returncode"] == rc_want
+    assert st["candidate_choice"]["chosen"] is None and "promote" not in st["stages"]
+    assert (fake_repo / "models" / "brain_triage_finetuned" / "study_level_eval.json").is_file()   # untouched
+
+
+def test_gate_crash_of_one_candidate_stops_the_stage(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk, capsys):
+    _offline_vit(fake_repo)
+    runner = FakeRunner(fake_repo, cand_eval={"warm": (3, 0.8), "fresh": (0, 0.8)})
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh"]) == rp.EXIT_STAGE_FAILED
+    out = capsys.readouterr().out
+    assert "MANIFEST check failed" in out and "resume with:" in out and "--candidates warm,fresh" in out
+    st = _state(fake_repo)
+    assert st["stages"]["gate"]["failed_candidate"] == "warm" and st["candidates"]["warm"]["gate"]["verdict"] == "error"
+    assert len([c for c in runner.calls if c[1] == "scripts/eval_study_level.py"]) == 1
+
+
+def test_resume_does_not_retrain_a_finished_candidate(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk, capsys):
+    _offline_vit(fake_repo)
+
+    class FailFreshOnce(FakeRunner):
+        failed = False
+
+        def __call__(self, argv, log_path, cwd, dry_run=False):
+            if "--base-model-fresh" in argv and not self.failed and not dry_run:
+                self.failed = True
+                self.calls.append(list(argv))
+                return 1
+            return super().__call__(argv, log_path, cwd, dry_run)
+
+    runner = FailFreshOnce(fake_repo, cand_eval={"warm": (0, 0.7), "fresh": (0, 0.8)})
+    monkeypatch.setattr(rp, "run_command", runner)
+    args = [*_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh", "--skip-tests"]
+    assert rp.main(["run", *args]) == rp.EXIT_STAGE_FAILED
+    out = capsys.readouterr().out
+    assert "stage train FAILED" in out
+    st = _state(fake_repo)
+    assert st["candidates"]["warm"]["train"]["status"] == "done"
+    assert st["candidates"]["fresh"]["train"]["status"] == "failed" and st["stages"]["train"]["failed_candidate"] == "fresh"
+    # the printed resume line (it carries --candidates) retrains fresh only
+    argv = _hint_argv(out, "resume with:")
+    assert "--candidates" in argv and argv[argv.index("--candidates") + 1] == "warm,fresh"
+    n = len(runner.calls)
+    assert rp.main(["run", *argv]) == 0
+    out = capsys.readouterr().out
+    assert "candidate warm already trained" in out
+    trains = [c for c in runner.calls[n:] if c[1] == "training/finetune_brain_classifier.py"]
+    assert [c[-1] for c in trains] == [f"{CAND}_fresh"]
+    assert _state(fake_repo)["candidate_choice"]["chosen"] == "fresh"
+    # a bare --resume inherits the candidates from state.json
+    cfg = rp.config_from_args(rp.build_parser().parse_args(
+        ["run", "--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vTEST", "--resume"]))
+    assert cfg.candidates == ["warm", "fresh"] and cfg.inherited["candidates"] == ["warm", "fresh"]
+
+
+# ---------------------------------------------------- fresh base offline guard --
+
+def test_fresh_base_resolution_prefers_the_offline_copy(rp, fake_repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "empty_cache"))
+    assert rp.fresh_base(fake_repo) == "google/vit-base-patch16-224"
+    problem = rp.fresh_base_problem(fake_repo, "/x/python")
+    assert problem.startswith("fresh base not available offline") and "snapshot_download" in problem
+    assert str(tmp_path / "empty_cache") in problem
+    # an incomplete offline copy is named as such
+    d = fake_repo / VIT_LOCAL
+    d.mkdir(parents=True)
+    (d / "config.json").write_text("{}")
+    assert rp.fresh_base(fake_repo) == VIT_LOCAL
+    problem = rp.fresh_base_problem(fake_repo)
+    assert "incomplete" in problem and "preprocessor_config.json" in problem and "model.safetensors" in problem
+    _offline_vit(fake_repo)
+    assert rp.fresh_base_problem(fake_repo) is None
+
+
+def test_fresh_base_from_the_hf_cache(rp, fake_repo, tmp_path, monkeypatch):
+    cache = _fake_hf_cache(tmp_path / "hf_cache", complete=False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    assert rp.hf_hub_cache_dir() == cache
+    assert not rp.hf_cache_has_model("google/vit-base-patch16-224")           # no weights yet
+    (cache / "models--google--vit-base-patch16-224" / "snapshots" / "0123abcd" / "model.safetensors").write_bytes(b"\0")
+    assert rp.hf_cache_has_model("google/vit-base-patch16-224")
+    assert rp.fresh_base_problem(fake_repo) is None
+    monkeypatch.delenv("HF_HUB_CACHE")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "home"))
+    assert rp.hf_hub_cache_dir() == tmp_path / "home" / "hub"
+
+
+def test_fresh_base_missing_stops_before_any_training(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk, capsys):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "empty_cache"))
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh"])
+    out = capsys.readouterr().out
+    assert rc == rp.EXIT_USAGE
+    assert "fresh base not available offline" in out and "guard rails before train failed" in out
+    assert "training/finetune_brain_classifier.py" not in _scripts(runner.calls)       # not even warm
+    st = _state(fake_repo)
+    assert any("fresh base not available offline" in e for e in st["guards"]["pre_train"]["errors"])
+    # once the cache holds it, the same resume trains both — fresh from the hub id, offline
+    shutil.rmtree(tmp_path / "empty_cache", ignore_errors=True)
+    _fake_hf_cache(tmp_path / "empty_cache")
+    runner.cand_eval = {"warm": (0, 0.7), "fresh": (0, 0.7)}
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh", "--resume",
+                    "--skip-tests"]) == 0
+    fresh = [c for c in runner.calls if "--base-model-fresh" in c][0]
+    assert fresh[fresh.index("--base-model") + 1] == "google/vit-base-patch16-224"
+    assert _state(fake_repo)["candidate_choice"]["chosen"] == "warm"
+
+
+def test_warm_only_never_checks_the_fresh_base(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk):
+    monkeypatch.setattr(rp, "fresh_base_problem", lambda *a, **k: pytest.fail("checked the fresh base"))
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--skip-tests"]) == 0
+
+
+def test_stage_env_is_offline_for_the_hub_unless_overridden(rp, monkeypatch):
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    assert rp.stage_env()["HF_HUB_OFFLINE"] == "1"
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    assert rp.stage_env()["HF_HUB_OFFLINE"] == "0"
+
+
+def test_single_candidate_gate_failure_also_offers_both_candidates(rp, fake_repo, tmp_path, monkeypatch,
+                                                                   plenty_of_disk, capsys):
+    runner = FakeRunner(fake_repo, eval_rc=2)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    argv = _hint_argv(capsys.readouterr().out, "train both candidates and promote the better one:")
+    assert argv[argv.index("--candidates") + 1] == "warm,fresh" and "--from" in argv and "--resume" not in argv
+
+
+@pytest.mark.parametrize("name", RUNBOOKS)
+def test_runbook_covers_candidates_intake_mirror_signing_and_clinic_delivery(rp, name):
+    text = (DOCS / name).read_text(encoding="utf-8")
+    for tok in ("--candidates warm,fresh", "--base-model-fresh", "fresh base not available offline",
+                "candidate_choice", "scripts/intake_batch.py", "scripts/backup_mirror.sh", "CHECKSUMS.sha256",
+                "raw/INVENTORY.csv", "--resume", "--verify", "WIN_CSC_LINK", "WIN_CSC_KEY_PASSWORD",
+                "Azure Trusted Signing", "OV", "NO-VALIDATED-MODEL", "packaging/provision_clinic.py"):
+        assert tok in text, (name, tok)
+    lang = name.rsplit("_", 1)[1][:2]
+    assert f"vendor_provisioning_{lang}.md" in text
+    # every intake / mirror flag the runbook quotes exists in the scripts
+    intake_src = (REPO / "scripts" / "intake_batch.py").read_text(encoding="utf-8")
+    joined = re.sub(r"\\\n\s*", " ", text)
+    for ln in joined.splitlines():
+        if "intake_batch.py" in ln:
+            for flag in re.findall(r"(--[a-z][a-z-]+)", ln):
+                assert f"'{flag}'" in intake_src, (name, flag)
+    mirror_src = (REPO / "scripts" / "backup_mirror.sh").read_text(encoding="utf-8")
+    for flag in ("--yes", "--sample", "--verify-only", "--dry-run"):
+        assert flag in mirror_src
+    assert "--candidates" in " ".join(rp.build_parser().format_help().split())
+
+
+def test_verdict_stop_prints_a_resume_line_that_reruns_only_the_gate(rp, fake_repo, tmp_path, monkeypatch,
+                                                                     plenty_of_disk, capsys):
+    """Dress rehearsal 2026-11-09: a gate verdict (no candidate qualifies) used to print only a status
+    line. It must also print the resume line, and that line must skip every done stage (index → train)
+    and re-run just the gate — never promote while no candidate qualifies."""
+    _offline_vit(fake_repo)
+    runner = FakeRunner(fake_repo, cand_eval={"warm": (4, 0.66), "fresh": (2, 0.66)})
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--candidates", "warm,fresh"]) == rp.EXIT_STAGE_FAILED
+    out = capsys.readouterr().out
+    assert "stopped before promote" in out
+    argv = _hint_argv(out, "then the gate):")
+    assert "--resume" in argv and argv[argv.index("--candidates") + 1] == "warm,fresh"
+    assert argv[argv.index("--tag") + 1] == "brain-triage-vTEST"
+    runner.calls.clear()
+    assert rp.main(["run", *argv]) == rp.EXIT_STAGE_FAILED          # same weights → same verdict
+    out = capsys.readouterr().out
+    for stage in ("index", "parse", "label", "match", "build", "combine", "train"):
+        assert f"stage {stage} already done" in out, stage
+    assert _scripts(runner.calls) == ["scripts/eval_study_level.py", "scripts/eval_study_level.py"]
+    st = _state(fake_repo)
+    assert st["stages"]["gate"]["verdict"] == "not_promoted" and "promote" not in st["stages"]

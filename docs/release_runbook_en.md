@@ -32,6 +32,48 @@ committed; patient names never reach any output file.
 6. **Clean git tree** before you start (`git status`), so the bump stage's diff is reviewable.
 7. **Access for the publish step**: the GitHub token that `git push` uses (keychain) or `SIAA_MODELS_TOKEN` in the environment; write access to the private models repo `SHAXZODBR/SIAA-models` and to the environment secret `MODEL_BUNDLE_URL` of the app repo.
 
+### 2a. When a drive arrives — intake + mirror
+
+Never train straight from the hospital's drive: first archive it (checksummed, inventoried), then
+mirror the archive to the second drive, then run the release from the archive copy.
+
+1. **Mount** the hospital drive and the archive drive (`SIAA_DATA`, encrypted). Both scripts refuse a
+   destination that does not exist, so an unmounted `/Volumes/…` is never filled on the internal disk.
+2. **Intake** — copy into `<SIAA_DATA>/raw/<clinic>/<batch>/{images,reports}`:
+
+   ```sh
+   /Users/shakhzodbtr/venv/bin/python scripts/intake_batch.py --src /Volumes/HOSPITAL/new2 \
+       --reports /Volumes/HOSPITAL/reports_new2 --clinic shox --batch new2 --dest /Volumes/SIAA_DATA
+   ```
+   - The source is only read. Every file is copied with its sha256 computed on the fly, renamed into
+     place, journaled, then **re-read from the archive drive and verified**. `CHECKSUMS.sha256` (and
+     `CHECKSUMS.sizes`) list every file in `shasum` format: `cd <batch dir> && shasum -a 256 -c CHECKSUMS.sha256`.
+   - `README.txt` records the received date (`--received YYYY-MM-DD`, default today), the sources, file
+     counts, and — from a quick header scan of the copied images (`index_new_studies.py --limit 200`) —
+     the modalities and the study-date range (marked "sample" when the batch has more studies).
+     `raw/INVENTORY.csv` gets one row per batch, written only after a fully verified intake.
+   - Interrupted, or reports arrive later → the same command with `--resume` (copied files are skipped,
+     a half-copied `.part` is redone; `--resume --reports <folder>` alone adds the reports). An existing
+     batch folder is never overwritten without `--resume`.
+   - Exit 3 = a copy differs from the source (listed in `.intake/needs_recopy.txt`; the next `--resume`
+     copies it again — check the archive drive). Exit 2 = unreadable source files (bad sectors?);
+     everything else is copied. `--verify` re-hashes a whole archived batch at any time.
+   - The script prints the exact `release_pipeline.py plan` / `run` commands for the batch
+     (`--root` = the folder that holds the study folders, `--reports` = the archived reports).
+3. **Mirror** the archive to the backup drive (dry run first, then confirm):
+
+   ```sh
+   scripts/backup_mirror.sh /Volumes/SIAA_DATA /Volumes/SIAA_BACKUP            # asks "Type yes"
+   scripts/backup_mirror.sh --yes /Volumes/SIAA_DATA /Volumes/SIAA_BACKUP      # unattended
+   ```
+   `rsync -a --checksum --delete-after` after a dry run that prints how many files would be copied and
+   **deleted** on the backup; then 50 random files are hashed on both sides (`--sample N`). It refuses
+   when the backup's `raw/INVENTORY.csv` is newer than the archive's (drives swapped, or a batch archived
+   on the backup only — mirroring would delete it) and when the archive is empty. Exit 0 ok · 1 refused /
+   not confirmed · 2 rsync failed · 3 sample verification failed. `--verify-only` re-checks a sample
+   without copying (monthly).
+4. Unmount and return the hospital drive only after step 3 printed `B is a verified mirror of A`.
+
 ## 3. Time estimates (5,000 studies, Apple Silicon)
 
 | Stage | Expected time | Notes |
@@ -82,6 +124,36 @@ cd ~/Desktop/Siaa_ai/sentinel
   from the second retrained release on, the release set named in the current model's
   `training_metrics.json` is passed as `--train-lock data/train_release_<previous tag>` automatically
   (`plan` prints it). `--train-lock <ids.txt | release-set dir>` sets it yourself.
+
+### 4a. Two candidates: `--candidates warm,fresh`
+
+By default (`--candidates warm`) one candidate is fine-tuned from the current release
+(`--base-model`, default `models/brain_triage_finetuned`) — exactly the commands above. With
+`--candidates warm,fresh` the pipeline also trains a **fresh** candidate from the public ImageNet ViT
+(`models/hf/google__vit-base-patch16-224` when that offline copy exists, else `google/vit-base-patch16-224`
+from the Hugging Face cache, with `--base-model-fresh`) and keeps the better one:
+
+```sh
+/Users/shakhzodbtr/venv/bin/python scripts/release_pipeline.py run --batch new2 \
+    --root /Volumes/SIAA_DATA/raw/shox/new2/images --reports /Volumes/SIAA_DATA/raw/shox/new2/reports \
+    --candidates warm,fresh
+```
+
+- `train` writes `models/brain_triage_candidate_<tag>_warm` and `…_fresh` (≈ 2 × the train time and disk);
+  `gate` evaluates **each** with `--compare-with models/brain_triage_finetuned` on the same val set.
+- `promote` moves the best candidate that **passed the gate with `promotion.promote = true`**, by
+  balanced accuracy; a tie goes to `warm`. A candidate that fails a floor (exit 2) or is not better than
+  the current release (exit 4) is never promoted, whatever its other numbers. When neither qualifies the
+  run stops before `promote` with the same `GATE FAILED` / `NOT PROMOTED` message as section 7.
+- The pre-train guard checks that the fresh base is on this Mac (**nothing is downloaded during a
+  release**; stages run with `HF_HUB_OFFLINE=1`): `fresh base not available offline` stops the run
+  before any training and prints the download command for a machine with internet — copy the resulting
+  `models/hf/google__vit-base-patch16-224/` into the repo.
+- `state.json` → `candidates.<warm|fresh>` (path, base, train / gate exit codes, sens / spec / balanced,
+  verdict) and `candidate_choice` (the chosen candidate and the ranking with the reason each one was
+  rejected); `plan`, `status` and the printed resume line show them. A `--resume` after one candidate
+  finished training retrains only the other one.
+- The candidate that was not promoted stays in `models/`; delete it once the release is published.
 
 ## 5. Stage by stage — what each prints and what "good" looks like
 
@@ -154,6 +226,7 @@ is untouched in both, and `state.json` records the verdict (`status` shows it):
        --base-model google/vit-base-patch16-224 --from train
    ```
    `--from train` (without `--resume`) always retrains; with `--resume` it also retrains, because `train` records its `--base-model` and `--epochs` and a new value counts as a changed input.
+   To train both and let the gate pick, use `--candidates warm,fresh --from train` instead (section 4a; the gate-failure message prints that line too).
 6. Never fine-tune on a handful of extra studies to squeeze past a floor — the numbers must be comparable across releases (same holdout, same protocol).
 
 **Relabel path (LLM labels), step by step.** Run from `~/Desktop/Siaa_ai/sentinel`; `<tag>` is the tag printed by the run.
@@ -203,6 +276,36 @@ After `bundle` the orchestrator prints this list; the script does none of it.
 8. **Publish the draft release** with release notes: new sensitivity / specificity with CI, number of held-out patients, model identity, batch name.
 9. Hand the installer + `admin_install_guide_*.md` to hospital IT; keep `data/release/<tag>/` until the install is confirmed.
 
+### 8a. Code signing — one-time purchase
+
+Without a certificate the installer is **unsigned** and Windows SmartScreen warns "Windows protected
+your PC" on every clinic PC. The CI already reads the secrets `WIN_CSC_LINK` (the `.pfx`, base64 or
+URL) and `WIN_CSC_KEY_PASSWORD`; when they are set, `electron-builder` signs the NSIS installer — no
+code change.
+
+- **OV code-signing certificate** (organisation-validated, from a public CA; the company's legal
+  documents are checked, allow 1–3 weeks). Since June 2023 CAs issue code-signing keys only on a
+  hardware token or a cloud HSM, so ask the CA **before buying** whether you can get a key usable from
+  CI (a `.pfx` for `WIN_CSC_LINK`, or a cloud-signing service) — a USB token can only sign on the
+  machine it is plugged into.
+- **Azure Trusted Signing** (Microsoft's cloud signing; low monthly fee, SmartScreen reputation builds
+  quickly). Check the eligibility rules (country and age of the organisation) before you plan on it.
+  It is not a `.pfx`: using it needs a CI change (Azure credentials as secrets + `azureSignOptions` in
+  `desktop-app/package.json`) — ask for it as a separate change.
+- After the first signed build: right-click the `.exe` → Properties → Digital Signatures shows the
+  company name; record the certificate's expiry date in the release checklist.
+
+### 8b. Clinic delivery flavour — installer without the model + per-clinic bundle
+
+For a paying clinic the validated model is not inside the installer: build with the workflow input
+`include_validated_model = false` (artifact `sentinel-windows-x64-NO-VALIDATED-MODEL`), then, per clinic
+PC, provision a licence + model bundle encrypted for that PC's fingerprint with
+`packaging/provision_clinic.py` and deliver both. The full vendor procedure (fingerprint → provision →
+deliver → import → verify, the ledger, renewals, a new model release for existing clinics) is
+[vendor_provisioning_en.md](vendor_provisioning_en.md) (RU: `vendor_provisioning_ru.md`); the clinic
+side is §5.3–§5.4 of `admin_install_guide_en.md`. After every model release, re-provision the bundle
+for each clinic in `data/licenses/ledger.csv`.
+
 ## 9. Resume, status and troubleshooting
 
 - `/Users/shakhzodbtr/venv/bin/python scripts/release_pipeline.py status --batch <batch>` — table of stages (pending / running / done / archived / failed) with log paths, guard verdicts and the gate verdict; the tag comes from `data/release/LATEST`.
@@ -224,17 +327,19 @@ Evidence paths are relative to `data/release/<tag>/` unless they start with `dat
 
 | ☐ | Item | Evidence |
 |---|---|---|
+| ☐ | Drive archived: intake verified, INVENTORY row written, mirror verified | `<SIAA_DATA>/raw/<clinic>/<batch>/README.txt`, `raw/INVENTORY.csv`, `backup_mirror.sh` summary |
 | ☐ | Reports parsed with modality from section headers, no names in any CSV | `data/<batch>_reports.csv`, `logs/parse.log` |
 | ☐ | Label benchmark ≥ 0.90 on `abnormal` | `logs/label.log`, `state.json` → `guards.label_benchmark` |
 | ☐ | ≥ 300 normal studies matched (or a documented reason to proceed) | `state.json` → `guards.matched_counts` / `guards.pre_train`, `logs/guards.log` |
 | ☐ | 0 train/val/tune overlap, 178 holdout ids in val | `data/train_release_<tag>/dataset_manifest.json`, `logs/guards.log` |
-| ☐ | Gate passed: sens ≥ 0.85, spec ≥ 0.40, promotion true | `models/brain_triage_finetuned/study_level_eval.json` |
+| ☐ | Gate passed: sens ≥ 0.85, spec ≥ 0.40, promotion true (with two candidates: the chosen one recorded) | `models/brain_triage_finetuned/study_level_eval.json`, `state.json` → `candidate_choice` |
 | ☐ | New identity printed and shown by the app | `MANIFEST.json`, `/health`, PDF footer |
 | ☐ | Bump applied, `bump_model_release.py --check` clean | `logs/guard_bump_check.log`, `logs/guards.log` |
 | ☐ | `pytest -q` and docs consistency green | `logs/guard_pytest*.log`, `state.json` → `guards.pre_bundle` |
 | ☐ | Bundle published, restore verified | `manifest.json`, `logs/bundle.log` |
 | ☐ | `MODEL_BUNDLE_URL` secret updated | GitHub → Settings → Environments |
 | ☐ | App version raised in `desktop-app/package.json`, bump committed, new `v<version>` tagged and pushed | `git log`, Actions run green |
+| ☐ | Installer signed (or the unsigned warning accepted for this pilot) | `.exe` → Properties → Digital Signatures |
 | ☐ | Installer downloaded and laptop test passed offline | `windows_laptop_test_*.md` ticked |
 | ☐ | Draft release published with numbers + identity | GitHub release page |
 | ☐ | Old release kept in `models/brain_triage_finetuned_prev_<id>/` for rollback | `ls models/` |

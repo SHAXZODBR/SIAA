@@ -125,7 +125,7 @@ FALLBACK_ACC = 0.7865168539325843
 FALLBACK_TP, FALLBACK_FN, FALLBACK_TN, FALLBACK_FP = 118, 13, 22, 25
 FALLBACK_N_STUDIES = 178
 FALLBACK_N_SLICES = 890
-FALLBACK_EVALUATED_ON = '2026-09-07'
+FALLBACK_EVALUATED_ON = '2026-11-09'
 FALLBACK_IDENTITY = '0d559766ce58'
 FALLBACK_MIN_SENS = 0.85
 FALLBACK_MIN_SPEC = 0.4
@@ -281,6 +281,30 @@ SENS_CI: tuple[float, float] = METRICS.sens_ci
 SPEC_CI: tuple[float, float] = METRICS.spec_ci
 
 
+def _publish(m: Metrics) -> None:
+    """Point METRICS and every module constant at `m` (one place, so the
+    constants can never disagree with METRICS after a reload)."""
+    g = globals()
+    g.update(
+        METRICS=m, MODEL_DIR=Path(m.model_dir), SOURCE=m.source,
+        SENS=m.sens, SPEC=m.spec, ACC=m.acc, TP=m.tp, FN=m.fn, TN=m.tn, FP=m.fp,
+        N_STUDIES=m.n_studies, N_ABNORMAL=m.n_abnormal, N_NORMAL=m.n_normal, N_SLICES=m.n_slices,
+        EVALUATED_ON=m.evaluated_on, IDENTITY=m.identity, MIN_SENS=m.min_sens, MIN_SPEC=m.min_spec,
+        THRESHOLD=m.threshold, SENS_CI=m.sens_ci, SPEC_CI=m.spec_ci,
+    )
+
+
+def reload(model_dir: Optional[Path] = None) -> Metrics:
+    """Re-read the release metrics (e.g. after POST /models/import swapped the
+    model) and refresh METRICS plus every module constant (SENS, SPEC,
+    IDENTITY, …). Callers that did `from validated_metrics import SENS` keep
+    their old binding — read `validated_metrics.SENS` / `.METRICS` at call time.
+    Never raises: an unreadable eval yields the fallback, exactly like load()."""
+    m = load(model_dir)
+    _publish(m)
+    return m
+
+
 # --------------------------------------------------------------------------- formatting
 
 def pct(x: float) -> str:
@@ -319,17 +343,41 @@ _SENS_FRAGMENT = {
 }
 
 
-def triage_note(lang: str = 'en', m: Metrics = None) -> str:
-    """The parenthetical the report templates / registry quote, e.g. (en)
-    "validated on this clinic's data: sensitivity 90%, specificity 47%"."""
+# Quoted instead of the figures whenever the triage output is NOT a validated
+# release (gate failed, no eval for the loaded weights, finding status 'pending'):
+# a report must never call such a model validated nor borrow another release's numbers.
+_NOT_VALIDATED_FRAGMENT = {
+    'ru': 'НЕ валидированный релиз — эффективность на данных клиники не подтверждена',
+    'uz': "validatsiya qilinmagan reliz — klinika ma'lumotlarida samaradorligi tasdiqlanmagan",
+    'en': "NOT a validated release — performance on this clinic's data not established",
+}
+
+
+def not_validated_note(lang: str = 'en') -> str:
+    """The parenthetical for a triage output that is not a validated release."""
+    return _NOT_VALIDATED_FRAGMENT.get(lang, _NOT_VALIDATED_FRAGMENT['en'])
+
+
+def triage_note(lang: str = 'en', m: Metrics = None, *, validated: bool = True) -> str:
+    """The parenthetical the report templates quote, e.g. (en)
+    "validated on this clinic's data: sensitivity 90%, specificity 47%".
+
+    Only when BOTH the release (m.validated) and the caller (validated=False
+    for a finding whose status is not 'validated') say so; otherwise the
+    not-validated wording, without any figures."""
     m = m or METRICS
+    if not (validated and m.validated):
+        return not_validated_note(lang)
     tpl = _VALIDATED_FRAGMENT.get(lang, _VALIDATED_FRAGMENT['en'])
     return tpl.format(sens=pct(m.sens), spec=pct(m.spec))
 
 
-def sensitivity_note(lang: str = 'en', m: Metrics = None) -> str:
-    """'sensitivity 90%' / 'чувствительность 90%' / 'sezuvchanlik 90%'."""
+def sensitivity_note(lang: str = 'en', m: Metrics = None, *, validated: bool = True) -> str:
+    """'sensitivity 90%' / 'чувствительность 90%' / 'sezuvchanlik 90%' — or the
+    not-validated wording under the same rule as triage_note()."""
     m = m or METRICS
+    if not (validated and m.validated):
+        return not_validated_note(lang)
     tpl = _SENS_FRAGMENT.get(lang, _SENS_FRAGMENT['en'])
     return tpl.format(sens=pct(m.sens))
 
@@ -337,6 +385,10 @@ def sensitivity_note(lang: str = 'en', m: Metrics = None) -> str:
 def registry_notes(m: Metrics = None) -> str:
     """BRAIN_TRIAGE ModelCard.notes (English, shown in the app's model list)."""
     m = m or METRICS
+    if not m.validated:
+        return (f'Local triage model — NOT a validated release '
+                f'({m.not_validated_reason or "release gate not passed"}); its output is labelled '
+                f'pending and unverified. Triage aid only; never certifies a scan as normal.')
     return (f'Trained AND validated on local patient studies: study-level sensitivity {dec(m.sens)} / '
             f'specificity {dec(m.spec)} at mean-prob {m.threshold:g} over {m.n_studies} held-out local '
             f'patients. Triage aid — prioritizes studies for radiologist review; never certifies a scan '
@@ -352,8 +404,9 @@ def summary_line(m: Metrics = None) -> str:
 
 
 __all__ = [
-    'Metrics', 'METRICS', 'MODEL_DIR', 'SOURCE', 'load', 'resolve_model_dir', 'models_dir', 'wilson_ci',
+    'Metrics', 'METRICS', 'MODEL_DIR', 'SOURCE', 'load', 'reload', 'resolve_model_dir', 'models_dir', 'wilson_ci',
     'SENS', 'SPEC', 'ACC', 'TP', 'FN', 'TN', 'FP', 'N_STUDIES', 'N_ABNORMAL', 'N_NORMAL', 'N_SLICES',
     'EVALUATED_ON', 'IDENTITY', 'MIN_SENS', 'MIN_SPEC', 'THRESHOLD', 'SENS_CI', 'SPEC_CI',
-    'pct', 'dec', 'ci', 'miss_one_in', 'triage_note', 'sensitivity_note', 'registry_notes', 'summary_line',
+    'pct', 'dec', 'ci', 'miss_one_in', 'triage_note', 'sensitivity_note', 'not_validated_note',
+    'registry_notes', 'summary_line',
 ]

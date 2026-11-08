@@ -1,6 +1,6 @@
 # SIAA — Sentinel Medical AI · Third-Party Data, Models and Software Attributions
 
-Version 1.0.0 · Document revision 2026-09 · English, with a Russian summary at the end
+Version 1.1.0 · Document revision 2026-11 · English, with a Russian summary at the end
 
 This document lists the third-party datasets, model weights and major software components used in Sentinel Medical AI, with their licence names as recorded in the source code (`src/inference/model_registry.py`, `scripts/import_public_normals.py`, `requirements.txt`, `desktop-app/package.json`). Licence texts are those published by the respective projects; before redistributing any component, verify the current licence text at the source.
 

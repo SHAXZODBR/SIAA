@@ -335,6 +335,72 @@ TABLE: list[tuple[str, str, str]] = [
     ('src/inference/validated_metrics.py', r'^FALLBACK_THRESHOLD = ' + FL + r'$', 'FALLBACK_THRESHOLD = {thr_raw}'),
 ]
 
+# ---------------- sales documents (docs/sales/)
+# Copied verbatim from docs/sales/test_sales_docs.py (BUMP_ENTRIES), which proves they match
+# exactly once, render the current release byte for byte and move every figure for another one.
+# Same D / I fragments and build_context keys as the table above.
+_EN_PATIENTS = (r"\*\*" + I + r" held-out patients\*\*", "**{n} held-out patients**")
+_EN_FIGURES = (
+    r"\*\*sensitivity " + D + r"\*\* \(" + I + r" of " + I + r" abnormal studies flagged\) and \*\*specificity "
+    + D + r"\*\* \(" + I + r" of " + I + r" normal studies not flagged; 95% CI " + D + r"–" + D + r"\)",
+    "**sensitivity {sens_en}** ({tp} of {n_abn} abnormal studies flagged) and **specificity {spec_en}** "
+    "({tn} of {n_norm} normal studies not flagged; 95% CI {spec_ci_en})",
+)
+_RU_PATIENTS = (r"\*\*" + I + r" отложенн(?:ом пациенте|ых пациентах)\*\*", "**{n} {patients_prep_ru}**")
+_RU_FIGURES = (
+    r"\*\*чувствительность " + D + r"\*\* \(отмечено " + I + r" из " + I
+    + r" патологическ(?:ого исследования|их исследований)\) и \*\*специфичность " + D + r"\*\* \(не отмечено "
+    + I + r" из " + I + r" нормальн(?:ого исследования|ых исследований); 95 % ДИ " + D + r"–" + D + r"\)",
+    "**чувствительность {sens_ru}** (отмечено {tp} из {n_abn} {abn_gen_ru}) и **специфичность {spec_ru}** "
+    "(не отмечено {tn} из {n_norm} {norm_gen_ru}; 95 % ДИ {spec_ci_ru})",
+)
+
+_SALES_ENTRIES: list[tuple[str, str, str]] = [
+    ("docs/sales/one_pager_en.md", *_EN_PATIENTS),
+    ("docs/sales/one_pager_en.md", *_EN_FIGURES),
+    ("docs/sales/one_pager_en.md",
+     r"about 1 in " + I + r" abnormal studies is not flagged, and (?:about half of|about \d+ in 10) normal studies "
+     r"are flagged as well",
+     "about 1 in {miss} abnormal studies is not flagged, and {normals_flagged_en} normal studies are flagged as well"),
+
+    ("docs/sales/one_pager_ru.md", *_RU_PATIENTS),
+    ("docs/sales/one_pager_ru.md", *_RU_FIGURES),
+    ("docs/sales/one_pager_ru.md",
+     r"примерно 1 из " + I + r" патологическ(?:ого исследования|их исследований) не отмечается, а около "
+     r"(?:половины|\d+ из 10) нормальных \*\*(?:отмечаются|отмечается)\*\*",
+     "примерно 1 из {miss} {miss_abn_ru} не отмечается, а {normals_flagged_ru}"),
+
+    ("docs/sales/one_pager_uz.md", r"\*\*" + I + r" ta ajratib qo‘yilgan bemorda\*\*",
+     "**{n} ta ajratib qo‘yilgan bemorda**"),
+    ("docs/sales/one_pager_uz.md",
+     r"\*\*sezgirlik " + D + r"\*\* \(" + I + r" ta patologik tekshiruvdan " + I + r" tasi belgilangan\) va "
+     r"\*\*spetsifiklik " + D + r"\*\* \(" + I + r" ta normal tekshiruvdan " + I + r" tasi belgilanmagan; "
+     r"95 % ishonch oralig‘i " + D + r"–" + D + r"\)",
+     "**sezgirlik {sens_ru}** ({n_abn} ta patologik tekshiruvdan {tp} tasi belgilangan) va **spetsifiklik "
+     "{spec_ru}** ({n_norm} ta normal tekshiruvdan {tn} tasi belgilanmagan; 95 % ishonch oralig‘i {spec_ci_ru})"),
+    ("docs/sales/one_pager_uz.md",
+     r"har " + I + r" ta patologik tekshiruvdan taxminan 1 tasi belgilanmaydi, (?:normal tekshiruvlarning esa "
+     r"taxminan yarmi|har 10 ta normal tekshiruvdan esa taxminan \d+ tasi) \*\*belgilanadi\*\*",
+     "har {miss} ta patologik tekshiruvdan taxminan 1 tasi belgilanmaydi, {normals_flagged_uz} **belgilanadi**"),
+
+    ("docs/sales/pilot_proposal_en.md", *_EN_PATIENTS),
+    ("docs/sales/pilot_proposal_en.md", *_EN_FIGURES),
+    ("docs/sales/pilot_proposal_en.md", r"release-gate floors \(" + D + r" / " + D + r"\)",
+     "release-gate floors ({min_sens_en} / {min_spec_en})"),
+    ("docs/sales/pilot_proposal_en.md", r"Triage sensitivity point estimate ≥ " + D + r" \*\*and\*\* specificity ≥ " + D,
+     "Triage sensitivity point estimate ≥ {min_sens_en} **and** specificity ≥ {min_spec_en}"),
+
+    ("docs/sales/pilot_proposal_ru.md", *_RU_PATIENTS),
+    ("docs/sales/pilot_proposal_ru.md", *_RU_FIGURES),
+    ("docs/sales/pilot_proposal_ru.md", r"порогами выпуска \(" + D + r" / " + D + r"\)",
+     "порогами выпуска ({min_sens_ru} / {min_spec_ru})"),
+    ("docs/sales/pilot_proposal_ru.md",
+     r"Точечная оценка чувствительности триажа ≥ " + D + r" \*\*и\*\* специфичности ≥ " + D,
+     "Точечная оценка чувствительности триажа ≥ {min_sens_ru} **и** специфичности ≥ {min_spec_ru}"),
+]
+
+TABLE += _SALES_ENTRIES
+
 FILES: list[str] = list(dict.fromkeys(f for f, _, _ in TABLE))   # unique, in table order
 
 

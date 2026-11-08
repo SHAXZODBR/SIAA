@@ -1,16 +1,29 @@
 # Installer builds for the Sentinel desktop app — Windows NSIS (x64) and macOS DMG (Apple Silicon).
 #
-#   trigger   Actions tab -> "Build installers" -> Run workflow, or push a tag v1.0.0 (tags v*)
+#   trigger   Actions tab -> "Build installers" -> Run workflow, or push a tag v1.1.0 (tags v*)
+#             Run workflow has one input, include_validated_model (default true). false = build the
+#             CLINIC flavour: the "Restore validated triage model" step is skipped, the installer ships
+#             without the validated model and the artifact is named ...-NO-VALIDATED-MODEL; the model
+#             then reaches each clinic as a bundle encrypted for that PC (packaging/provision_clinic.py,
+#             docs/vendor_provisioning_en.md). Tag pushes always restore the model (full flavour);
+#             only the full flavour is attached to a tag's draft release (a clinic-flavour run
+#             dispatched on a tag ref keeps its installer as a workflow artifact only).
+#   gate      job `tests` (ubuntu, CPU torch) runs `pytest -q -m "not slow"`, the docs drift guard and
+#             the desktop tests (type-check + `npm test`); both installer jobs `needs: tests`, so a red
+#             suite never produces an installer.
 #   output    artifact  sentinel-windows-x64-{full|UNVALIDATED-DEMO|NO-VALIDATED-MODEL}   <- desktop-app/release/*.exe
 #             artifact  sentinel-macos-arm64-{full|UNVALIDATED-DEMO|NO-VALIDATED-MODEL}   <- desktop-app/release/*.dmg
 #             (UNVALIDATED-DEMO = a bundle published with --allow-unvalidated; a v* tag build refuses it)
-#             tag builds also attach the files to a DRAFT GitHub Release for the tag
+#             artifacts expire after 1 day (retention-days: 1 — the repository is public; download
+#             the installer right after the run). Tag builds also attach the files to a DRAFT GitHub
+#             Release for the tag (never published automatically).
 #
-# Each job: checkout -> Python 3.11 venv with CPU-only PyTorch -> PyInstaller freeze
+# Installer jobs: checkout -> Python 3.11 venv with CPU-only PyTorch -> PyInstaller freeze
 # (packaging/build_backend.{ps1,sh}) -> public models (scripts/download_all_models.py) ->
 # validated model from the MODEL_BUNDLE_URL secret (packaging/fetch_model_bundle.py) ->
 # bundle identity == the identity the code pins (src/inference/validated_metrics.py FALLBACK_IDENTITY,
-# rewritten by scripts/bump_model_release.py) -> /health smoke of the frozen exe (packaging/smoke_backend.{ps1,sh}) -> npm ci + type-check ->
+# rewritten by scripts/bump_model_release.py) -> bundled release record (evaluated_on, counts) == the code
+# pin (packaging/check_bundle_release.py) -> /health smoke of the frozen exe (packaging/smoke_backend.{ps1,sh}) -> npm ci + type-check ->
 # electron-builder -> upload.
 #
 # Secrets (Settings -> Secrets and variables -> Actions); every one is optional:
@@ -34,6 +47,12 @@ name: Build installers
 
 on:
   workflow_dispatch:
+    inputs:
+      include_validated_model:
+        description: 'Include the validated triage model (MODEL_BUNDLE_URL). Untick for the clinic flavour (...-NO-VALIDATED-MODEL): the model is delivered per clinic, encrypted for that PC.'
+        type: boolean
+        required: false
+        default: true
   push:
     tags: ['v*']
 
@@ -41,7 +60,8 @@ permissions:
   contents: write     # draft-release upload on tag builds (checkout needs read)
 
 concurrency:
-  group: build-installers-${{ github.ref }}
+  # per ref AND flavour: a clinic-flavour dispatch on a tag must not cancel that tag's full build
+  group: build-installers-${{ github.ref }}-${{ github.event_name }}-${{ inputs.include_validated_model }}
   cancel-in-progress: true
 
 env:
@@ -58,8 +78,72 @@ env:
   PYTHONIOENCODING: utf-8
 
 jobs:
+  # The whole unit-test suite (CPU torch, no models, no secrets) gates both installer builds.
+  # Tests that need real data or the validated model skip when it is absent, as they do on a
+  # fresh checkout. The HF/transformers offline flags keep the run hermetic: a test can never
+  # pass only because the runner happened to reach huggingface.co.
+  tests:
+    name: Test suite (pytest, CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Python venv + CPU torch + requirements
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          PY="$GITHUB_WORKSPACE/.venv/bin/python"
+          "$PY" -m pip install --upgrade pip wheel
+          "$PY" -m pip install "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" --index-url "$TORCH_INDEX_URL"
+          "$PY" -m pip install -r requirements.txt -r requirements-dev.txt --extra-index-url "$TORCH_INDEX_URL"
+          v="$("$PY" -c 'import torch; print(torch.__version__)')"
+          case "$v" in "$TORCH_VERSION"*) ;; *) echo "torch resolved to $v, expected $TORCH_VERSION (a requirement re-pinned it; update TORCH_VERSION)"; exit 1;; esac
+          echo "PYTHON=$PY" >> "$GITHUB_ENV"
+
+      - name: Unit tests (pytest -m "not slow")
+        run: '"$PYTHON" -m pytest -q -m "not slow"'
+
+      # pytest.ini testpaths = tests, so the docs + sales-document guards are run explicitly
+      - name: Docs drift guard (docs/test_docs_consistency.py + docs/sales/test_sales_docs.py)
+        run: '"$PYTHON" -m pytest -q docs/test_docs_consistency.py docs/sales/test_sales_docs.py'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: desktop-app/package-lock.json
+
+      # Desktop unit tests (node --test) + type-check; the Electron binary is not needed for them.
+      - name: Desktop tests (npm ci + type-check + npm test)
+        working-directory: desktop-app
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run type-check
+          npm test
+
   windows:
     name: Windows installer (NSIS x64)
+    needs: tests
     environment: MODEL_BUNDLE_URL   # the secrets MODEL_BUNDLE_URL / MODEL_BUNDLE_TOKEN live in this GitHub environment
     runs-on: windows-latest
     timeout-minutes: 240
@@ -115,8 +199,17 @@ jobs:
           }
           if (-not $ok) { throw "download_all_models.py failed after 3 attempts" }
 
+      # Clinic flavour (Run workflow with include_validated_model = false): no validated model in
+      # the installer; it is delivered per clinic, encrypted for that PC (packaging/provision_clinic.py).
+      - name: Validated model excluded (clinic flavour)
+        if: github.event_name == 'workflow_dispatch' && !inputs.include_validated_model
+        run: |
+          Write-Host '::notice title=Clinic flavour::include_validated_model=false - the installer is built WITHOUT the validated triage model (artifact ...-NO-VALIDATED-MODEL). Deliver the model per clinic with packaging/provision_clinic.py (docs/vendor_provisioning_en.md).'
+          '## Clinic flavour: validated model deliberately excluded (include_validated_model=false)' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
       - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
         id: bundle
+        if: github.event_name != 'workflow_dispatch' || inputs.include_validated_model
         env:
           MODEL_BUNDLE_URL: ${{ secrets.MODEL_BUNDLE_URL }}
           MODEL_BUNDLE_TOKEN: ${{ secrets.MODEL_BUNDLE_TOKEN }}
@@ -141,6 +234,14 @@ jobs:
             Write-Host "::error title=Bundle identity mismatch::MODEL_BUNDLE_URL restored identity $env:BUNDLE_IDENTITY but the code pins $pinned. Point the MODEL_BUNDLE_URL secret at this release's manifest asset (packaging/publish_model_bundle.py prints it) or commit the scripts/bump_model_release.py changes."
             throw "bundle identity $env:BUNDLE_IDENTITY != code-pinned identity $pinned"
           }
+
+      # A re-evaluation keeps the identity but changes the release record (evaluated_at, counts):
+      # the bundled study_level_eval.json must be the one the committed bump pinned (the docs quote it).
+      - name: Verify bundle release record matches the code
+        if: steps.bundle.outputs.have_bundle == '1'
+        run: |
+          & $env:PYTHON packaging\check_bundle_release.py --model-dir models\brain_triage_finetuned
+          if ($LASTEXITCODE -ne 0) { throw "bundle release record != code pin (check_bundle_release.py exit $LASTEXITCODE)" }
 
       # A bundle published with --allow-unvalidated ("validated": false) is for demo builds only:
       # a release tag must never ship it (its artifact is named ...-UNVALIDATED-DEMO below).
@@ -204,11 +305,14 @@ jobs:
           name: sentinel-windows-x64-${{ steps.bundle.outputs.have_bundle == '1' && (steps.bundle.outputs.bundle_validated == '0' && 'UNVALIDATED-DEMO' || 'full') || 'NO-VALIDATED-MODEL' }}
           path: desktop-app/release/*.exe
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1        # public repo: installers must not stay downloadable
           compression-level: 0     # the NSIS payload is already LZMA-compressed
 
+      # Full flavour only: a clinic-flavour run dispatched ON a tag ref (github.ref = refs/tags/v…)
+      # produces installers with the SAME file names — attaching them would --clobber the full
+      # installer in the tag's draft release.
       - name: Attach to draft GitHub Release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.include_validated_model)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -226,6 +330,7 @@ jobs:
 
   macos:
     name: macOS installer (DMG arm64)
+    needs: tests
     environment: MODEL_BUNDLE_URL   # the secrets MODEL_BUNDLE_URL / MODEL_BUNDLE_TOKEN live in this GitHub environment
     runs-on: macos-latest      # Apple Silicon runner -> arm64 backend + arm64 DMG (an Intel DMG needs an Intel runner)
     timeout-minutes: 240
@@ -276,8 +381,17 @@ jobs:
           done
           echo "download_all_models.py failed after 3 attempts"; exit 1
 
+      # Clinic flavour (Run workflow with include_validated_model = false): no validated model in
+      # the installer; it is delivered per clinic, encrypted for that PC (packaging/provision_clinic.py).
+      - name: Validated model excluded (clinic flavour)
+        if: github.event_name == 'workflow_dispatch' && !inputs.include_validated_model
+        run: |
+          echo '::notice title=Clinic flavour::include_validated_model=false - the installer is built WITHOUT the validated triage model (artifact ...-NO-VALIDATED-MODEL). Deliver the model per clinic with packaging/provision_clinic.py (docs/vendor_provisioning_en.md).'
+          echo '## Clinic flavour: validated model deliberately excluded (include_validated_model=false)' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
         id: bundle
+        if: github.event_name != 'workflow_dispatch' || inputs.include_validated_model
         env:
           MODEL_BUNDLE_URL: ${{ secrets.MODEL_BUNDLE_URL }}
           MODEL_BUNDLE_TOKEN: ${{ secrets.MODEL_BUNDLE_TOKEN }}
@@ -300,6 +414,12 @@ jobs:
             echo "bundle identity $BUNDLE_IDENTITY != code-pinned identity $pinned"
             exit 1
           fi
+
+      # A re-evaluation keeps the identity but changes the release record (evaluated_at, counts):
+      # the bundled study_level_eval.json must be the one the committed bump pinned (the docs quote it).
+      - name: Verify bundle release record matches the code
+        if: steps.bundle.outputs.have_bundle == '1'
+        run: '"$PYTHON" packaging/check_bundle_release.py --model-dir models/brain_triage_finetuned'
 
       # A bundle published with --allow-unvalidated ("validated": false) is for demo builds only:
       # a release tag must never ship it (its artifact is named ...-UNVALIDATED-DEMO below).
@@ -363,11 +483,14 @@ jobs:
           name: sentinel-macos-arm64-${{ steps.bundle.outputs.have_bundle == '1' && (steps.bundle.outputs.bundle_validated == '0' && 'UNVALIDATED-DEMO' || 'full') || 'NO-VALIDATED-MODEL' }}
           path: desktop-app/release/*.dmg
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1        # public repo: installers must not stay downloadable
           compression-level: 0
 
+      # Full flavour only: a clinic-flavour run dispatched ON a tag ref (github.ref = refs/tags/v…)
+      # produces installers with the SAME file names — attaching them would --clobber the full
+      # installer in the tag's draft release.
       - name: Attach to draft GitHub Release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.include_validated_model)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

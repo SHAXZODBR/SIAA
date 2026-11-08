@@ -1,20 +1,35 @@
 """FastAPI inference server for Sentinel Medical AI.
 
-Accepts DICOM files via REST API, runs DenseNet121 classification + Grad-CAM,
-and returns structured analysis results in under 10 seconds.
+Accepts DICOM files via REST API, routes each study to the matching detector
+(brain MR panel, head-CT series protocol, single-file registry models) and
+returns structured, provenance-stamped analysis results.
+
+Clinic-operations endpoints (v1.1.0, docs/dev/finish_line_contract.md):
+  GET/PUT /settings/ai   admin: show/hide unvalidated ('pending') detectors,
+                         persisted at DATA_DIR/settings.json (audit-logged)
+  GET  /diagnostics      admin: PHI-safe support zip (health, versions, model
+                         identities, log tails, redacted audit tail)
+  POST /models/import    admin: install a per-clinic encrypted model bundle
+                         from DATA_DIR/model_inbox/ (verify → test-decrypt →
+                         swap → reload, rollback on any failure, audit-logged)
 """
 
 import io
 import os
+import re
+import sys
 import json
 import time
 import shutil
 import sqlite3
 import hashlib
 import asyncio
+import inspect
+import platform
 import threading
 import uuid
 import base64
+import zipfile
 import tempfile
 from datetime import datetime
 import numpy as np
@@ -24,9 +39,9 @@ import pydicom
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import Optional
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field, StrictBool
+from typing import Any, Optional
 from contextlib import asynccontextmanager
 from loguru import logger
 
@@ -45,7 +60,7 @@ from src.utils.offline import OFFLINE
 
 # Server/app version reported in /health and stamped on every analysis
 # (desktop-app/package.json carries the same number for the UI build).
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # All mutable state (DB, logs, corrections, JWT secret) lives under DATA_DIR.
 # Wire the logger before anything else imports (auth_routes creates the default
@@ -117,6 +132,10 @@ class ReportRequest(BaseModel):
     patient_info: Optional[dict] = None
     modality: str = 'CR'
     body_part: str = 'CHEST'
+    # brain MR: the sequence names actually present (the /analyze/study
+    # 'sequences_present'); lets the regenerated report keep the same honest
+    # technique line as the first draft (D4). None → generic line, no claim.
+    sequences: Optional[list[str]] = None
 
 
 class QuestionRequest(BaseModel):
@@ -173,6 +192,252 @@ def _audit(user: dict, action: str, entity_type: str, entity_id: str,
         )
     except Exception as e:
         logger.debug(f"audit log failed: {e}")
+
+
+# ==================== AI settings (D1: pending detectors) ====================
+# DATA_DIR/settings.json holds the admin's persisted choices. Only
+# 'show_pending_detectors' is defined today; unknown keys are preserved on
+# write. Resolution (contract /settings/ai):
+#   1. settings.json 'show_pending_detectors' (bool)            source='file'
+#   2. env SENTINEL_SHOW_PENDING_DETECTORS = '1' | '0'          source='env'
+#   3. '0' when SENTINEL_HOSPITAL_BUILD=1, else '1'             source='default'
+# Read on every analysis (a tiny file) so a PUT takes effect for the next
+# study without a restart. Env vars are read at call time, not import time.
+
+SETTINGS_FILE_NAME = 'settings.json'
+_settings_lock = threading.Lock()
+_warned_settings: set = set()
+
+
+def _settings_path() -> Path:
+    return DATA_DIR / SETTINGS_FILE_NAME
+
+
+def _read_settings_file() -> dict:
+    """Parsed DATA_DIR/settings.json, or {} when absent/unreadable/not an object.
+    A corrupt file is logged and ignored (the env/default rule then applies)."""
+    path = _settings_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        logger.warning(f"settings: {path.name} unreadable ({type(e).__name__}); using env/default rule")
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(f"settings: {path.name} is not a JSON object; using env/default rule")
+        return {}
+    return data
+
+
+def _write_settings_file(data: dict) -> None:
+    """Atomic write (tmp + os.replace), owner-only (0600)."""
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    payload = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _default_show_pending() -> tuple[bool, str]:
+    """(value, source) from env/default only — settings.json not consulted."""
+    raw = os.environ.get('SENTINEL_SHOW_PENDING_DETECTORS')
+    if raw is not None and raw.strip() in ('0', '1'):
+        return raw.strip() == '1', 'env'
+    if raw is not None and raw.strip() and raw not in _warned_settings:
+        _warned_settings.add(raw)       # warn once per value (/health polls this)
+        logger.warning(f"SENTINEL_SHOW_PENDING_DETECTORS={raw!r} ignored (expected '1' or '0')")
+    hospital = os.environ.get('SENTINEL_HOSPITAL_BUILD') == '1'
+    return (not hospital), 'default'
+
+
+def get_ai_settings() -> dict:
+    """{'show_pending_detectors': bool, 'source': 'file'|'env'|'default'}."""
+    data = _read_settings_file()
+    value = data.get('show_pending_detectors')
+    if isinstance(value, bool):
+        return {'show_pending_detectors': value, 'source': 'file'}
+    if value is not None:
+        logger.warning("settings: 'show_pending_detectors' is not a boolean; using env/default rule")
+    show, source = _default_show_pending()
+    return {'show_pending_detectors': show, 'source': source}
+
+
+def set_ai_settings(show_pending_detectors: bool) -> tuple[dict, dict]:
+    """Persist the setting. Returns (old_settings, new_settings)."""
+    with _settings_lock:
+        old = get_ai_settings()
+        data = _read_settings_file()
+        data['show_pending_detectors'] = bool(show_pending_detectors)
+        data['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        _write_settings_file(data)
+        new = get_ai_settings()
+    return old, new
+
+
+def show_pending_detectors() -> bool:
+    """Whether unvalidated ('pending') detectors run/are reported right now."""
+    try:
+        return bool(get_ai_settings()['show_pending_detectors'])
+    except Exception as e:      # never let a settings glitch break an analysis
+        logger.warning(f"settings: resolution failed ({e}); pending detectors hidden")
+        return False
+
+
+# Localized note for a study that has no validated detector while pending
+# detectors are hidden (D1). The desktop renders findings.noValidatedDetector.
+NO_VALIDATED_DETECTOR = 'no_validated_detector'
+_NO_VALIDATED_NOTES = {
+    'en': ('Not analysed by AI: no clinically validated detector is available for this study '
+           'type, and unvalidated detectors are switched off (Preferences → AI models). '
+           'The radiologist reads the study as usual.'),
+    'ru': ('ИИ-анализ не выполнялся: для этого типа исследования нет клинически валидированного '
+           'детектора, а невалидированные детекторы отключены (Настройки → Модели ИИ). '
+           'Врач-рентгенолог описывает исследование в обычном порядке.'),
+    'uz': ('Sun’iy intellekt tahlil qilmadi: ushbu tekshiruv turi uchun klinik tasdiqlangan '
+           'detektor yo‘q, tasdiqlanmagan detektorlar esa o‘chirilgan (Sozlamalar → AI modellari). '
+           'Rentgenolog tekshiruvni odatdagidek o‘qiydi.'),
+}
+
+
+def _no_validated_note(language: str) -> str:
+    return _NO_VALIDATED_NOTES.get(language, _NO_VALIDATED_NOTES['en'])
+
+
+# A brain MR on which NO panel detector produced an output while pending
+# detectors are SHOWN (every model missing / failed, or no usable series for
+# any of them). Same not-analysed state as D1, but the D1 note ("unvalidated
+# detectors are switched off") would be false here. Desktop: findings.noDetectorRan.
+NO_DETECTOR_RAN = 'no_detector_ran'
+_NO_DETECTOR_RAN_NOTES = {
+    'en': ('Not analysed by AI: no AI detector could run on this study (model not installed or '
+           'no suitable series). The radiologist reads the study as usual.'),
+    'ru': ('ИИ-анализ не выполнялся: ни один ИИ-детектор не смог обработать это исследование '
+           '(модель не установлена или нет подходящей серии). Врач-рентгенолог описывает '
+           'исследование в обычном порядке.'),
+    'uz': ('Sun’iy intellekt tahlil qilmadi: bu tekshiruvda hech bir AI detektori ishlay olmadi '
+           '(model o‘rnatilmagan yoki mos seriya yo‘q). Rentgenolog tekshiruvni odatdagidek o‘qiydi.'),
+}
+
+# Reason codes of the "accepted, NOT analysed by AI" state (requires_review,
+# rejected=False). Persisted inside overall_assessment so GET /study/{id}
+# can return the code after a restart (the studies table has no column for it).
+NOT_ANALYSED_REASONS = (NO_VALIDATED_DETECTOR, NO_DETECTOR_RAN)
+
+
+def _no_detector_ran_note(language: str) -> str:
+    return _NO_DETECTOR_RAN_NOTES.get(language, _NO_DETECTOR_RAN_NOTES['en'])
+
+
+def _persisted_rejection_reason(rejected: bool, requires_review: bool, overall: Any,
+                                impression: str) -> Optional[str]:
+    """rejection_reason for a persisted study (GET /study/{id}).
+
+    rejected → the persisted impression (the human reason, as before).
+    Accepted-but-not-analysed (requires_review, not rejected) → the machine
+    code stored in overall_assessment['rejection_reason']; rows written before
+    that field existed are recognised by their localized note text.
+    Otherwise None."""
+    if rejected:
+        return impression or None
+    if not requires_review:
+        return None
+    if isinstance(overall, dict):
+        code = overall.get('rejection_reason')
+        if isinstance(code, str) and code in NOT_ANALYSED_REASONS:
+            return code
+    text = (impression or '').strip()
+    if text and text in _NO_VALIDATED_NOTES.values():
+        return NO_VALIDATED_DETECTOR
+    if text and text in _NO_DETECTOR_RAN_NOTES.values():
+        return NO_DETECTOR_RAN
+    return None
+
+
+# ==================== Encryption at rest (D2) ====================
+
+def _maybe_encrypt_models_at_rest(models_dir: Optional[Path] = None) -> Optional[dict]:
+    """Encrypt the proprietary weights under MODELS_DIR on start of an
+    installed app. Runs ONLY when SENTINEL_ENCRYPT_MODELS_AT_REST=1 (set by the
+    packaged Electron shell), never with SENTINEL_DEV_INSECURE=1 and never on
+    macOS inside a .app bundle (signed, read-only). Never raises: startup must
+    not die over this — a failure is logged loudly and the plaintext/previous
+    state is left to model_crypto's own rollback. Returns the report dict, or
+    None when skipped/failed."""
+    from src.inference import model_registry as _mr
+    models_dir = Path(models_dir) if models_dir is not None else Path(_mr.MODELS_DIR)
+    if os.environ.get('SENTINEL_ENCRYPT_MODELS_AT_REST') != '1':
+        return None
+    if DEV_INSECURE:
+        logger.warning("SENTINEL_ENCRYPT_MODELS_AT_REST=1 ignored: SENTINEL_DEV_INSECURE=1")
+        return None
+    if sys.platform == 'darwin' and any(part.endswith('.app') for part in models_dir.parts):
+        logger.info(f"Encryption at rest skipped: models dir is inside a macOS .app bundle ({models_dir})")
+        return None
+    try:
+        from src.utils import model_crypto
+        fn = getattr(model_crypto, 'encrypt_proprietary_models_at_rest', None)
+        if fn is None:
+            logger.error("ENCRYPTION AT REST NOT PERFORMED: model_crypto.encrypt_proprietary_models_at_rest "
+                         "is not available in this build")
+            return None
+        report = fn(models_dir)
+    except Exception as e:
+        logger.error(f"ENCRYPTION AT REST FAILED ({type(e).__name__}: {e}) — models left as they were; "
+                     f"startup continues")
+        return None
+    _log_encryption_report(report)
+    return report if isinstance(report, dict) else {'report': report}
+
+
+def _log_encryption_report(report: Any) -> None:
+    """One loud line per outcome bucket (encrypted / already / skipped /
+    rekeyed / failed). model_crypto reports 'failed' as a dict
+    {dir_name: '<reason_code>: detail'}; every entry is logged at ERROR and
+    suppresses the final 'OK' line (a list-valued failure bucket from an older
+    model_crypto is handled the same way)."""
+    if not isinstance(report, dict):
+        logger.info(f"Encryption at rest: {report!r}")
+        return
+    failed: list[str] = []
+    failed_map = report.get('failed') or {}
+    if isinstance(failed_map, dict):
+        for name, why in failed_map.items():
+            # a key_mismatch dir holds only ciphertext (nothing was changed); anything else
+            # was rolled back to its plaintext
+            kept = ('ciphertext left untouched' if str(why).startswith('key_mismatch')
+                    else 'rolled back, plaintext kept')
+            logger.error(f"ENCRYPTION AT REST FAILED — {name}: {why} — {kept}")
+            failed.append(str(name))
+    for key, value in report.items():
+        if key == 'failed' and isinstance(value, dict):
+            continue
+        items = value if isinstance(value, (list, tuple, set)) else None
+        if items is None:
+            logger.info(f"Encryption at rest: {key} = {value}")
+            continue
+        names = [str(getattr(v, 'name', v)) for v in items]
+        if any(tok in key.lower() for tok in ('fail', 'error', 'rolled')):
+            failed.extend(names)
+            if names:
+                logger.error(f"ENCRYPTION AT REST — {key}: {len(names)} ({', '.join(names)}) — rolled back, "
+                             f"plaintext kept; see model_crypto log lines above")
+        else:
+            logger.info(f"Encryption at rest — {key}: {len(names)}" + (f" ({', '.join(names)})" if names else ''))
+    if not failed:
+        logger.info("Encryption at rest: OK — no plaintext proprietary weights left under the models dir")
 
 
 # ==================== App Lifecycle ====================
@@ -341,17 +606,35 @@ async def lifespan(app: FastAPI):
         state.legacy_model_reason = f"no checkpoint at {checkpoint_path}"
         logger.warning(f"No model checkpoint found at {checkpoint_path}. Server running in demo mode.")
 
+    # D2: encrypt proprietary weights at rest on an installed app BEFORE any
+    # model is loaded (after the license check: the key may come from the
+    # license's model_key_secret). Never fatal.
+    try:
+        _maybe_encrypt_models_at_rest()
+    except Exception as e:      # belt and braces — the helper already never raises
+        logger.error(f"Encryption at rest step crashed: {e}")
+    _ai = get_ai_settings()
+    logger.info(f"AI settings: show_pending_detectors={_ai['show_pending_detectors']} (source: {_ai['source']})")
+
     # Warm the brain panel so /health can report real load status (and the
     # first study of the day is not the one that pays the load cost). The
     # local triage model is the product's only validated detector — /health
     # reports 'degraded' without it. SENTINEL_SKIP_WARMUP=1 skips (tests/CLI).
+    # A hidden pending detector (D1) is not warmed: it would only hold memory;
+    # if an admin switches pending detectors on, it loads on the next study.
     if os.environ.get('SENTINEL_SKIP_WARMUP') != '1':
-        from src.inference.model_registry import get_model as _get_model
-        for _key in ('brain_triage', 'brain_tumor_class'):
+        from src.inference.model_registry import get_model as _get_model, get_model_identity as _get_identity
+        _warm = ('brain_triage', 'brain_tumor_class') if show_pending_detectors() else ('brain_triage',)
+        for _key in _warm:
             try:
                 _entry = _get_model(_key, device=str(state.device))
                 if _entry and _entry.get('available'):
                     logger.info(f"Warmed model '{_key}'")
+                    if _key == 'brain_triage':
+                        # hash once now so /health can name the weights that will run
+                        _ident = _get_identity(_key) or {}
+                        logger.info(f"brain_triage identity {_ident.get('sha256_12')} "
+                                    f"(encrypted at rest: {bool(_ident.get('encrypted_at_rest'))})")
                 else:
                     logger.warning(f"Model '{_key}' not available: {(_entry or {}).get('reason', '')}")
             except Exception as e:
@@ -439,8 +722,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],   # PUT: /settings/ai
     allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["Content-Disposition"],            # GET /diagnostics filename
 )
 
 # Include auth routes
@@ -471,6 +755,16 @@ def _probe_llm() -> dict:
     return {'backend': backend, 'reachable': reachable}
 
 
+def _cached_identity(key: str) -> Optional[str]:
+    """sha256_12 of a loaded model if the registry already computed it, else None."""
+    try:
+        from src.inference import model_registry as _mr
+        ident = _mr._identity_cache.get(key) or {}
+        return ident.get('sha256_12') or None
+    except Exception:
+        return None
+
+
 @app.get("/health")
 def health_check():
     """Public health/contract endpoint (API contract v1 — polled by the desktop app).
@@ -490,6 +784,10 @@ def health_check():
         }
     elif not models['chest']['loaded'] and state.legacy_model_reason:
         models['chest'] = {'loaded': False, 'reason': state.legacy_model_reason}
+    # identity of the loaded triage weights (first 12 hex of sha256), from the
+    # registry cache only — /health is polled and must never hash 350 MB itself.
+    if models['brain_triage'].get('loaded'):
+        models['brain_triage']['identity'] = _cached_identity('brain_triage')
     status = 'ok' if models['brain_triage']['loaded'] else 'degraded'
     return {
         'status': status,
@@ -501,6 +799,7 @@ def health_check():
         'license': {'mode': state.license_info.get('mode')},
         'offline': OFFLINE,
         'data_dir': str(DATA_DIR),
+        'ai_settings': get_ai_settings(),
         # legacy fields (scripts/production_smoke_test.py, start.sh)
         'model_loaded': state.model is not None,
         'uptime_seconds': round(time.time() - state.start_time, 1),
@@ -541,16 +840,625 @@ async def audit_log_view(limit: int = 200, admin: dict = Depends(require_admin))
     return {"entries": _db.get_audit_log(limit=limit)}
 
 
+def _license_status_dict() -> dict:
+    """License STATUS only (never the license file or any secret in it)."""
+    return {
+        'valid': state.license_valid,
+        'info': dict(state.license_info or {}),
+        'demo_calls_today': state.demo_calls_today,
+        'demo_limit': 10,
+    }
+
+
 @app.get("/license/status")
 async def license_status():
     """Return current license info — used by the desktop app to show
     customer name, expiry, and which features are unlocked."""
-    return {
-        'valid': state.license_valid,
-        'info': state.license_info,
-        'demo_calls_today': state.demo_calls_today,
-        'demo_limit': 10,
+    return _license_status_dict()
+
+
+def _ops_error(status_code: int, reason: str, message: str) -> JSONResponse:
+    """Uniform error body for the clinic-ops endpoints: a stable reason code
+    the desktop maps to a localized message + the English detail for logs."""
+    return JSONResponse(status_code=status_code,
+                        content={'ok': False, 'reason': reason, 'detail': message})
+
+
+# ==================== /settings/ai (admin) ====================
+
+class AISettingsUpdate(BaseModel):
+    """PUT /settings/ai body. StrictBool: "yes"/1 are rejected (422), not coerced."""
+    show_pending_detectors: StrictBool
+
+
+@app.get("/settings/ai")
+def get_settings_ai(admin: dict = Depends(require_admin)):
+    """Admin: {'show_pending_detectors': bool, 'source': 'file'|'env'|'default'}."""
+    return get_ai_settings()
+
+
+@app.put("/settings/ai")
+def put_settings_ai(req: AISettingsUpdate, request: Request, admin: dict = Depends(require_admin)):
+    """Admin: persist show_pending_detectors in DATA_DIR/settings.json. Takes
+    effect for the next analysis (no restart). Audit-logged old→new."""
+    try:
+        old, new = set_ai_settings(req.show_pending_detectors)
+    except OSError as e:
+        logger.error(f"settings: write of {SETTINGS_FILE_NAME} failed: {e}")
+        return _ops_error(500, 'settings_write_failed', f'could not write {SETTINGS_FILE_NAME}: {e}')
+    _audit(admin, 'settings_ai_update', 'settings', 'ai',
+           details=(f"show_pending_detectors: {str(old['show_pending_detectors']).lower()} "
+                    f"({old['source']}) -> {str(new['show_pending_detectors']).lower()} ({new['source']})"),
+           request=request)
+    logger.info(f"AI settings changed by {admin.get('username') or admin.get('sub')}: "
+                f"show_pending_detectors {old['show_pending_detectors']} -> {new['show_pending_detectors']}")
+    return new
+
+
+# ==================== GET /diagnostics (admin) ====================
+# A support zip IT can e-mail to the vendor. PHI-safe by construction: only
+# status/identity/version data, log tails passed through the PHI redactor,
+# an audit tail with patient fields redacted. Never previews, the DB, the
+# license file, keys or settings secrets.
+
+DIAG_LOG_TAIL_BYTES = 2 * 1024 * 1024
+DIAG_AUDIT_TAIL_ROWS = 200
+REDACTED = '[REDACTED]'
+_PHI_FIELD_RE = re.compile(
+    r'(?i)^(patient[_ ]?(id|name|birth[_ ]?date)|patientid|patientname|patientbirthdate|'
+    r'accession([_ ]?(number|no))?|accessionnumber)$')
+_PHI_TEXT_RE = re.compile(
+    r'(?i)\b(patient[_ ]?id|patient[_ ]?name|patientid|patientname|accession(?:[_ ]?(?:number|no))?|'
+    r'accessionnumber)(["\']?\s*[=:]\s*)(["\']?)([^"\',;|\s}]+)')
+_SECRET_NAME_RE = re.compile(r'(?i)(secret|passw|token|key|credential|user)')
+
+
+def _redact_text(text: str) -> str:
+    """Patient identifiers in free text → [REDACTED] (key=value, key: value,
+    "key": "value" and DICOM Person Names)."""
+    if not text:
+        return text
+    from src.utils.logger import redact_phi
+    out = redact_phi(text)          # the log patcher's rules (PN names, birth dates, …)
+    return _PHI_TEXT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}", out)
+
+
+def _redact_obj(obj: Any) -> Any:
+    """Recursively redact PHI fields (by key) and PHI in strings (incl. JSON
+    strings such as audit 'details')."""
+    if isinstance(obj, dict):
+        return {k: (REDACTED if _PHI_FIELD_RE.match(str(k)) and v not in (None, '') else _redact_obj(v))
+                for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_redact_obj(v) for v in obj]
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in ('{', '[') :
+            try:
+                return json.dumps(_redact_obj(json.loads(s)), ensure_ascii=False)
+            except ValueError:
+                pass
+        return _redact_text(obj)
+    return obj
+
+
+def _redact_secrets(obj: Any) -> Any:
+    """Values of secret-looking keys (key/secret/token/password/user) → [REDACTED]."""
+    if isinstance(obj, dict):
+        return {k: (REDACTED if _SECRET_NAME_RE.search(str(k)) and v not in (None, '') else _redact_secrets(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_secrets(v) for v in obj]
+    return obj
+
+
+def _tail_text(path: Path, max_bytes: int = DIAG_LOG_TAIL_BYTES) -> str:
+    """Last `max_bytes` of a text file (cut at a line boundary), PHI-redacted."""
+    size = path.stat().st_size
+    with open(path, 'rb') as fh:
+        if size > max_bytes:
+            fh.seek(size - max_bytes)
+            data = fh.read(max_bytes)
+            nl = data.find(b'\n')
+            data = data[nl + 1:] if nl >= 0 else data
+        else:
+            data = fh.read()
+    text = data.decode('utf-8', errors='replace')
+    return '\n'.join(_redact_text(line) for line in text.split('\n'))
+
+
+def _versions_info() -> dict:
+    info = {
+        'app': APP_VERSION,
+        'python': platform.python_version(),
+        'torch': getattr(torch, '__version__', None),
+        'os': platform.platform(),
+        'machine': platform.machine(),
+        'frozen': bool(getattr(sys, 'frozen', False)),
+        'device': str(state.device) if state.device is not None else None,
+        'offline': OFFLINE,
     }
+    for mod in ('transformers', 'pydicom', 'fastapi', 'numpy', 'cryptography'):
+        try:
+            info[mod] = getattr(__import__(mod), '__version__', None)
+        except Exception:
+            info[mod] = None
+    return info
+
+
+def _models_info() -> dict:
+    from src.inference.model_registry import REGISTRY, get_model_identity
+    out = {}
+    for key in REGISTRY:
+        try:
+            out[key] = get_model_identity(key)
+        except Exception as e:
+            out[key] = {'key': key, 'error': f'{type(e).__name__}: {e}'}
+    return out
+
+
+def _audit_tail(limit: int = DIAG_AUDIT_TAIL_ROWS) -> list[dict]:
+    from src.inference.auth_routes import db as _db
+    return [_redact_obj(dict(r)) for r in _db.get_audit_log(limit=limit)]
+
+
+def _settings_redacted() -> dict:
+    env = {k: v for k, v in sorted(os.environ.items())
+           if k.startswith(('SENTINEL_', 'ORTHANC_', 'DEV_'))}
+    return {'settings_file': _redact_secrets(_read_settings_file()),
+            'ai_settings': get_ai_settings(),
+            'environment': _redact_secrets(env)}
+
+
+def build_diagnostics_zip() -> tuple[bytes, list[str]]:
+    """(zip bytes, member names). Each section is best-effort: a failing
+    section is replaced by {'error': ...} instead of failing the export."""
+    def _section(fn):
+        try:
+            return fn()
+        except Exception as e:
+            logger.warning(f"diagnostics: section {getattr(fn, '__name__', fn)} failed: {e}")
+            return {'error': f'{type(e).__name__}: {e}'}
+
+    members: list[tuple[str, str]] = [
+        ('health.json', json.dumps(_section(health_check), indent=2, default=str)),
+        ('license.json', json.dumps(_section(_license_status_dict), indent=2, default=str)),
+        ('ai_settings.json', json.dumps(_section(get_ai_settings), indent=2)),
+        ('versions.json', json.dumps(_section(_versions_info), indent=2, default=str)),
+        ('models.json', json.dumps(_section(_models_info), indent=2, default=str)),
+    ]
+    backend_log = LOG_DIR / 'backend.log'
+    if backend_log.is_file():
+        try:
+            members.append(('logs/backend.log', _tail_text(backend_log)))
+        except OSError as e:
+            logger.warning(f"diagnostics: backend.log unreadable: {e}")
+    app_logs = sorted((p for p in LOG_DIR.glob('sentinel_*.log') if p.is_file()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    if app_logs:
+        try:
+            members.append((f'logs/{app_logs[0].name}', _tail_text(app_logs[0])))
+        except OSError as e:
+            logger.warning(f"diagnostics: {app_logs[0].name} unreadable: {e}")
+    audit = _section(_audit_tail)
+    audit_lines = audit if isinstance(audit, list) else [audit]
+    members.append(('audit_tail.jsonl',
+                    ''.join(json.dumps(r, ensure_ascii=False, default=str) + '\n' for r in audit_lines)))
+    members.append(('settings_redacted.json', json.dumps(_section(_settings_redacted), indent=2,
+                                                         ensure_ascii=False, default=str)))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, text in members:
+            zf.writestr(name, text)
+    return buf.getvalue(), [n for n, _ in members]
+
+
+@app.get("/diagnostics")
+def diagnostics(request: Request, admin: dict = Depends(require_admin)):
+    """Admin: PHI-safe support zip (see build_diagnostics_zip). Audit-logged."""
+    data, names = build_diagnostics_zip()
+    filename = f"sentinel-diagnostics-{datetime.now().strftime('%Y%m%d-%H%M')}.zip"
+    _audit(admin, 'export_diagnostics', 'system', 'diagnostics',
+           details=f"members={len(names)}; bytes={len(data)}", request=request)
+    return Response(content=data, media_type='application/zip',
+                    headers={'Content-Disposition': f'attachment; filename={filename}'})
+
+
+# ==================== POST /models/import (admin) ====================
+# Per-clinic model delivery (D3): the vendor ships brain_triage_finetuned
+# encrypted for THIS machine; the desktop copies the zip into
+# DATA_DIR/model_inbox/ and posts its path. Verified, test-decrypted, swapped
+# in atomically (previous release kept as …_prev_<identity>), reloaded —
+# rolled back on any failure.
+
+MODEL_INBOX_NAME = 'model_inbox'
+IMPORT_MODEL_KEY = 'brain_triage'
+IMPORT_DIR_NAME = 'brain_triage_finetuned'
+MAX_BUNDLE_BYTES = 4 * 1024 ** 3
+MAX_BUNDLE_UNCOMPRESSED = 6 * 1024 ** 3
+MAX_BUNDLE_MEMBERS = 64
+PLAIN_WEIGHTS = 'model.safetensors'
+ENC_WEIGHTS = 'model.safetensors.enc'
+ENC_META = 'model.safetensors.enc.meta.json'
+_REQUIRED_BUNDLE_FILES = ('MANIFEST.json', 'config.json', ENC_WEIGHTS, ENC_META)
+_import_lock = threading.Lock()
+
+
+class ModelImportRequest(BaseModel):
+    path: str
+
+
+class _ModelImportFailure(Exception):
+    def __init__(self, status_code: int, reason: str, message: str):
+        super().__init__(message)
+        self.status_code, self.reason, self.message = status_code, reason, message
+
+
+def _model_inbox() -> Path:
+    return DATA_DIR / MODEL_INBOX_NAME
+
+
+def _sha256_path(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _bundle_extractor():
+    """packaging/fetch_model_bundle.extract_bundle when that file ships next to
+    the code (dev / CI); the frozen backend does not bundle packaging/, so an
+    equivalent built-in extractor is used there."""
+    src = REPO_ROOT / 'packaging' / 'fetch_model_bundle.py'
+    if src.is_file():
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('sentinel_fetch_model_bundle', src)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.extract_bundle
+        except Exception as e:
+            logger.warning(f"model import: packaging/fetch_model_bundle.py not loadable ({e}); "
+                           f"using the built-in extractor")
+    return _extract_bundle_builtin
+
+
+def _extract_bundle_builtin(zip_path: Path, dest: Path) -> Path:
+    """Same contract as fetch_model_bundle.extract_bundle: dest/<IMPORT_DIR_NAME>
+    from either layout (dir at the zip root, or MANIFEST.json at the root).
+    Refuses absolute / '..' / drive-letter entries; skips macOS/Windows junk."""
+    from pathlib import PurePosixPath
+    with zipfile.ZipFile(zip_path) as zf:
+        members = []
+        for info in zf.infolist():
+            name = info.filename.replace('\\', '/')
+            parts = PurePosixPath(name).parts
+            if (not parts or name.startswith('/') or '..' in parts
+                    or (len(parts[0]) == 2 and parts[0][1] == ':')):
+                raise ValueError(f'refusing unsafe zip entry {info.filename!r}')
+            if name.startswith('__MACOSX/') or parts[-1] in ('.DS_Store', 'Thumbs.db') or info.is_dir():
+                continue
+            members.append(info)
+        names = [m.filename.replace('\\', '/') for m in members]
+        if any(n.startswith(IMPORT_DIR_NAME + '/') for n in names):
+            target = dest
+        elif 'MANIFEST.json' in names:
+            target = dest / IMPORT_DIR_NAME
+        else:
+            raise ValueError(f'zip holds neither {IMPORT_DIR_NAME}/ nor a top-level MANIFEST.json')
+        target.mkdir(parents=True, exist_ok=True)
+        zf.extractall(target, members=members)
+    return dest / IMPORT_DIR_NAME
+
+
+def _resolve_inbox_bundle(path_str: str) -> Path:
+    """The bundle path, validated: absolute, inside DATA_DIR/model_inbox/ (after
+    resolving symlinks), an existing .zip within the size cap."""
+    if not path_str or not path_str.strip():
+        raise _ModelImportFailure(400, 'path_missing', 'no bundle path given')
+    p = Path(path_str.strip()).expanduser()
+    if not p.is_absolute():
+        raise _ModelImportFailure(400, 'path_not_absolute', 'bundle path must be absolute')
+    inbox = _model_inbox().resolve()
+    try:
+        rp = p.resolve()
+    except OSError as e:
+        raise _ModelImportFailure(400, 'path_invalid', f'cannot resolve bundle path: {e}')
+    if rp == inbox or not rp.is_relative_to(inbox):
+        raise _ModelImportFailure(400, 'path_outside_inbox',
+                                  f'the bundle must be copied into {inbox} first')
+    if not rp.is_file():
+        raise _ModelImportFailure(404, 'bundle_not_found', f'{rp.name} not found in the model inbox')
+    if rp.suffix.lower() != '.zip' or not zipfile.is_zipfile(rp):
+        raise _ModelImportFailure(400, 'bundle_not_zip', f'{rp.name} is not a zip archive')
+    if rp.stat().st_size > MAX_BUNDLE_BYTES:
+        raise _ModelImportFailure(413, 'bundle_too_large', f'{rp.name} exceeds {MAX_BUNDLE_BYTES} bytes')
+    return rp
+
+
+def _check_zip_limits(zip_path: Path) -> None:
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_BUNDLE_MEMBERS:
+            raise _ModelImportFailure(400, 'bundle_invalid', f'zip holds {len(infos)} entries (max {MAX_BUNDLE_MEMBERS})')
+        total = sum(i.file_size for i in infos)
+        if total > MAX_BUNDLE_UNCOMPRESSED:
+            raise _ModelImportFailure(400, 'bundle_invalid', f'zip expands to {total} bytes (max {MAX_BUNDLE_UNCOMPRESSED})')
+
+
+def _verify_bundle_dir(model_dir: Path) -> dict:
+    """MANIFEST pins (plaintext AND ciphertext sha), sidecar, required files.
+    Returns the manifest's files dict."""
+    missing = [n for n in _REQUIRED_BUNDLE_FILES if not (model_dir / n).is_file()]
+    if missing:
+        raise _ModelImportFailure(400, 'bundle_incomplete', f'bundle is missing {", ".join(missing)}')
+    from src.utils.model_crypto import plaintext_weight_files, read_meta
+    if plaintext_weight_files(model_dir):
+        raise _ModelImportFailure(400, 'bundle_contains_plaintext',
+                                  'bundle carries plaintext weights; only encrypted bundles are installed')
+    try:
+        manifest = json.loads((model_dir / 'MANIFEST.json').read_text(encoding='utf-8'))
+        files = manifest['files']
+        if manifest.get('algorithm', 'sha256') != 'sha256' or not isinstance(files, dict):
+            raise ValueError('unsupported manifest')
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise _ModelImportFailure(400, 'manifest_invalid', f'MANIFEST.json unreadable: {e}')
+    for pin in (PLAIN_WEIGHTS, ENC_WEIGHTS):
+        if not re.fullmatch(r'[0-9a-f]{64}', str(files.get(pin, ''))):
+            raise _ModelImportFailure(400, 'manifest_invalid', f'MANIFEST.json does not pin {pin}')
+    problems = []
+    for name, pinned in files.items():
+        if name == PLAIN_WEIGHTS:
+            continue                       # plaintext is checked after test-decryption
+        rel = Path(str(name))
+        if rel.is_absolute() or '..' in rel.parts:
+            raise _ModelImportFailure(400, 'manifest_invalid', f'unsafe path in MANIFEST.json: {name!r}')
+        fp = model_dir / rel
+        if not fp.is_file():
+            problems.append(f'{name}: missing')
+        elif _sha256_path(fp) != str(pinned):
+            problems.append(f'{name}: sha256 does not match the pin')
+    if problems:
+        raise _ModelImportFailure(400, 'manifest_mismatch', '; '.join(problems))
+    try:
+        sidecar_sha = read_meta(model_dir / ENC_WEIGHTS).get('plaintext_sha256')
+    except (OSError, ValueError) as e:
+        raise _ModelImportFailure(400, 'sidecar_invalid', f'{ENC_META} unreadable: {e}')
+    if sidecar_sha != files[PLAIN_WEIGHTS]:
+        raise _ModelImportFailure(400, 'sidecar_mismatch',
+                                  f'{ENC_META} plaintext_sha256 does not match the MANIFEST pin')
+    return files
+
+
+def _test_decrypt(model_dir: Path, plaintext_pin: str) -> None:
+    """Decrypt into memory with THIS machine's key and check the plaintext pin."""
+    from cryptography.exceptions import InvalidTag
+    from src.utils import model_crypto
+    try:
+        key = model_crypto.get_model_key(refresh=True)
+        source = model_crypto.key_source()
+    except Exception as e:
+        raise _ModelImportFailure(500, 'model_key_unavailable', f'model key unavailable: {e}')
+    try:
+        plaintext = model_crypto.decrypt_file_to_bytes(model_dir / ENC_WEIGHTS, key=key, verify=True)
+    except InvalidTag:
+        if source == model_crypto.KEY_SOURCE_INSTALL:
+            # No licence with a model_key_secret is active, so the key is this install's
+            # local secret — a vendor bundle (HKDF(licence secret ‖ fingerprint), D3)
+            # can never decrypt under it. Most likely the licence of the delivery was not
+            # imported yet (or the app not restarted): say so instead of "wrong machine".
+            raise _ModelImportFailure(400, 'license_model_key_missing',
+                                      'no licence with a model key is active on this PC — import the '
+                                      'license.dat from the same delivery, restart, then import the '
+                                      'bundle again')
+        raise _ModelImportFailure(400, 'bundle_not_for_this_machine',
+                                  'the bundle was not encrypted for this machine (wrong key), or the '
+                                  'installed licence is not the one from the same delivery')
+    except ValueError as e:
+        raise _ModelImportFailure(400, 'decrypted_hash_mismatch', str(e))
+    try:
+        if hashlib.sha256(plaintext).hexdigest() != plaintext_pin:
+            raise _ModelImportFailure(400, 'decrypted_hash_mismatch',
+                                      'decrypted weights do not match the MANIFEST plaintext pin')
+    finally:
+        del plaintext
+
+
+def _dir_identity(model_dir: Path) -> str:
+    from src.utils.model_crypto import plaintext_sha256_of_dir
+    try:
+        sha = plaintext_sha256_of_dir(model_dir)
+    except Exception:
+        sha = None
+    return (sha or 'unknown')[:12]
+
+
+def _evict_registry(key: str) -> None:
+    from src.inference import model_registry as _mr
+    _mr._loaded_models.pop(key, None)
+    _mr._identity_cache.pop(key, None)
+
+
+def _reload_and_check(models_dir: Path, identity: str) -> dict:
+    """Load the installed dir through the registry; it must be THAT dir, the
+    pinned identity, encrypted at rest."""
+    from src.inference import model_registry as _mr
+    _evict_registry(IMPORT_MODEL_KEY)
+    entry = _mr.get_model(IMPORT_MODEL_KEY, device=str(state.device or 'cpu'))
+    if not entry or not entry.get('available'):
+        raise _ModelImportFailure(500, 'reload_failed',
+                                  f"model did not load: {(entry or {}).get('reason', 'unknown')}")
+    src = Path(entry.get('source_path') or '')
+    target = (models_dir / IMPORT_DIR_NAME).resolve()
+    if not src or src.resolve() != target:
+        raise _ModelImportFailure(500, 'reload_failed', f'registry loaded {src} instead of {target}')
+    ident = _mr.get_model_identity(IMPORT_MODEL_KEY) or {}
+    if ident.get('sha256_12') != identity:
+        raise _ModelImportFailure(500, 'reload_failed',
+                                  f"loaded identity {ident.get('sha256_12')} != pinned {identity}")
+    if not ident.get('encrypted_at_rest'):
+        raise _ModelImportFailure(500, 'reload_failed', 'installed model is not encrypted at rest')
+    return ident
+
+
+def _refresh_validated_metrics(model_dir: Path):
+    """Reload the release metrics for the new model: validated_metrics.reload
+    refreshes METRICS and every module constant (brain_analysis reads METRICS
+    at call time to decide 'validated' vs 'pending'; the report templates read
+    it for the quoted figures), and the brain_triage registry card's notes are
+    rebuilt so the model list shows the new release's numbers without a restart."""
+    from src.inference import validated_metrics as _vm
+    from src.inference import model_registry as _mr
+    metrics = _vm.reload(model_dir)
+    card = _mr.REGISTRY.get(IMPORT_MODEL_KEY)
+    if card is not None:
+        card.notes = _vm.registry_notes(metrics)
+    return metrics
+
+
+def _encrypt_previous_release(prev_dir: Path) -> None:
+    """Plaintext must not linger on a clinic disk (D2): encrypt a kept previous
+    release that still has plaintext weights, when encryption at rest is on."""
+    if os.environ.get('SENTINEL_ENCRYPT_MODELS_AT_REST') != '1' or DEV_INSECURE:
+        return
+    try:
+        from src.utils import model_crypto
+        if model_crypto.plaintext_weight_files(prev_dir):
+            # verify-before-delete + rollback, same procedure as the startup pass
+            model_crypto.encrypt_dir_at_rest(prev_dir)
+            logger.info(f"model import: previous release {prev_dir.name} encrypted at rest")
+    except Exception as e:
+        logger.error(f"model import: could not encrypt the previous release {prev_dir.name}: {e}")
+
+
+def import_model_bundle(path_str: str) -> dict:
+    """Install a per-clinic encrypted brain_triage bundle (contract POST
+    /models/import). Raises _ModelImportFailure(status, reason, message);
+    on any failure after the swap the previous release is restored and reloaded."""
+    from src.inference import model_registry as _mr
+
+    if os.environ.get(f'SENTINEL_MODEL_DIR_OVERRIDE_{IMPORT_MODEL_KEY.upper()}', '').strip():
+        raise _ModelImportFailure(409, 'model_dir_overridden',
+                                  f'SENTINEL_MODEL_DIR_OVERRIDE_{IMPORT_MODEL_KEY.upper()} is set; '
+                                  f'an imported model would not be used')
+    bundle = _resolve_inbox_bundle(path_str)
+    models_dir = Path(_mr.MODELS_DIR)
+    try:
+        models_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise _ModelImportFailure(500, 'models_dir_not_writable', f'{models_dir}: {e}')
+    if not os.access(models_dir, os.W_OK):
+        raise _ModelImportFailure(500, 'models_dir_not_writable', f'{models_dir} is not writable')
+    _check_zip_limits(bundle)
+
+    # Staging under MODELS_DIR → the final move is a same-filesystem rename.
+    staging = models_dir / f'.import_staging_{uuid.uuid4().hex[:12]}'
+    current = models_dir / IMPORT_DIR_NAME
+    prev: Optional[Path] = None
+    swapped = False
+    try:
+        staging.mkdir(mode=0o700)
+        try:
+            new_dir = _bundle_extractor()(bundle, staging)
+        except (ValueError, zipfile.BadZipFile, OSError) as e:
+            raise _ModelImportFailure(400, 'bundle_invalid', f'extract failed: {e}')
+        if not new_dir.is_dir():
+            raise _ModelImportFailure(400, 'bundle_invalid', f'no {IMPORT_DIR_NAME}/ in the bundle')
+        files = _verify_bundle_dir(new_dir)
+        identity = str(files[PLAIN_WEIGHTS])[:12]
+        _test_decrypt(new_dir, str(files[PLAIN_WEIGHTS]))
+        from src.inference import validated_metrics as _vm
+        metrics = _vm.load(new_dir)
+        status = 'validated' if (metrics.source == 'json' and metrics.validated) else 'pending'
+
+        with state.inference_lock:          # no analysis sees a half-swapped model
+            old_identity = _dir_identity(current) if current.exists() else None
+            try:
+                if current.exists():
+                    prev = models_dir / f'{IMPORT_DIR_NAME}_prev_{old_identity}'
+                    if prev.exists():
+                        prev = models_dir / f"{prev.name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    os.replace(current, prev)
+                os.replace(new_dir, current)
+                swapped = True
+                ident = _reload_and_check(models_dir, identity)
+            except Exception as e:
+                failure = e if isinstance(e, _ModelImportFailure) else \
+                    _ModelImportFailure(500, 'install_failed', f'{type(e).__name__}: {e}')
+                _rollback_import(models_dir, current, prev, swapped)
+                raise failure
+        try:
+            metrics = _refresh_validated_metrics(current)
+        except Exception as e:
+            logger.warning(f"model import: release metrics not refreshed: {e}")
+        if prev is not None:
+            _encrypt_previous_release(prev)
+        logger.info(f"MODEL IMPORTED: {IMPORT_DIR_NAME} {old_identity or 'none'} -> {identity} "
+                    f"(status {status}, encrypted at rest); previous kept as {prev.name if prev else '-'}")
+        return {
+            'ok': True,
+            'identity': identity,
+            'encrypted_at_rest': bool(ident.get('encrypted_at_rest')),
+            'status': status,
+            'previous_identity': old_identity,
+            'previous_dir': prev.name if prev else None,
+            'not_validated_reason': None if status == 'validated' else
+                (getattr(metrics, 'not_validated_reason', '') or 'no study_level_eval.json in the bundle'),
+        }
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _rollback_import(models_dir: Path, current: Path, prev: Optional[Path], swapped: bool) -> None:
+    """Put the previous release back and reload it (best effort, logged)."""
+    try:
+        if swapped and current.exists():
+            failed = models_dir / f'.import_failed_{uuid.uuid4().hex[:8]}'
+            os.replace(current, failed)
+            shutil.rmtree(failed, ignore_errors=True)
+        if prev is not None and prev.exists() and not current.exists():
+            os.replace(prev, current)
+    except OSError as e:
+        logger.error(f"MODEL IMPORT ROLLBACK INCOMPLETE: {e} — check {models_dir}")
+    _evict_registry(IMPORT_MODEL_KEY)
+    try:
+        from src.inference import model_registry as _mr
+        entry = _mr.get_model(IMPORT_MODEL_KEY, device=str(state.device or 'cpu'))
+        logger.warning(f"model import rolled back; previous model "
+                       f"{'reloaded' if entry and entry.get('available') else 'NOT available'}")
+    except Exception as e:
+        logger.error(f"model import rollback: reload of the previous model failed: {e}")
+
+
+@app.post("/models/import")
+def models_import(req: ModelImportRequest, request: Request, admin: dict = Depends(require_admin)):
+    """Admin: install DATA_DIR/model_inbox/<bundle>.zip as the brain_triage
+    model. 200 {ok, identity, encrypted_at_rest, status}; 4xx/5xx {ok: false,
+    reason, detail}. Audit-logged either way."""
+    if not _import_lock.acquire(blocking=False):
+        return _ops_error(409, 'import_in_progress', 'another model import is running')
+    try:
+        name = Path(req.path or '').name
+        try:
+            out = import_model_bundle(req.path)
+        except _ModelImportFailure as f:
+            logger.error(f"model import of {name or '?'} failed: {f.reason}: {f.message}")
+            _audit(admin, 'model_import_failed', 'model', IMPORT_MODEL_KEY,
+                   details=f"bundle={name}; reason={f.reason}", request=request)
+            return _ops_error(f.status_code, f.reason, f.message)
+        except Exception as e:
+            logger.exception(f"model import of {name or '?'} crashed")
+            _audit(admin, 'model_import_failed', 'model', IMPORT_MODEL_KEY,
+                   details=f"bundle={name}; reason=internal_error", request=request)
+            return _ops_error(500, 'internal_error', f'{type(e).__name__}: {e}')
+        _audit(admin, 'model_import', 'model', IMPORT_MODEL_KEY,
+               details=(f"bundle={name}; identity {out['previous_identity'] or 'none'} -> {out['identity']}; "
+                        f"status={out['status']}; encrypted_at_rest={out['encrypted_at_rest']}"),
+               request=request)
+        return out
+    finally:
+        _import_lock.release()
 
 
 def _enforce_license_or_demo_limit():
@@ -759,13 +1667,16 @@ async def regenerate_report(req: ReportRequest, user: dict = Depends(clinical_au
         raise HTTPException(status_code=503, detail="Gemma engine not available. Install Ollama and pull gemma3:4b")
 
     try:
-        report = state.gemma_engine.generate(
+        kwargs = dict(
             findings=req.findings,
             language=req.language,
             patient_info=req.patient_info,
             modality=req.modality,
             body_part=req.body_part,
         )
+        if req.sequences is not None and _engine_accepts(state.gemma_engine.generate, 'sequences'):
+            kwargs['sequences'] = [str(x) for x in req.sequences][:32]
+        report = state.gemma_engine.generate(**kwargs)
         return {"report": report, "language": req.language}
     except Exception as e:
         logger.error(f"Report regeneration failed: {e}")
@@ -806,7 +1717,6 @@ async def analyze_brain_panel(
       so production output stays trustworthy. Returns a `coverage` roadmap of
       all brain finding types and whether each is wired yet.
     """
-    from src.inference.brain_analysis import analyze_brain_study
     import tempfile, shutil
 
     _enforce_license_or_demo_limit()
@@ -827,9 +1737,9 @@ async def analyze_brain_panel(
                 out.write(content)
             file_paths.append(fp)
 
-        with state.inference_lock:
-            result = analyze_brain_study(file_paths, device=str(state.device),
-                                         include_experimental=include_experimental)
+        # Pending detectors follow the AI setting (D1) on this route too.
+        result = await asyncio.to_thread(_run_brain_panel, file_paths, include_experimental,
+                                         show_pending_detectors())
         # Unreadable input is a client error, not a 200 with an 'error' field
         # (same contract as /analyze/study).
         if result.get('error'):
@@ -1212,14 +2122,27 @@ def _route_single_file(modality: str, body_part: str, texts=()) -> Optional[str]
     return _match_registry_card(modality, body_part, texts)
 
 
+def _engine_accepts(fn, name: str) -> bool:
+    """True when callable `fn` takes keyword `name` (or **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _generate_report(findings: list[dict], language: str, modality: str,
-                     body_part: str, study_date: str = '') -> tuple[Optional[str], bool]:
+                     body_part: str, study_date: str = '',
+                     sequences: Optional[list[str]] = None) -> tuple[Optional[str], bool]:
     """(report_text, engine_used). Patient identifiers are never passed to the
-    engine (PHI minimisation — the prompt may reach an Ollama host)."""
+    engine (PHI minimisation — the prompt may reach an Ollama host).
+    `sequences` (brain MR: the sequence names actually present, e.g.
+    T1/T1ce/T2/FLAIR/DWI) lets the engine build an honest technique line (D4);
+    it is passed only when the engine's generate() accepts it."""
     if state.gemma_engine is None:
         return None, False
     try:
-        text = state.gemma_engine.generate(
+        kwargs = dict(
             findings=[
                 {'class_name': f.get('class_name'), 'confidence': f.get('confidence'),
                  'location': f.get('location', ''), 'positive': f.get('positive'),
@@ -1232,6 +2155,9 @@ def _generate_report(findings: list[dict], language: str, modality: str,
             body_part=body_part,
             study_date=study_date or '',
         )
+        if sequences is not None and _engine_accepts(state.gemma_engine.generate, 'sequences'):
+            kwargs['sequences'] = list(sequences)
+        text = state.gemma_engine.generate(**kwargs)
         return (text or None), bool(text)
     except Exception as e:
         logger.warning(f"Report generation failed: {e}")
@@ -1553,6 +2479,24 @@ async def analyze_auto(
             f"Auto-routing study {study_id}: modality={study.modality}, "
             f"body_part={study.body_part} → model='{modality_key}'"
         )
+        card = REGISTRY[modality_key]
+        if card.validation_status != 'validated' and not show_pending_detectors():
+            # D1: the routed model is not validated and pending detectors are hidden.
+            note = _no_validated_note(language)
+            _audit(user, "analyze", "study", study_id,
+                   details=f"model={modality_key}; requires_review; {NO_VALIDATED_DETECTOR}; lang={language}",
+                   request=request)
+            return AnalysisResponse(
+                study_id=study_id, modality=f"{study.modality}/{modality_key}",
+                inference_time_ms=int((time.time() - start_time) * 1000),
+                findings=[], overall_impression=note, normal=False,
+                model_version=card.display_name, report_language=language,
+                preview_base64=_preview_from_file(Path(tmp_path)),
+                body_part=study.body_part,
+                overall_assessment={'abnormal_flagged': False, 'flags': [], 'text': note},
+                disclaimer=_localized_disclaimer(language),
+                requires_review=True, rejection_reason=NO_VALIDATED_DETECTOR,
+            )
         run = await asyncio.to_thread(_run_registry_model, study, modality_key, language)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -1624,11 +2568,15 @@ def _read_study_headers(file_paths: list[Path]) -> Optional[dict]:
     Patient/study fields come from the first readable DICOM; SeriesDescription
     and ProtocolName are collected unique across all files (upload order).
     'best_path' is the largest image (Rows×Columns) — the single-file fallback.
+    'series_groups' groups the files by SeriesInstanceUID with each series'
+    own BodyPartExamined / description (D5: mixed-body-part CT studies are
+    routed per series, see _plan_series_route).
     Returns None when nothing parses as DICOM."""
     hdr = None
     series, protocols = [], []
     best_path, best_px = None, -1
-    for p in file_paths:
+    groups: dict[str, dict] = {}
+    for order, p in enumerate(file_paths):
         try:
             ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
         except Exception:
@@ -1652,12 +2600,169 @@ def _read_study_headers(file_paths: list[Path]) -> Optional[dict]:
             px = 0
         if px > best_px:
             best_path, best_px = p, px
+        _add_to_series_group(groups, ds, Path(p), order, px)
     if hdr is None:
         return None
     hdr['series_descriptions'] = series
     hdr['protocol_names'] = protocols
     hdr['best_path'] = best_path
+    hdr['series_groups'] = _finish_series_groups(groups)
     return hdr
+
+
+# ---- D5: per-series body-part routing (mixed CT studies) ----
+# A CT study can hold several body parts (e.g. HEAD + CHEST). The study-level
+# header comes from the FIRST file, so routing on it sent a head+chest study
+# wherever the first series pointed and let head_ct pick a chest series. Each
+# series is classified by its own BodyPartExamined, else by tokens in its
+# SeriesDescription / ProtocolName.
+_HEAD_REGION_TOKENS = ('HEAD', 'BRAIN', 'SKULL', 'CRANI', 'ГОЛОВ', 'ЧЕРЕП')
+_NON_HEAD_REGION_TOKENS = ('CHEST', 'THORAX', 'LUNG', 'ABDOM', 'PELVI', 'SPINE', 'NECK',
+                           'ГРУД', 'ЛЕГК', 'ОГК', 'БРЮШ', 'ПОЗВОН', 'ТАЗ')
+
+
+def _series_region(body_part: str, description: str, protocol: str = '') -> tuple[Optional[str], str]:
+    """('head'|'other'|None, label) for one series. BodyPartExamined wins when
+    present; otherwise head tokens, then non-head tokens, in the series'
+    description/protocol. None = the series carries no body-part information."""
+    bp = (body_part or '').upper().strip()
+    if bp:
+        if any(t in bp for t in _HEAD_REGION_TOKENS):
+            return 'head', 'HEAD'
+        return 'other', bp
+    text = f'{description or ""} | {protocol or ""}'.upper()
+    if any(t in text for t in _HEAD_REGION_TOKENS):
+        return 'head', 'HEAD'
+    for t in _NON_HEAD_REGION_TOKENS:
+        if t in text:
+            return 'other', t
+    return None, ''
+
+
+def _add_to_series_group(groups: dict, ds, path: Path, order: int, px: int) -> None:
+    uid = _tag(ds, 'SeriesInstanceUID') or f'__nouid__{order}'
+    g = groups.get(uid)
+    if g is None:
+        g = groups[uid] = {
+            'uid': uid, 'order': order, 'description': '', 'protocol': '', 'body_part': '',
+            'paths': [], 'best_path': None, 'best_px': -1,
+        }
+    for key, tag in (('description', 'SeriesDescription'), ('protocol', 'ProtocolName'),
+                     ('body_part', 'BodyPartExamined')):
+        if not g[key]:
+            g[key] = _tag(ds, tag)
+    g['paths'].append(path)
+    if px > g['best_px']:
+        g['best_path'], g['best_px'] = path, px
+
+
+def _finish_series_groups(groups: dict) -> list[dict]:
+    out = []
+    for g in sorted(groups.values(), key=lambda x: x['order']):
+        region, label = _series_region(g['body_part'], g['description'], g['protocol'])
+        out.append({**g, 'region': region, 'region_label': label, 'n_images': len(g['paths'])})
+    return out
+
+
+def _group_series(file_paths: list[Path]) -> list[dict]:
+    """Series groups for callers holding a hand-made hdr without 'series_groups'."""
+    groups: dict[str, dict] = {}
+    for order, p in enumerate(file_paths):
+        try:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
+        except Exception:
+            continue
+        if not (_tag(ds, 'SOPClassUID') or _tag(ds, 'Modality')):
+            continue
+        try:
+            px = int(ds.get('Rows') or 0) * int(ds.get('Columns') or 0)
+        except Exception:
+            px = 0
+        _add_to_series_group(groups, ds, Path(p), order, px)
+    return _finish_series_groups(groups)
+
+
+def _series_brief(g: dict) -> dict:
+    return {'description': g.get('description') or '', 'body_part': g.get('body_part') or '',
+            'region': g.get('region'), 'n_images': g.get('n_images', len(g.get('paths') or []))}
+
+
+def _plan_series_route(hdr: dict, file_paths: list[Path]) -> dict:
+    """Which registry model analyses a NON-brain-MR study, and on which files.
+
+    CT studies whose series carry body-part information are routed per series
+    (D5): any head series → head_ct on the head series ONLY; otherwise the
+    first informed series' body part picks the model, analysed on the series
+    of that same body part. Series with NO body-part information are added to
+    the route when every informed series agrees on that body part (an
+    unambiguous study; e.g. a HEAD-tagged scout + an untagged axial reformat),
+    and excluded in a mixed study. Only when no series carries body-part
+    information does routing fall back to the study header (first file) over
+    all files. Series informed as another body part never reach head_ct.
+
+    Returns {'modality_key', 'paths', 'best_path', 'body_part', 'routing'}."""
+    modality = hdr.get('modality') or ''
+    texts = [hdr.get('study_description') or ''] + list(hdr.get('series_descriptions') or []) \
+        + list(hdr.get('protocol_names') or [])
+    fallback = {
+        'modality_key': _match_registry_card(modality, hdr.get('body_part'), texts),
+        'paths': list(file_paths),
+        'best_path': hdr.get('best_path'),
+        'body_part': hdr.get('body_part') or '',
+        'routing': {'mode': 'study_header'},
+    }
+    if 'CT' not in modality.upper():
+        return fallback
+    groups = hdr.get('series_groups')
+    if groups is None:
+        groups = _group_series(file_paths)
+    informed = [g for g in groups if g.get('region')]
+    if not informed:
+        if fallback['modality_key'] in _CT_SERIES_ROUTES:
+            fallback['routing'] = {'mode': 'first_series_fallback',
+                                   'reason': 'no series carries body-part information'}
+        return fallback
+
+    head = [g for g in informed if g['region'] == 'head']
+    if head:
+        chosen, body_part = head, 'HEAD'
+        key = _match_registry_card(modality, 'HEAD', [g.get('description') or '' for g in head])
+    else:
+        label = informed[0]['region_label']
+        chosen = [g for g in informed if g['region'] == 'other' and g['region_label'] == label]
+        body_part = informed[0].get('body_part') or label
+        key = _match_registry_card(modality, body_part,
+                                   [g.get('description') or '' for g in chosen]
+                                   + [g.get('protocol') or '' for g in chosen])
+        if key in _CT_SERIES_ROUTES:       # defensive: a non-head series never reaches head_ct
+            key = None
+    # Series WITHOUT body-part information (no BodyPartExamined, no region token —
+    # typical of workstation reformats) join the route only when every informed
+    # series agrees on the chosen body part: then the study is unambiguously that
+    # body part and dropping them would leave e.g. only a HEAD-tagged scout for
+    # head_ct. In a genuinely mixed study they stay excluded (could be either).
+    adopted: list[dict] = []
+    if len(chosen) == len(informed):
+        adopted = [g for g in groups if not g.get('region')]
+    routed = chosen + adopted
+    paths = [p for g in routed for p in g['paths']]
+    best = max(routed, key=lambda g: g.get('best_px', -1))
+    excluded = [g for g in groups if not any(g is c for c in routed)]
+    routing = {
+        'mode': 'per_series_body_part',
+        'series_routed': [_series_brief(g) for g in routed],
+        'series_excluded': [_series_brief(g) for g in excluded],
+    }
+    if adopted:
+        routing['series_adopted_without_body_part'] = [_series_brief(g) for g in adopted]
+        logger.info(f"series routing: {len(adopted)} series without body-part information "
+                    f"adopted into the {body_part} route (every informed series is {body_part})")
+    if excluded:
+        logger.info(f"series routing: {len(routed)} {body_part} series → '{key}'; "
+                    f"{len(excluded)} other series excluded "
+                    f"({', '.join((g.get('body_part') or g.get('region_label') or '?') for g in excluded)})")
+    return {'modality_key': key, 'paths': paths, 'best_path': best.get('best_path'),
+            'body_part': body_part, 'routing': routing}
 
 
 def _is_brain_mr(hdr: dict) -> bool:
@@ -1679,15 +2784,140 @@ def _is_brain_mr(hdr: dict) -> bool:
     return any(is_brain_text(t) is True for t in texts)
 
 
+def _hidden_brain_detectors(show_pending: bool) -> set[str]:
+    """Panel detector keys switched off by the AI setting (D1): every detector
+    whose STATIC status is 'pending' when pending detectors are hidden.
+    (A triage model downgraded to 'pending' at run time because its eval did
+    not pass the gate keeps running — its findings already say 'pending'.)"""
+    if show_pending:
+        return set()
+    from src.inference.brain_analysis import DETECTORS
+    return {d.key for d in DETECTORS if d.status == 'pending'}
+
+
+def _run_brain_panel(file_paths: list[Path], include_experimental: bool,
+                     show_pending: bool) -> dict:
+    """analyze_brain_study under the inference lock, honouring the pending-
+    detector setting. When brain_analysis accepts `detector_statuses` the
+    hidden detectors are not run at all; until then they still execute
+    (~0.2 s, and the panel's preview slice may be the one the hidden tumor
+    classifier saw) and are removed afterwards by _apply_detector_visibility."""
+    from src.inference.brain_analysis import analyze_brain_study
+
+    kwargs: dict = {'device': str(state.device or 'cpu'), 'include_experimental': include_experimental}
+    try:
+        params = inspect.signature(analyze_brain_study).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if 'detector_statuses' in params:
+        allowed = {'validated', 'pending'} if show_pending else {'validated'}
+        if include_experimental:
+            allowed.add('experimental')
+        kwargs['detector_statuses'] = allowed
+    with state.inference_lock:
+        result = analyze_brain_study(file_paths, **kwargs)
+    return _apply_detector_visibility(result, _hidden_brain_detectors(show_pending))
+
+
+def _apply_detector_visibility(result: dict, hidden: set[str]) -> dict:
+    """Remove hidden detectors' findings / detectors_run entries, mark hidden
+    coverage rows, and rebuild overall_assessment from what remains (same
+    wording as brain_analysis). Idempotent; a no-op when nothing is hidden."""
+    if not hidden or result.get('error') or result.get('rejected'):
+        if hidden:
+            result['detectors_hidden'] = sorted(hidden)
+        return result
+    from src.inference.brain_analysis import DETECTORS
+
+    ran_before = list(result.get('detectors_run') or [])
+    findings = [f for f in (result.get('findings') or []) if f.get('detector') not in hidden]
+    detectors_run = [d for d in ran_before if d not in hidden]
+    removed = [d for d in ran_before if d in hidden]
+    positives = [f for f in findings if f.get('positive')]
+    covered = [d.label for d in DETECTORS if d.key in detectors_run]
+    result['findings'] = findings
+    result['detectors_run'] = detectors_run
+    result['detectors_hidden'] = sorted(hidden)
+    result['detectors_suppressed'] = removed
+    result['overall_assessment'] = {
+        'abnormal_flagged': bool(positives),
+        'flags': [f.get('finding') for f in positives],
+        'text': (
+            'ABNORMAL — flagged for review: ' + '; '.join(str(f.get('finding')) for f in positives)
+            if positives else
+            'No finding flagged by the panel. This is NOT a normal read — the panel only '
+            f'detects [{", ".join(covered)}]. Any other pathology requires full radiologist review.'
+        ),
+    }
+    if result.get('coverage'):
+        result['coverage'] = [
+            {**c, 'wired': False, 'hidden': True} if (c.get('key') in hidden or c.get('status') == 'pending')
+            else c
+            for c in result['coverage']
+        ]
+    return result
+
+
+def _not_analysed_resp(resp: dict, route: str, preview_path: Optional[Path], *,
+                       reason: str, note: str, hidden: list[str]) -> dict:
+    """Accepted into the worklist, NOT analysed by AI (requires_review, not
+    rejected, no findings, no draft report). `reason` is one of
+    NOT_ANALYSED_REASONS; it is also stored inside overall_assessment so the
+    persisted row keeps it (GET /study/{id} after a restart)."""
+    resp.update({
+        'route': route,
+        'requires_review': True,
+        'rejected': False,
+        'rejection_reason': reason,
+        'note': note,
+        'findings': [],
+        'detectors_run': [],
+        'model_identity': [],
+        'overall_assessment': {'abnormal_flagged': False, 'flags': [], 'text': note,
+                               'rejection_reason': reason},
+        'overall_impression': note,
+        'preview_base64': _preview_from_file(preview_path),
+        'report_text': None,
+        'gemma_available': False,
+    })
+    if hidden:
+        resp['detectors_hidden'] = sorted(set(hidden))
+    return resp
+
+
+def _no_validated_detector_resp(resp: dict, route: str, language: str,
+                                preview_path: Optional[Path], hidden: list[str]) -> dict:
+    """D1: accepted into the worklist, not analysed by AI (requires_review)."""
+    _not_analysed_resp(resp, route, preview_path, reason=NO_VALIDATED_DETECTOR,
+                       note=_no_validated_note(language), hidden=hidden)
+    resp['detectors_hidden'] = sorted(set(hidden))
+    logger.info(f"study routed to '{route}' — no validated detector and pending detectors hidden: "
+                f"requires_review ({NO_VALIDATED_DETECTOR})")
+    return resp
+
+
+def _no_detector_ran_resp(resp: dict, route: str, language: str,
+                          preview_path: Optional[Path]) -> dict:
+    """Pending detectors shown, yet no panel detector produced an output."""
+    _not_analysed_resp(resp, route, preview_path, reason=NO_DETECTOR_RAN,
+                       note=_no_detector_ran_note(language), hidden=[])
+    logger.warning(f"study routed to '{route}' — no detector could run: requires_review ({NO_DETECTOR_RAN})")
+    return resp
+
+
 def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
                         study_id: str) -> dict:
     """Blocking core of POST /analyze/study (runs in a worker thread).
 
-    Brain MR → the detector panel (validated triage + pending tumor class).
-    Anything else → strict single-file registry routing, or _NeedsReview."""
-    from src.inference.brain_analysis import analyze_brain_study, DETECTORS
-    from src.inference.model_registry import get_model_identity
+    Brain MR → the detector panel (validated triage; pending tumor class only
+    when the AI setting shows pending detectors). Anything else → per-series
+    routing (_plan_series_route) to a registry model, or _NeedsReview. A route
+    whose model is not validated while pending detectors are hidden returns
+    requires_review / rejection_reason='no_validated_detector' (D1)."""
+    from src.inference.brain_analysis import DETECTORS
+    from src.inference.model_registry import get_model_identity, REGISTRY
 
+    show_pending = show_pending_detectors()
     resp = {
         'study_id': study_id,
         **{k: (hdr.get(k) or None) for k in _STUDY_HEADER_KEYS},
@@ -1711,19 +2941,19 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
         'report_language': language,
         'gemma_available': False,
         'app_version': APP_VERSION,
+        'show_pending_detectors': show_pending,
     }
 
     if _is_brain_mr(hdr):
-        with state.inference_lock:
-            result = analyze_brain_study(file_paths, device=str(state.device),
-                                         include_experimental=False)
+        result = _run_brain_panel(file_paths, include_experimental=False, show_pending=show_pending)
         preview_slice = result.pop('_preview_slice', None)
         if result.get('error'):
             raise HTTPException(status_code=400, detail=result['error'])
 
         resp['route'] = 'brain_panel'
         resp['body_part'] = 'BRAIN'
-        resp['sequences_present'] = result.get('sequences_present', [])
+        sequences = list(result.get('sequences_present', []) or [])
+        resp['sequences_present'] = sequences
         if result.get('rejected'):
             reason = result.get('non_brain_reason') or 'not a brain study'
             note = result.get('note') or f'Not analyzed by the brain panel: {reason}.'
@@ -1736,6 +2966,24 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
                 'preview_base64': _preview_from_file(hdr.get('best_path')),
             })
             return resp
+
+        if not result.get('detectors_run'):
+            # No detector produced an output — an empty panel is NOT an analysed study, so
+            # never a "nothing flagged" impression or a draft report. Causes: only hidden
+            # (pending) detectors could run; the validated triage model is not installed
+            # (clinic flavour before the bundle import) or failed to load/predict; or the
+            # study has no axial series (outside the validated protocol). The panel's notes
+            # say which, and go into the response for support.
+            hidden = result.get('detectors_hidden') or []
+            if hidden:
+                out = _no_validated_detector_resp(resp, 'brain_panel', language,
+                                                  hdr.get('best_path'), hidden)
+            else:
+                out = _no_detector_ran_resp(resp, 'brain_panel', language, hdr.get('best_path'))
+            out['panel_notes'] = [str(n) for n in (result.get('notes') or [])]
+            for n in out['panel_notes']:
+                logger.info(f"brain panel ({study_id}): {n}")
+            return out
 
         model_keys = {d.key: d.model_key for d in DETECTORS}
         # Panel findings already carry status/detector/positive/sequence_used.
@@ -1751,7 +2999,7 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
             else _preview_from_file(hdr.get('best_path'))
         report_text, engine_used = _generate_report(
             findings, language, modality='MR', body_part='BRAIN',
-            study_date=hdr.get('study_date') or '',
+            study_date=hdr.get('study_date') or '', sequences=sequences,
         )
         resp.update({
             'findings': findings,
@@ -1765,27 +3013,39 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
             'has_brats_quartet': bool(result.get('has_brats_quartet')),
             'coverage': result.get('coverage', []),
         })
+        if result.get('detectors_hidden'):
+            resp['detectors_hidden'] = result['detectors_hidden']
         return resp
 
-    # ---- non-brain: strict single-file routing on the best file ----
-    texts = [hdr.get('study_description') or ''] + list(hdr.get('series_descriptions') or []) \
-        + list(hdr.get('protocol_names') or [])
-    modality_key = _match_registry_card(hdr.get('modality'), hdr.get('body_part'), texts)
+    # ---- non-brain: per-series routing, then the series protocol / single file ----
+    plan = _plan_series_route(hdr, file_paths)
+    modality_key = plan['modality_key']
+    resp['routing'] = plan['routing']
     if modality_key is None:
         raise _NeedsReview(
             f"No registered model for modality '{hdr.get('modality') or '?'}' / body part "
-            f"'{hdr.get('body_part') or '?'}' — study routed to radiologist review without AI analysis"
+            f"'{plan['body_part'] or hdr.get('body_part') or '?'}' — study routed to radiologist "
+            f"review without AI analysis"
         )
+    route_paths = plan['paths'] or list(file_paths)
+    route_hdr = {**hdr, 'body_part': plan['body_part'] or hdr.get('body_part') or ''}
+    card = REGISTRY.get(modality_key)
+    if card is not None and card.validation_status != 'validated' and not show_pending:
+        preview_path = largest_non_localizer(route_paths) or plan['best_path'] or hdr.get('best_path')
+        resp['body_part'] = route_hdr['body_part'] or resp['body_part']
+        return _no_validated_detector_resp(resp, modality_key, language, preview_path, [modality_key])
+
     run = None
-    best_path = hdr.get('best_path')
+    best_path = plan['best_path'] or hdr.get('best_path')
     if modality_key in _CT_SERIES_ROUTES:
-        # Whole head-CT study: axial brain series, central slices, never the scout.
-        run = _run_ct_head_series(file_paths, modality_key, language, hdr)
+        # Whole head-CT study: axial brain series, central slices, never the scout
+        # and never a series of another body part (D5).
+        run = _run_ct_head_series(route_paths, modality_key, language, route_hdr)
         if run is None:
             # No series with enough images (single-file upload) — single-image
             # path, but still never a localizer when anything else decodes.
-            best_path = largest_non_localizer(file_paths) or best_path
-            logger.warning(f"head_ct: no analysable series in {len(file_paths)} file(s); "
+            best_path = largest_non_localizer(route_paths) or best_path
+            logger.warning(f"head_ct: no analysable series in {len(route_paths)} file(s); "
                            f"falling back to single image {getattr(best_path, 'name', best_path)}")
     if run is None:
         study = load_dicom(best_path) if best_path else None
@@ -1796,7 +3056,7 @@ def _analyze_study_sync(file_paths: list[Path], hdr: dict, language: str,
     card = run['card']
     resp.update({
         'route': modality_key,
-        'body_part': hdr.get('body_part') or (card.body_part_dicom_tags[0] if card.body_part_dicom_tags else ''),
+        'body_part': route_hdr['body_part'] or (card.body_part_dicom_tags[0] if card.body_part_dicom_tags else ''),
         'findings': run['findings'],
         'detectors_run': [modality_key],
         'model_identity': run['model_identity'],
@@ -2024,6 +3284,12 @@ async def analyze_study(
     only at or above the card's decision threshold), model provenance
     (model_identity), a localized disclaimer and the actual analyzed slice.
     Persisted to the studies/ai_results tables. `normal` is ALWAYS false.
+
+    v1.1.0: CT studies are routed per series by each series' body part (D5 —
+    a HEAD+CHEST study runs head_ct on the head series only, see `routing`);
+    unvalidated ('pending') detectors follow GET/PUT /settings/ai (D1) — when
+    hidden, a study with no validated detector is accepted with
+    requires_review=true / rejection_reason='no_validated_detector'.
     """
     files = await _read_study_uploads(request)
     _enforce_license_or_demo_limit()
@@ -2072,7 +3338,9 @@ async def analyze_study(
 
     _audit(user, 'analyze_study', 'study', study_id,
            details=(f"route={resp.get('route')}; detectors={resp.get('detectors_run')}; "
-                    f"rejected={resp['rejected']}; files={resp['num_files']}; "
+                    f"rejected={resp['rejected']}; requires_review={resp.get('requires_review')}; "
+                    f"reason={resp.get('rejection_reason') if not resp['rejected'] else 'rejected'}; "
+                    f"files={resp['num_files']}; "
                     f"lang={language}; {inference_time_ms}ms"),
            request=request)
     logger.info(
@@ -2194,7 +3462,11 @@ def get_study_detail(
             'disclaimer': _localized_disclaimer(ai_row.get('report_language') or 'ru'),
             'requires_review': bool(study.get('requires_review')),
             'rejected': bool(study.get('rejected')),
-            'rejection_reason': (ai_row.get('overall_impression') or None) if study.get('rejected') else None,
+            # rejected → the human reason; accepted-but-not-analysed (D1) → its machine
+            # code, so the desktop shows the same localized note after a restart.
+            'rejection_reason': _persisted_rejection_reason(
+                bool(study.get('rejected')), bool(study.get('requires_review')), overall,
+                ai_row.get('overall_impression') or ''),
             'app_version': ai_row.get('app_version'),
             'created_at': ai_row.get('created_at'),
             # The persisted analyzed slice; null once pruned or never written.

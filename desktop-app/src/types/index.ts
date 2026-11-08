@@ -85,6 +85,9 @@ export interface AIResult {
   appVersion: string | null;
   reportLanguage?: Lang;
   gemmaAvailable?: boolean;
+  /** brain MR: sequence names the server found (T1/T1ce/T2/FLAIR/…); sent back on
+   *  /report/regenerate so the technique line stays truthful (contract D4) */
+  sequencesPresent?: string[];
 }
 
 export interface Report {
@@ -128,10 +131,35 @@ export interface HealthStatus {
   version: string | null;
   device: string | null;
   authRequired: boolean;
-  models: Record<string, { loaded: boolean; reason: string | null }>;
+  /** identity: first 12 hex of the loaded weights' sha256 (brain_triage only; null when unknown). */
+  models: Record<string, { loaded: boolean; reason: string | null; identity: string | null }>;
   llm: { backend: string | null; reachable: boolean };
   license: { mode: string | null };
   dataDir: string | null;
+  /** /health "ai_settings" — null when the server predates v1.1.0 or omits it. */
+  aiSettings: AiSettings | null;
+}
+
+/** Where the effective AI setting came from (GET/PUT /settings/ai "source"). */
+export type AiSettingsSource = 'file' | 'env' | 'default';
+
+/**
+ * GET/PUT /settings/ai (admin) and /health "ai_settings".
+ * showPendingDetectors=false hides detectors whose validation status is
+ * "pending" (decision D1: off by default in hospital builds).
+ */
+export interface AiSettings {
+  showPendingDetectors: boolean;
+  source: AiSettingsSource;
+}
+
+/** 200 body of POST /models/import. */
+export interface ModelImportResult {
+  ok: boolean;
+  /** 12-hex identity of the newly installed model. */
+  identity: string;
+  encryptedAtRest: boolean;
+  status: string;
 }
 
 export interface AppSettings {

@@ -2,7 +2,7 @@
 
 # SIAA — Sentinel Medical AI · Pilot baholash protokoli (2–3 oy)
 
-Versiya 1.0.0 · Hujjat tahriri 2026-09
+Versiya 1.1.0 · Hujjat tahriri 2026-11
 
 ## 1. Maqsad
 
@@ -77,7 +77,7 @@ draft_used (yes/no) | time_to_read_min | model_fingerprint | comment (optional, 
 
 ### 7.2 Ikkilamchi (tavsifiy)
 
-- O‘sma detektori: roziman / rozi emasman sonlari; normal tekshiruvlar orasida yolg‘on belgilar ulushi.
+- O‘sma detektori (faqat administrator pilot uchun tasdiqlanmagan (pending) detektorlarni yoqqan bo‘lsa — 1.1.0 versiyada ular sukut bo‘yicha o‘chirilgan): roziman / rozi emasman sonlari; normal tekshiruvlar orasida yolg‘on belgilar ulushi.
 - «Ko‘rib chiqish kerak» belgisi bilan qaytgan tekshiruvlar ulushi va sabablari; tahlil xatolari.
 - Hisobot qoralamalari: qoralama boshlang‘ich nuqta sifatida ishlatilgan hisobotlar %; tahrirlangan % (serverning tuzatishlar jadvalidan).
 
@@ -119,7 +119,7 @@ Agar 2-mezon bajarilmasa, model qayta tasdiqlanmaguncha ushbu klinikada ustuvorl
 ```
 PILOT BAHOLASH HISOBOTI — Sentinel Medical AI
 Klinika: ____________   Davr: ______ – ______   Pilot rahbari: ____________
-Dasturiy ta’minot versiyasi: 1.0.0   Triaj modeli barmoq izi: ____________   O‘sma modeli barmoq izi: ____________
+Dasturiy ta’minot versiyasi: 1.1.0   Triaj modeli barmoq izi: ____________   O‘sma modeli barmoq izi: ____________
 
 1. Kiritish: tahlil qilingan tekshiruvlar ___ ; baholangan ___ (normal ___ / patologik ___); qo‘llanilmaydi ___ (sabablari)
 2. Triaj detektori: sezgirlik ___ (95 % IO ___–___); spetsifiklik ___ (95 % IO ___–___); PPV ___; NPV ___; belgilash darajasi ___

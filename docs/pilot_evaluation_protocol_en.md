@@ -1,6 +1,6 @@
 # SIAA — Sentinel Medical AI · Pilot Evaluation Protocol (2–3 months)
 
-Version 1.0.0 · Document revision 2026-09
+Version 1.1.0 · Document revision 2026-11
 
 ## 1. Purpose
 
@@ -75,7 +75,7 @@ With 60 abnormal and 40 normal studies the 95% confidence intervals are roughly 
 
 ### 7.2 Secondary (descriptive)
 
-- Tumor detector: agree / disagree counts; false-flag rate among normal studies.
+- Tumor detector (only if an administrator enabled pending detectors for the pilot — off by default in 1.1.0): agree / disagree counts; false-flag rate among normal studies.
 - Share of studies returned "needs review" and why; analysis failures.
 - Report drafts: % of reports where the draft was used as a starting point; % edited (from the server's corrections table).
 
@@ -117,7 +117,7 @@ If criterion 2 fails, the model must not be used for prioritisation at this clin
 ```
 PILOT EVALUATION REPORT — Sentinel Medical AI
 Clinic: ____________   Period: ______ – ______   Pilot lead: ____________
-Software version: 1.0.0   Triage model fingerprint: ____________   Tumor model fingerprint: ____________
+Software version: 1.1.0   Triage model fingerprint: ____________   Tumor model fingerprint: ____________
 
 1. Enrolment: studies analysed ___ ; adjudicated ___ (normal ___ / abnormal ___); not applicable ___ (reasons)
 2. Triage detector: sensitivity ___ (95% CI ___–___); specificity ___ (95% CI ___–___); PPV ___; NPV ___; flag rate ___

@@ -13,8 +13,14 @@ import { useAppStore } from '../store/appStore';
 import type {
   AIResult, Study, Finding, FindingStatus, ModelIdentity, OverallAssessment,
   HealthStatus, SignedReport, User, Lang, LicenseStatus, AvailableModel,
+  AiSettings, ModelImportResult,
 } from '../types';
 import type { I18nKey } from '../i18n/en';
+import {
+  parseAiSettings, parseModelImportResult, extractReasonCode, classifyModelImportFailure,
+  MODEL_IMPORT_ERROR_KEYS, filenameFromContentDisposition, defaultDiagnosticsName, looksLikeZip,
+} from './adminTools';
+import type { ModelImportFailure } from './adminTools';
 
 // ===== Inference Server API =====
 
@@ -136,6 +142,7 @@ export function unreachableHealth(): HealthStatus {
     llm: { backend: null, reachable: false },
     license: { mode: null },
     dataDir: null,
+    aiSettings: null,
   };
 }
 
@@ -143,7 +150,8 @@ function mapHealth(d: any): HealthStatus {
   const models: HealthStatus['models'] = {};
   if (d?.models && typeof d.models === 'object') {
     for (const [k, v] of Object.entries<any>(d.models)) {
-      models[k] = { loaded: !!v?.loaded, reason: v?.reason ?? null };
+      const identity = typeof v?.identity === 'string' && /^[0-9a-f]{12}$/i.test(v.identity) ? v.identity.toLowerCase() : null;
+      models[k] = { loaded: !!v?.loaded, reason: v?.reason ?? null, identity };
     }
   }
   const status = d?.status === 'ok' || d?.status === 'degraded' ? d.status : 'error';
@@ -157,6 +165,7 @@ function mapHealth(d: any): HealthStatus {
     llm: { backend: d?.llm?.backend ?? null, reachable: !!d?.llm?.reachable },
     license: { mode: d?.license?.mode ?? null },
     dataDir: d?.data_dir ?? null,
+    aiSettings: parseAiSettings(d?.ai_settings),
   };
 }
 
@@ -300,6 +309,7 @@ function mapStudyResponse(data: any): StudyAnalysis {
     appVersion: data?.app_version ?? null,
     reportLanguage,
     gemmaAvailable: !!data?.gemma_available,
+    sequencesPresent: mapSequences(data?.sequences_present),
   };
 
   return {
@@ -395,7 +405,13 @@ export async function analyzeDicom(
     rejected: !!data.rejected,
     rejectionReason: data.rejection_reason ?? null,
     appVersion: data.app_version ?? null,
+    sequencesPresent: mapSequences(data.sequences_present),
   };
+}
+
+/** sequences_present → string[] (undefined when the server sent none). */
+function mapSequences(raw: unknown): string[] | undefined {
+  return Array.isArray(raw) ? raw.map(String) : undefined;
 }
 
 // ----- Studies (worklist persistence) ---------------------------------------
@@ -588,6 +604,7 @@ export async function regenerateReport(
   patientInfo?: any,
   modality: string = 'CR',
   bodyPart: string = 'CHEST',
+  sequences?: string[],
 ): Promise<string> {
   const res = await inferenceAPI.post('/report/regenerate', {
     findings,
@@ -595,6 +612,8 @@ export async function regenerateReport(
     patient_info: patientInfo,
     modality,
     body_part: bodyPart,
+    // only when known: without it the server writes a technique line with no sequence/contrast claim
+    ...(sequences ? { sequences } : {}),
   }, { timeout: 60000 });
   return res.data.report;
 }
@@ -776,4 +795,91 @@ export async function attachReportPdf(reportId: string, pdfBase64: string, push 
     orthancId: d.orthanc_id ?? null,
     error: d.push_error ?? null,
   };
+}
+
+// ----- Administration (v1.1.0): AI settings, model bundle, diagnostics --------
+
+/**
+ * GET /settings/ai (admin JWT). Throws on any failure (classify with
+ * describeApiError) and when the body is not the contract's shape — the
+ * toggle must never show a guessed value.
+ */
+export async function getAiSettings(): Promise<AiSettings> {
+  const res = await inferenceAPI.get('/settings/ai', { timeout: 8000 });
+  const parsed = parseAiSettings(res.data);
+  if (!parsed) throw new InvalidPayloadError(`unexpected /settings/ai response: ${JSON.stringify(res.data)?.slice(0, 200)}`);
+  return parsed;
+}
+
+/**
+ * PUT /settings/ai {show_pending_detectors} (admin JWT). The server persists
+ * it in DATA_DIR/settings.json, audit-logs the change and applies it to the
+ * next analysis. Returns the server's effective setting.
+ */
+export async function putAiSettings(showPendingDetectors: boolean): Promise<AiSettings> {
+  const res = await inferenceAPI.put('/settings/ai', { show_pending_detectors: showPendingDetectors }, { timeout: 8000 });
+  const parsed = parseAiSettings(res.data);
+  if (!parsed) throw new InvalidPayloadError(`unexpected /settings/ai response: ${JSON.stringify(res.data)?.slice(0, 200)}`);
+  return parsed;
+}
+
+/**
+ * POST /models/import {path} (admin JWT). `path` must be the absolute path the
+ * Electron shell staged under DATA_DIR/model_inbox/. Verification, test-decrypt
+ * and the swap with rollback can take a while on a clinic PC — hence the long
+ * timeout. Throws on failure; classify with describeModelImportError.
+ */
+export async function importModelBundle(path: string): Promise<ModelImportResult> {
+  const res = await inferenceAPI.post('/models/import', { path }, { timeout: 600000 });
+  return parseModelImportResult(res.data);
+}
+
+export interface ModelImportErrorInfo {
+  failure: ModelImportFailure;
+  /** Reason code / detail from the server, for the toast body and the console. */
+  reason: string | null;
+  httpStatus: number | null;
+  messageKey: I18nKey;
+}
+
+/**
+ * Doctor-facing classification of a failed POST /models/import. A non-HTTP
+ * error (e.g. a 200 body without an identity) is 'unknown', never "server down".
+ */
+export function describeModelImportError(e: unknown): ModelImportErrorInfo {
+  if (!axios.isAxiosError(e)) {
+    const reason = e instanceof Error ? e.message : String(e);
+    return { failure: 'unknown', reason, httpStatus: null, messageKey: MODEL_IMPORT_ERROR_KEYS.unknown };
+  }
+  const httpStatus = e.response?.status ?? null;
+  const reason = e.response ? extractReasonCode(e.response.data) : null;
+  const failure = classifyModelImportFailure(reason, httpStatus);
+  return { failure, reason, httpStatus, messageKey: MODEL_IMPORT_ERROR_KEYS[failure] };
+}
+
+/** The server answered 200 but the body is not what the contract promises. */
+export class InvalidPayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidPayloadError';
+  }
+}
+
+export interface DiagnosticsDownload {
+  bytes: Uint8Array;
+  /** From Content-Disposition, sanitised; sentinel-diagnostics-<stamp>.zip otherwise. */
+  filename: string;
+}
+
+/**
+ * GET /diagnostics (admin JWT) → the support zip as bytes. The server
+ * builds it without PHI, keys or license.dat. Throws when the request fails
+ * or the body is not a zip archive.
+ */
+export async function downloadDiagnostics(): Promise<DiagnosticsDownload> {
+  const res = await inferenceAPI.get('/diagnostics', { responseType: 'arraybuffer', timeout: 120000 });
+  const bytes = new Uint8Array(res.data as ArrayBuffer);
+  if (!looksLikeZip(bytes)) throw new InvalidPayloadError('diagnostics response is not a zip archive');
+  const header = (res.headers?.['content-disposition'] as string | undefined) ?? null;
+  return { bytes, filename: filenameFromContentDisposition(header, defaultDiagnosticsName()) };
 }

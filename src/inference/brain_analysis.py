@@ -209,15 +209,48 @@ DETECTORS = [
 ]
 
 
+def _triage_not_validated_reason() -> str:
+    """'' when the loaded brain_triage weights are a validated release, else why not.
+
+    Reads validated_metrics.METRICS at call time (POST /models/import reloads
+    it). A gate-failed eval → its reason. No eval next to the model (METRICS
+    came from the built-in fallback) is only trusted when the LOADED weights
+    are the fallback release itself — an imported/hand-copied model without
+    study_level_eval.json must never inherit another release's 'validated'."""
+    from src.inference import validated_metrics as _vm
+    m = _vm.METRICS
+    if not m.validated:
+        return m.not_validated_reason or 'release gate not passed'
+    if m.source == 'json':
+        return ''
+    try:
+        from src.inference.model_registry import get_model_identity
+        loaded = (get_model_identity('brain_triage') or {}).get('sha256_12')
+    except Exception as e:                      # identity unknown → do not claim validated
+        logger.warning(f"triage identity unavailable ({e}); output labelled pending")
+        return 'model identity unavailable'
+    if loaded and loaded != m.identity:
+        return f'no study_level_eval.json for the loaded weights {loaded}'
+    return ''
+
+
 def analyze_brain_study(file_paths: list, device: str = 'cpu',
-                        include_experimental: bool = True) -> dict:
+                        include_experimental: bool = True, *,
+                        detector_statuses: Optional[set[str]] = None) -> dict:
     """Run the brain detector panel over one study.
+
+    detector_statuses: when not None, only detectors whose STATIC status
+    (Detector.status: validated / pending / experimental) is in the set are
+    run — a hidden detector's model is never even loaded (contract D1: pending
+    detectors are off by default in hospital builds). include_experimental is
+    applied on top, unchanged. None = every detector (legacy behaviour).
 
     Returns a dict with: rejected/non_brain, sequences_present, findings (each
     tagged with status + the detector + sequence used), and a roadmap of
     not-yet-wired finding types so the UI can show honest coverage.
     """
     from src.inference.model_registry import get_model
+    allowed = None if detector_statuses is None else {str(s) for s in detector_statuses}
 
     study = process_brain_study([Path(p) for p in file_paths])
     if study.num_sequences == 0:
@@ -238,9 +271,16 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
     for det in DETECTORS:
         if det.status == 'experimental' and not include_experimental:
             continue
+        if allowed is not None and det.status not in allowed:
+            logger.debug(f"Detector {det.key} not run: status '{det.status}' is switched off")
+            continue
         entry = get_model(det.model_key, device=device)
         if not entry or not entry.get('available'):
-            logger.debug(f"Detector {det.key} unavailable: {(entry or {}).get('reason','')}")
+            why = (entry or {}).get('reason', '') or 'model not loaded'
+            logger.debug(f"Detector {det.key} unavailable: {why}")
+            if det.status != 'experimental':
+                # the server returns a not-analysed result when nothing ran; say why
+                notes.append(f'{det.label} detector not run: model unavailable ({why}).')
             continue
         if det.key == 'triage':
             # the validated protocol only: an axial series with usable slices (the SAME rule
@@ -268,21 +308,29 @@ def analyze_brain_study(file_paths: list, device: str = 'cpu',
                 probs = entry['predictor'](_to_model_input(picked['slice']))
         except Exception as e:
             logger.warning(f"Detector {det.key} failed: {e}")
+            notes.append(f'{det.label} detector not run: inference failed ({type(e).__name__}).')
             continue
         detectors_run.append(det.key)
         status = det.status
         if det.key == 'triage':
-            from src.inference.validated_metrics import METRICS
-            if not METRICS.validated:
+            why_not = _triage_not_validated_reason()
+            if why_not:
                 # the eval next to the model says it did NOT pass the release gate (e.g. an
-                # --allow-unvalidated demo bundle): never label its output 'validated'
+                # --allow-unvalidated demo bundle), or there is no eval for THESE weights:
+                # never label its output 'validated'
                 status = 'pending'
                 notes.append(f'Local triage model is NOT a validated release '
-                             f'({METRICS.not_validated_reason}); its output is unverified.')
+                             f'({why_not}); its output is unverified.')
         for f in det.interpret(probs):
+            label = f['label']
+            if det.key == 'triage' and status != 'validated' and f.get('class') == 'normal':
+                # the interpreter quotes the release's sensitivity — not these weights'
+                from src.inference.validated_metrics import sensitivity_note
+                label = (f'Not flagged by local triage ({sensitivity_note("en", validated=False)} '
+                         f'— not a normal certificate)')
             findings.append({
                 'detector': det.key,
-                'finding': f['label'],
+                'finding': label,
                 'class_name': f.get('class'),
                 'confidence': round(f['confidence'], 4),
                 'positive': f['positive'],

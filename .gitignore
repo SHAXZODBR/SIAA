@@ -74,3 +74,13 @@ desktop-app/dist/
 packaging/dist/
 packaging/build/
 desktop-app/release/
+
+# === Per-clinic provisioning (packaging/provision_clinic.py) ===
+# vendor ledger of issued licenses, encrypted weights, model bundles dropped
+# into the app's inbox, and any license.dat (it carries the clinic's
+# model_key_secret) must never reach the public repo
+data/licenses/
+data/model_inbox/
+model_inbox/
+*.enc
+license.dat

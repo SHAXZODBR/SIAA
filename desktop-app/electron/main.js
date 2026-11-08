@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const adminIpc = require('./adminIpc');
 
 let mainWindow;
 let inferenceProcess = null;
@@ -43,6 +44,10 @@ const MESSAGES = {
     logFile: 'Log file: {log}',
     exitCode: 'exit code {code}',
     signal: 'signal {signal}',
+    importBundleTitle: 'Select the model bundle',
+    modelBundleFiles: 'Model bundle (.zip)',
+    saveDiagnosticsTitle: 'Save diagnostics for support',
+    zipFiles: 'ZIP archives',
   },
   ru: {
     ok: 'ОК',
@@ -63,6 +68,10 @@ const MESSAGES = {
     logFile: 'Файл журнала: {log}',
     exitCode: 'код выхода {code}',
     signal: 'сигнал {signal}',
+    importBundleTitle: 'Выберите пакет модели',
+    modelBundleFiles: 'Пакет модели (.zip)',
+    saveDiagnosticsTitle: 'Сохранить диагностику для поддержки',
+    zipFiles: 'Архивы ZIP',
   },
   uz: {
     ok: 'OK',
@@ -83,6 +92,10 @@ const MESSAGES = {
     logFile: 'Jurnal fayli: {log}',
     exitCode: 'chiqish kodi {code}',
     signal: 'signal {signal}',
+    importBundleTitle: 'Model paketini tanlang',
+    modelBundleFiles: 'Model paketi (.zip)',
+    saveDiagnosticsTitle: 'Qo‘llab-quvvatlash uchun diagnostikani saqlash',
+    zipFiles: 'ZIP arxivlari',
   },
 };
 
@@ -281,6 +294,59 @@ ipcMain.handle('write-license', async (_, licenseData) => {
   }
 });
 
+// ===== Administration: model bundle import, diagnostics export =====
+// Both handlers resolve {ok:true, path} or {ok:false, canceled?|error, detail}
+// and never throw into the renderer; reason codes come from adminIpc.js.
+
+// DATA_DIR of the backend this shell started = SENTINEL_DATA_DIR = userData.
+// In dev the developer runs the server by hand with its own DATA_DIR, so the
+// renderer may pass /health data_dir as a hint; a packaged app ignores it.
+function adminDataDir(hint) {
+  const own = app.getPath('userData');
+  if (app.isPackaged || typeof hint !== 'string' || !path.isAbsolute(hint)) return own;
+  try { return fs.statSync(hint).isDirectory() ? hint : own; } catch { return own; }
+}
+
+ipcMain.handle('model-bundle:import', async (_, opts) => {
+  try {
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: msg('importBundleTitle'),
+      filters: [{ name: msg('modelBundleFiles'), extensions: ['zip'] }],
+      properties: ['openFile'],
+    });
+    if (picked.canceled || !picked.filePaths || !picked.filePaths.length) return { ok: false, canceled: true };
+    const res = await adminIpc.stageModelBundle(picked.filePaths[0], adminDataDir(opts && opts.dataDirHint));
+    logBackend(res.ok
+      ? `model bundle staged for import: ${res.path} (${res.bytes} bytes)`
+      : `model bundle staging failed: ${res.error}${res.detail ? ` (${res.detail})` : ''}`);
+    return res;
+  } catch (e) {
+    logBackend(`model-bundle:import failed: ${e}`);
+    return { ok: false, error: 'internal_error', detail: String((e && e.message) || e) };
+  }
+});
+
+ipcMain.handle('diagnostics:save', async (_, payload) => {
+  try {
+    const checked = adminIpc.validateDiagnosticsPayload(payload && payload.bytes);
+    if (!checked.ok) return checked;
+    const name = adminIpc.safeFileName(payload && payload.suggestedName, '.zip') || 'sentinel-diagnostics.zip';
+    const save = await dialog.showSaveDialog(mainWindow, {
+      title: msg('saveDiagnosticsTitle'),
+      defaultPath: path.join(app.getPath('downloads'), name),
+      filters: [{ name: msg('zipFiles'), extensions: ['zip'] }],
+    });
+    if (save.canceled || !save.filePath) return { ok: false, canceled: true };
+    const res = await adminIpc.writeDiagnostics(save.filePath, checked.buffer);
+    logBackend(res.ok ? `diagnostics saved: ${res.path} (${res.bytes} bytes)` : `diagnostics save failed: ${res.error}`);
+    if (res.ok) shell.showItemInFolder(res.path);
+    return res.ok ? { ok: true, path: res.path, bytes: res.bytes } : res;
+  } catch (e) {
+    logBackend(`diagnostics:save failed: ${e}`);
+    return { ok: false, error: 'internal_error', detail: String((e && e.message) || e) };
+  }
+});
+
 // ===== Documentation =====
 // A packaged build may ship a docs/ folder next to the backend
 // (electron-builder extraResources); in dev the repo root is used. When no
@@ -416,6 +482,10 @@ function backendEnv() {
     SENTINEL_REQUIRE_AUTH: '1',                    // enforce auth in production
     SENTINEL_DATA_DIR: app.getPath('userData'),    // DB, audit log, license, logs
     SENTINEL_HOSPITAL_BUILD: '1',                  // offline posture; dev bypasses ignored
+    // D2: an installed app encrypts proprietary weights at rest on first start.
+    // Only the packaged shell sets '1', so dev runs / CI smoke tests never
+    // encrypt the build tree.
+    SENTINEL_ENCRYPT_MODELS_AT_REST: app.isPackaged ? '1' : '0',
     ...(fs.existsSync(bundledModelsDir()) ? { SENTINEL_MODELS_DIR: bundledModelsDir() } : {}),
   };
 }

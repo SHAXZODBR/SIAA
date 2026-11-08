@@ -55,9 +55,22 @@ if OFFLINE:
     _export_offline_env()
 
 
+# Registry keys whose weights are the vendor's own release: NOT downloadable
+# (scripts/download_all_models.py cannot fetch them). On a clinic-flavour
+# install (…-NO-VALIDATED-MODEL) they arrive as an encrypted per-PC bundle
+# (packaging/provision_clinic.py → POST /models/import, contract D3).
+VENDOR_ONLY_MODEL_KEYS: frozenset[str] = frozenset({'brain_triage'})
+
+
 def missing_model_reason(key: str, looked_in: list[str] | None = None) -> str:
     """The unavailable-reason a missing model reports in offline mode (surfaced
-    verbatim in /health.models[key].reason)."""
+    verbatim in /health.models[key].reason). For a vendor-only model the
+    download hint would be wrong (it is not downloadable) — the admin is told
+    to import the vendor's encrypted bundle instead."""
     where = f" (looked in: {', '.join(looked_in)})" if looked_in else ""
+    if key in VENDOR_ONLY_MODEL_KEYS:
+        return (f"model missing — the validated {key} model is delivered by the vendor as an "
+                f"encrypted bundle for this PC: Preferences → AI models → Import model bundle "
+                f"(POST /models/import){where}")
     return (f"model missing — run scripts/download_all_models.py --only {key} "
             f"on a machine with internet and copy models/ here{where}")

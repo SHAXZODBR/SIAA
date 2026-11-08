@@ -34,6 +34,10 @@ hiddenimports += ['uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto', 'uvi
                   'uvicorn.protocols.http', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets',
                   'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan', 'uvicorn.lifespan.on']
 datas += [(os.path.join(ROOT, 'configs'), 'configs')]
+# POST /models/import extracts the per-clinic bundle with the SAME code the installer
+# build uses (server._bundle_extractor loads REPO_ROOT/packaging/fetch_model_bundle.py;
+# REPO_ROOT is the bundle root when frozen). Without it the server's built-in twin is used.
+datas += [(os.path.join(ROOT, 'packaging', 'fetch_model_bundle.py'), 'packaging')]
 
 a = Analysis([os.path.join(ROOT, 'run_server.py')], pathex=[ROOT], binaries=binaries, datas=datas,
              hiddenimports=hiddenimports, hookspath=[], runtime_hooks=[],

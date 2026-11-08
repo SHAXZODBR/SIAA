@@ -1,7 +1,7 @@
 # Windows laptop — offline test checklist (founder's copy)
 
 Goal: build the installer on **your own Windows laptop**, install it, **switch the Wi-Fi off**, and prove
-that the whole product works without internet: login → setup wizard → real brain MRI → 2 findings →
+that the whole product works without internet: login → setup wizard → real brain MRI → triage flag →
 RU report → sign → PDF → language switch → restart with the study restored.
 The Russian version is `windows_laptop_test_ru.md`. Print this page; tick the boxes as you go.
 
@@ -28,7 +28,7 @@ The build script checks all of this itself and prints the exact install command 
    powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
    ```
    Steps 0–7 print on screen and go to `packaging\build_windows.log`. The last step (installer compression) looks frozen for 10–20 min — it is not.
-4. ☐ It ends with `BUILD OK` and the installer path + size: `C:\SIAA\sentinel\desktop-app\release\Sentinel Medical AI Setup 1.0.0.exe` (expect ≈ 1.5–2 GB).
+4. ☐ It ends with `BUILD OK` and the installer path + size: `C:\SIAA\sentinel\desktop-app\release\Sentinel Medical AI Setup 1.1.0.exe` (expect ≈ 1.5–2 GB).
    Re-running the script is safe: finished steps are skipped.
 5. ☐ If it fails: it prints the step name, the last 40 log lines and **`>>> Send this file to the developer: C:\SIAA\sentinel\packaging\build_windows.log`** — send that file. Two known hiccups: *Cannot create symbolic link* during electron-builder → Windows Settings → *For developers* → **Developer Mode ON**, re-run; *node-gyp / MSBuild* errors → you have Node 24, install Node 20 LTS.
 
@@ -55,7 +55,7 @@ The build script checks all of this itself and prints the exact install command 
 
 13. ☐ **Language** → choose Russian (default) → Next.
 14. ☐ **Clinic** → type any clinic name → Next.
-15. ☐ **AI server** → click **Test connection**. The *Server status* card must show **Connected**, and in *Loaded models*: **`brain_triage` — Loaded** (the required one). `brain_tumor_class` and `chest` are normally *Loaded* as well (both are warmed at start-up). → Next.
+15. ☐ **AI server** → click **Test connection**. The *Server status* card must show **Connected**, and in *Loaded models*: **`brain_triage` — Loaded** (the required one). `brain_tumor_class` is normally *Not loaded* in this release: it is a pending (unvalidated) detector, hidden by default and not warmed at start-up; `chest` may be *Loaded* or *Not loaded* (it loads with the first chest study). → Next.
 16. ☐ **License** → **Skip** (demo mode is enough for this test).
 17. ☐ **Support** → Finish setup. The empty worklist appears; the top-right status must NOT say *degraded*.
 
@@ -63,10 +63,10 @@ The build script checks all of this itself and prints the exact install command 
 
 18. ☐ In the worklist click **Folder** and pick **`C:\SIAA\demo_study`** (the whole folder; 23 DICOM files, series sub-folders inside). Upload + analysis take 20–90 s on CPU.
 19. ☐ The study appears in the worklist; the centre viewer shows a **real brain MRI slice** (not a placeholder pattern).
-20. ☐ **Findings** tab: expect **2 findings**:
-    - **Abnormal (triage)** — status **Validated** (the Uzbek-trained triage model; this study's radiologist report says tumor, so it should be flagged),
-    - a tumor class, e.g. **Glioma** — status **Pending validation** (public tumor classifier, not validated locally).
-    The overall line reads *AI flagged a finding — requires review* and the disclaimer under it is in Russian.
+20. ☐ **Findings** tab: expect **exactly 1 finding**:
+    - **Abnormal (triage)** — status **Validated** (the Uzbek-trained triage model; this study's radiologist report says tumor, so it should be flagged).
+    No tumor class is shown: since v1.1.0 unvalidated (*Pending validation*) detectors are switched off by default. The overall line reads *AI flagged a finding — requires review* and the disclaimer under it is in Russian.
+    *Optional:* Preferences → **AI models** → switch on **Show unvalidated (pending) detectors**, upload the folder again → now **2 findings**: the triage flag plus a tumor class, e.g. **Glioma** — status **Pending validation**. Switch it **off** again before you continue.
 21. ☐ **Report** tab: the RU report text is there (template sections: показание / методика / описание / заключение).
 22. ☐ Click **Sign report** → confirm. The line *Signed by: Administrator · <date/time>* appears and the text becomes read-only.
 23. ☐ Click **Export signed PDF** → choose a folder → the PDF is saved and Explorer opens on it. **Open the PDF**: Cyrillic must render (no boxes), it contains the clinic name, the finding, the signature line and the model identity `0d559766ce58`.
@@ -94,7 +94,7 @@ The build script checks all of this itself and prints the exact install command 
 | Test connection → *degraded* / `brain_triage — Not loaded` | backend.log + a screenshot of the *Server status* card; the reason text next to the model |
 | Folder upload → *No DICOM (.dcm) files in the selection* or an error toast | screenshot of the toast + which folder you picked |
 | Study analysed but the viewer shows a grey placeholder / no image | screenshot + backend.log |
-| Fewer or more than 2 findings, or triage not flagged | screenshot of the Findings tab (with statuses) + backend.log |
+| Not exactly 1 finding with pending detectors off (2 with them on), or triage not flagged | screenshot of the Findings tab (with statuses) + backend.log |
 | PDF shows □□□ instead of Cyrillic, or *Could not export the PDF* | the PDF itself + screenshot |
 | After restart the study is gone or has no image | backend.log + `dir %APPDATA%\sentinel-medical-ai\previews` output |
 | Windows Defender / antivirus quarantines `sentinel-backend.exe` or the installer (PyInstaller false positive) | screenshot of the alert; then Windows Security → Virus & threat protection → Exclusions → add `C:\SIAA` and the install folder, re-run |

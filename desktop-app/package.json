@@ -1,6 +1,6 @@
 {
   "name": "sentinel-medical-ai",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Sentinel Medical AI — On-premise brain MRI / CT / X-ray AI assistant for clinics",
   "homepage": "https://siaa.uz",
   "author": {
@@ -20,7 +20,8 @@
     "build:all": "vite build && electron-builder --win --mac",
     "preview": "vite preview",
     "lint": "eslint src/",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs"
   },
   "build": {
     "appId": "uz.siaa.sentinel",

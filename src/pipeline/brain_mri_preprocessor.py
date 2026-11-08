@@ -68,9 +68,18 @@ SEQUENCE_PATTERNS = {
         rf'(?:^|[\W_])t2w?(?:[\W_]|$)',
         rf'(?:^|[\W_])t2{_OPT_SEP}tse(?:[\W_]|$)',
     ],
-    'DWI':   [rf'(?:^|[\W_])dwi(?:[\W_]|$)', rf'(?:^|[\W_])diffusion(?:[\W_]|$)'],
+    # Siemens names its diffusion series 'ep2d_diff_3scan_trace_p2_TRACEW' (and the derived map
+    # '..._ADC'); GE uses 'DIFF'. Without the diff/trace tokens a real Siemens DWI series stayed
+    # 'unknown' and the report technique line omitted it (dress rehearsal 2026-11-09).
+    'DWI':   [rf'(?:^|[\W_])dwi(?:[\W_]|$)', rf'(?:^|[\W_])diffusion(?:[\W_]|$)',
+              rf'(?:^|[\W_])(?:diff|trace|tracew)(?:[\W_]|$)'],
     'ADC':   [rf'(?:^|[\W_])adc(?:[\W_]|$)'],
 }
+
+# ADC before DWI: an ADC map is named after its diffusion series ('ep2d_diff_..._ADC'), so the
+# 'adc' token is the more specific one. Both come after the anatomical sequences, which the
+# validated triage protocol (CLASSIFIER_SEQUENCE_PREFERENCE) depends on — unchanged.
+_DETECTION_ORDER: tuple[str, ...] = ('T1ce', 'FLAIR', 'T1', 'T2', 'ADC', 'DWI')
 
 
 def detect_sequence(text: str) -> Optional[str]:
@@ -78,12 +87,13 @@ def detect_sequence(text: str) -> Optional[str]:
 
     Order matters — more specific tokens (T1ce, FLAIR) checked first so
     "T1ce" doesn't get caught by the generic T1 pattern, and "T2_FLAIR"
-    becomes FLAIR instead of T2.
+    becomes FLAIR instead of T2; ADC before DWI so "ep2d_diff_..._ADC" is
+    the ADC map, not the diffusion series (_DETECTION_ORDER).
     """
     if not text:
         return None
     s = ' ' + text.lower() + ' '   # pad so word-boundary works at edges
-    for seq in ['T1ce', 'FLAIR', 'T1', 'T2', 'DWI', 'ADC']:
+    for seq in _DETECTION_ORDER:
         for pattern in SEQUENCE_PATTERNS[seq]:
             if re.search(pattern, s):
                 return seq

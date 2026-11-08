@@ -12,6 +12,7 @@ import {
 } from '../services/findingTranslations';
 import type { FindingUrgency } from '../services/findingTranslations';
 import { getAppVersion } from '../services/appInfo';
+import { rejectionReasonKey } from '../services/adminTools';
 import { useT, LANGS, langShort, formatDate, formatDateTime } from '../i18n';
 import AIChat from './AIChat';
 
@@ -184,15 +185,24 @@ function FindingsTab({ result, lang }: { result: AIResult | null; lang: Lang }) 
   );
 }
 
+/**
+ * Rejected / requires-review result. Known server reason codes are shown as a
+ * localized sentence (e.g. D1 'no_validated_detector'); free-text reasons are
+ * appended as the server sent them.
+ */
 function NotAnalyzedState({ result }: { result: AIResult }) {
   const t = useT();
   const reason = result.rejectionReason || '';
+  const reasonKey = rejectionReasonKey(reason);
   return (
     <div className="p-4 space-y-3">
       <div className="p-4 rounded-lg border severity-moderate">
         <div className="text-sm font-semibold leading-snug">
-          {t('findings.notAnalyzed')}{reason ? `: ${reason}` : ''}
+          {t('findings.notAnalyzed')}{reason && !reasonKey ? `: ${reason}` : ''}
         </div>
+        {reasonKey && (
+          <div className="mt-2 text-xs leading-relaxed" data-reason={reason}>{t(reasonKey)}</div>
+        )}
       </div>
       <DisclaimerBanner text={t('findings.disclaimer')} />
     </div>
@@ -423,6 +433,7 @@ function ReportTab({ result, study, lang }: { result: AIResult | null; study: St
           { id: study.patientId, age: study.patientAge ?? undefined, sex: study.patientSex ?? undefined, study_date: study.studyDate },
           modality,
           bodyPart,
+          result.sequencesPresent,
         );
         if (cancelled) return;
         if (!text || !text.trim()) throw new Error('Empty report from server');

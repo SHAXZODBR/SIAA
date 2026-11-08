@@ -140,3 +140,123 @@ def test_malformed_file_fails():
 def test_machine_id_is_stable_and_hex():
     a, b = lic.get_machine_id(), lic.get_machine_id()
     assert a == b and len(a) == 64 and int(a, 16) >= 0
+
+
+# ---------------------------------------------------------------- model_key_secret (contract D3)
+
+SECRET = "ab" * 32                                   # 64 lowercase hex, synthetic
+
+
+def _payload_of(license_data: str) -> dict:
+    bundle = json.loads(base64.b64decode(license_data).decode())
+    return json.loads(base64.b64decode(bundle["payload"]).decode())
+
+
+def test_model_key_secret_round_trip(trusted):
+    data = lic.sign_license(_license(model_key_secret=SECRET), trusted)
+    assert _payload_of(data)["model_key_secret"] == SECRET          # inside the SIGNED payload
+    result = lic.verify_license(data, current_machine_id=MACHINE)
+    assert result.valid is True, result.reason
+    assert result.license.model_key_secret == SECRET
+
+
+def test_license_without_secret_serializes_as_before(trusted):
+    """No model key → the payload has no extra field, so pre-1.1 licenses and verifiers agree."""
+    lo = _license()
+    assert "model_key_secret" not in lo.to_payload()
+    result = lic.verify_license(lic.sign_license(lo, trusted), current_machine_id=MACHINE)
+    assert result.valid is True and result.license.model_key_secret is None
+
+
+def test_tampered_model_key_secret_fails(trusted):
+    data = lic.sign_license(_license(model_key_secret=SECRET), trusted)
+    forged = _tamper(data, payload={"model_key_secret": "cd" * 32})
+    result = lic.verify_license(forged, current_machine_id=MACHINE)
+    assert result.valid is False and "signature" in result.reason
+    # adding a secret to a license that had none is a forgery too
+    plain = lic.sign_license(_license(), trusted)
+    result = lic.verify_license(_tamper(plain, payload={"model_key_secret": SECRET}), current_machine_id=MACHINE)
+    assert result.valid is False and "signature" in result.reason
+
+
+@pytest.mark.parametrize("bad", ["ab" * 31, "AB" * 32, "zz" * 32, "ab" * 32 + "0", ""])
+def test_sign_refuses_malformed_secret(trusted, bad):
+    with pytest.raises(ValueError):
+        lic.sign_license(_license(model_key_secret=bad), trusted)
+
+
+def test_secret_never_in_repr(trusted):
+    lo = _license(model_key_secret=SECRET)
+    assert SECRET not in repr(lo)
+    result = lic.verify_license(lic.sign_license(lo, trusted), current_machine_id=MACHINE)
+    assert SECRET not in repr(result)
+
+
+def test_generate_model_key_secret_is_fresh_64_hex():
+    a, b = lic.generate_model_key_secret(), lic.generate_model_key_secret()
+    assert a != b and lic.is_valid_model_key_secret(a) and lic.is_valid_model_key_secret(b)
+
+
+@pytest.fixture
+def local_license(tmp_path, monkeypatch, trusted):
+    """A license.dat at a temp path that load_and_verify_local_license reads, on MACHINE."""
+    path = tmp_path / "license.dat"
+    monkeypatch.setattr(lic, "get_license_path", lambda: path)
+    monkeypatch.setattr(lic, "get_machine_id", lambda: MACHINE)
+
+    def write(**over):
+        path.write_text(lic.sign_license(_license(**over), trusted))
+        return path
+    return write
+
+
+def test_license_model_key_secret_valid_license(local_license):
+    local_license(model_key_secret=SECRET)
+    assert lic.license_model_key_secret() == bytes.fromhex(SECRET)
+
+
+@pytest.mark.parametrize("over", [
+    {"machine_id": "machine-fingerprint-B"},                                        # other PC
+    {"expires_at": (datetime.date.today() - datetime.timedelta(days=1)).isoformat()},  # expired
+    {},                                                                              # no secret
+])
+def test_license_model_key_secret_none_unless_valid_here(local_license, over):
+    fields = {"model_key_secret": SECRET} if over else {}
+    fields.update(over)
+    local_license(**fields)
+    assert lic.license_model_key_secret() is None
+
+
+def test_license_model_key_secret_none_without_file_or_with_garbage(local_license, tmp_path):
+    assert lic.license_model_key_secret() is None                    # no file
+    (tmp_path / "license.dat").write_text("garbage")
+    assert lic.license_model_key_secret() is None
+
+
+def test_license_model_key_secret_untrusted_signer(local_license, monkeypatch):
+    local_license(model_key_secret=SECRET)
+    _priv, other_pub = _keypair()
+    monkeypatch.setattr(lic, "SENTINEL_PUBLIC_KEY_PEM", other_pub)
+    assert lic.license_model_key_secret() is None
+
+
+def test_cli_issue_with_model_key_never_prints_secret(tmp_path, trusted, monkeypatch, capsys):
+    key_file = tmp_path / "vendor_private_key.pem"
+    key_file.write_bytes(trusted)
+    out = tmp_path / "license.dat"
+    lic.main(["issue", "--customer", "Test Clinic", "--machine-id", MACHINE, "--expires", "2031-12-31",
+              "--private-key", str(key_file), "--output", str(out), "--with-model-key"])
+    printed = capsys.readouterr()
+    data = out.read_text()
+    secret = _payload_of(data)["model_key_secret"]
+    assert lic.is_valid_model_key_secret(secret)
+    assert secret not in printed.out and secret not in printed.err
+    assert "key fingerprint" in printed.out
+    assert (out.stat().st_mode & 0o777) == 0o600
+    result = lic.verify_license(data, current_machine_id=MACHINE)
+    assert result.valid is True and result.license.model_key_secret == secret
+    # without the flag: no secret
+    out2 = tmp_path / "plain.dat"
+    lic.main(["issue", "--customer", "Test Clinic", "--machine-id", MACHINE, "--expires", "2031-12-31",
+              "--private-key", str(key_file), "--output", str(out2)])
+    assert "model_key_secret" not in _payload_of(out2.read_text())

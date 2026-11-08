@@ -135,6 +135,10 @@ else
 fi
 
 # ---------------------------------------------------------------- README_FIRST.txt
+# The installer file name follows desktop-app/package.json (electron-builder default
+# "${productName} Setup ${version}.exe"), never a hard-coded version.
+APP_VERSION="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+               "$REPO/desktop-app/package.json")" || die "cannot read the version from desktop-app/package.json"
 # UTF-8 BOM first: the RU half must open correctly in any Windows Notepad.
 printf '\xEF\xBB\xBF' > "$KIT/README_FIRST.txt"
 cat >> "$KIT/README_FIRST.txt" <<EOF
@@ -153,7 +157,7 @@ SIAA / Sentinel Medical AI - WINDOWS TEST KIT  (built $(date '+%Y-%m-%d %H:%M') 
   3. Run:
         powershell -ExecutionPolicy Bypass -File packaging\\build_windows.ps1
 
-     45-90 minutes. It ends with the installer path:  desktop-app\\release\\Sentinel Medical AI Setup 1.0.0.exe
+     45-90 minutes. It ends with the installer path:  desktop-app\\release\\Sentinel Medical AI Setup ${APP_VERSION}.exe
      If it fails, send  C:\\SIAA\\sentinel\\packaging\\build_windows.log  to the developer.
 
   Then install the .exe (SmartScreen: "More info" -> "Run anyway"), turn Wi-Fi OFF and follow

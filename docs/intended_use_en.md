@@ -1,6 +1,6 @@
 # SIAA — Sentinel Medical AI · Intended Use Statement
 
-Version 1.0.0 · Document revision 2026-09
+Version 1.1.0 · Document revision 2026-11
 
 ## Intended use
 
@@ -13,7 +13,7 @@ Licensed radiologists and physicians of the clinic in which the software is inst
 ## Indications
 
 - **Brain MRI** (adult routine brain protocols; axial T1, T1 with contrast, T2 and/or FLAIR series): prioritisation of studies for reading. This is the only validated indication.
-- **Head CT**: the software can route a head CT to a public intracranial-hemorrhage classifier when that model is installed; its output is marked *pending validation* and **no performance claim is made for CT**. Where the model is not installed the study is returned as "requires review" without AI output.
+- **Head CT**: there is no validated CT detector. By default (pending detectors disabled) a head CT is returned as "requires review" without AI output, with a note that no validated detector exists. Only when an administrator has enabled pending detectors and the model is installed is it routed to a public intracranial-hemorrhage classifier, whose output is marked *pending validation*; **no performance claim is made for CT**.
 - Other modalities and body regions are outside the intended use; such studies are returned as "requires review".
 
 ## Contraindications and limitations
@@ -21,6 +21,7 @@ Licensed radiologists and physicians of the clinic in which the software is inst
 - **Not for stand-alone diagnosis, screening, or exclusion of disease.** A study with no AI flag has *not* been read as normal: about 1 in 10 abnormal studies in local validation was not flagged.
 - **Not a normal certificate.** The detector panel only recognises the finding types it lists; any other pathology is invisible to it.
 - The **brain tumor classifier** (glioma / meningioma / pituitary) is a public model with *pending* validation on the local population and is known to over-call tumors. Its flags — and its "no tumor" output — must not be used clinically without the radiologist's own reading.
+- **Unvalidated (pending and experimental) detectors are disabled by default; only an administrator can enable pending detectors, and every such change is recorded in the audit log.**
 - Ischemic stroke and cerebral atrophy detectors are *experimental* and are not executed in whole-study analysis. Hemorrhage, white-matter disease and hydrocephalus detection are not implemented.
 - Performance has **not** been established for: paediatric patients, post-operative or post-treatment brains, non-standard or non-axial protocols, studies with heavy motion or metal artefacts, scanner models absent from the local training data, or DICOM exports with missing header information.
 - Not intended for time-critical decisions (e.g., acute stroke or hemorrhage rule-out).
@@ -35,7 +36,7 @@ Licensed radiologists and physicians of the clinic in which the software is inst
 | | | Study-level specificity | **0.47** (22 of 47 normal studies not flagged) |
 | | | Accuracy | 0.79 |
 
-**How it was measured.** The triage model (a ViT-B image classifier) was fine-tuned on brain MRI studies from a Tashkent hospital, with study-level labels derived from the hospital's own radiology reports, and tested on **178 held-out patients** (131 abnormal, 47 normal) not used in training — 890 axial slices, 5 central slices per study. For each study the abnormal-probabilities of the 5 slices are averaged and the study is flagged when the mean is ≥ 0.50 — the same protocol the software runs in production. Evaluation script: `scripts/eval_study_level.py`, results in `models/brain_triage_finetuned/study_level_eval.json` (evaluated 2026-09-07). A model release is blocked by the same script if it falls below sensitivity 0.85 or specificity 0.40. Note the small number of normal studies (47): the specificity estimate is imprecise (95% CI roughly 0.33–0.61). The labels are report-derived and applied at study level, not per-slice expert annotations. A radiologist-adjudicated pilot test set (see `pilot_evaluation_protocol_en.md`) is required to confirm these figures at each installation.
+**How it was measured.** The triage model (a ViT-B image classifier) was fine-tuned on brain MRI studies from a Tashkent hospital, with study-level labels derived from the hospital's own radiology reports, and tested on **178 held-out patients** (131 abnormal, 47 normal) not used in training — 890 axial slices, 5 central slices per study. For each study the abnormal-probabilities of the 5 slices are averaged and the study is flagged when the mean is ≥ 0.50 — the same protocol the software runs in production. Evaluation script: `scripts/eval_study_level.py`, results in `models/brain_triage_finetuned/study_level_eval.json` (evaluated 2026-11-09). A model release is blocked by the same script if it falls below sensitivity 0.85 or specificity 0.40. Note the small number of normal studies (47): the specificity estimate is imprecise (95% CI roughly 0.33–0.61). The labels are report-derived and applied at study level, not per-slice expert annotations. A radiologist-adjudicated pilot test set (see `pilot_evaluation_protocol_en.md`) is required to confirm these figures at each installation.
 
 No performance figures are claimed for the brain tumor classifier, for CT, or for report text quality.
 
@@ -47,7 +48,7 @@ Sentinel Medical AI provides decision support only. **A qualified radiologist re
 
 | Item | Identifier |
 |---|---|
-| Desktop application / AI server | 1.0.0 (shown on the login screen, status bar, `/health`, and every PDF) |
+| Desktop application / AI server | 1.1.0 (shown on the login screen, status bar, `/health`, and every PDF) |
 | Validated triage model | `models/brain_triage_finetuned` — `model.safetensors` SHA-256 `0d559766ce58…` (pinned in `MANIFEST.json`; the first 12 characters are shown in the app and printed on reports) |
 | Brain tumor classifier (pending) | public Hugging Face model bundle; identity (name + SHA-256 fingerprint + status) shown with each result |
 | Decision threshold | 0.50 (printed on every report) |

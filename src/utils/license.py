@@ -31,7 +31,21 @@
         --machine-id <fingerprint-from-clinic> \
         --tier pro \
         --expires 2027-12-31 \
-        --output license.dat
+        --private-key vendor_keys/vendor_private_key.pem \
+        --output license.dat [--with-model-key]
+
+  PER-CLINIC MODEL KEY (docs/dev/finish_line_contract.md D3):
+    --with-model-key puts a fresh random 32-byte `model_key_secret` (64 hex)
+    INSIDE the signed payload. The model weights delivered to that clinic are
+    encrypted with HKDF(secret || machine_id) (src/utils/model_crypto.derive_key),
+    so the vendor can encrypt offline and the clinic never sees plaintext.
+    The secret is never printed; only the derived key's fingerprint is.
+    packaging/provision_clinic.py does license + encrypted model bundle in one
+    step — use it for real deliveries (a bare `issue --with-model-key` renewal
+    changes the key and orphans the bundle the clinic already has).
+    license_model_key_secret() returns the secret only for a license that
+    verifies on THIS machine. A license carrying model_key_secret needs app
+    >= 1.1.0 (older verifiers reject the unknown payload field).
 
   HOW THE CLIENT GETS THEIR FINGERPRINT:
     python -m src.utils.license fingerprint
@@ -49,9 +63,17 @@ import platform
 import socket
 import sys
 import uuid
-from dataclasses import dataclass
+import logging
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# model_key_secret: 32 random bytes as 64 lowercase hex chars (contract D3).
+MODEL_KEY_SECRET_HEX_LEN = 64
+_MODEL_KEY_SECRET_RE = re.compile(r'^[0-9a-f]{64}$')
 
 
 # ============================================================================
@@ -173,9 +195,13 @@ class License:
     features: list[str]  # ['chest', 'brain_2d', 'head_ct', 'mammography', 'cloud']
     seat_count: int = 1
     notes: str = ''
+    # Per-clinic model-encryption secret (64 hex), signed with the rest of the
+    # payload. Optional: licenses issued before v1.1.0 do not carry it and
+    # verify exactly as before. repr=False keeps it out of logs / tracebacks.
+    model_key_secret: Optional[str] = field(default=None, repr=False)
 
     def to_payload(self) -> dict:
-        return {
+        payload = {
             'customer': self.customer,
             'machine_id': self.machine_id,
             'tier': self.tier,
@@ -185,6 +211,21 @@ class License:
             'seat_count': self.seat_count,
             'notes': self.notes,
         }
+        # Only present when set, so a license without a model key serializes
+        # byte-for-byte as it did before the field existed.
+        if self.model_key_secret is not None:
+            payload['model_key_secret'] = self.model_key_secret
+        return payload
+
+
+def is_valid_model_key_secret(value: object) -> bool:
+    """True for a well-formed model_key_secret: exactly 64 lowercase hex chars."""
+    return isinstance(value, str) and bool(_MODEL_KEY_SECRET_RE.match(value))
+
+
+def generate_model_key_secret() -> str:
+    """A fresh model_key_secret: os.urandom(32) as 64 lowercase hex chars."""
+    return os.urandom(MODEL_KEY_SECRET_HEX_LEN // 2).hex()
 
 
 @dataclass
@@ -204,6 +245,10 @@ def sign_license(license_obj: License, private_key_pem: bytes) -> str:
     """
     if not _CRYPTO_AVAILABLE:
         raise RuntimeError('cryptography not installed')
+    if license_obj.model_key_secret is not None and not is_valid_model_key_secret(license_obj.model_key_secret):
+        # Refuse at the source: a malformed secret would silently fall back to
+        # the install key at the clinic and the delivered bundle would not load.
+        raise ValueError('model_key_secret must be 64 lowercase hex characters')
 
     private_key = serialization.load_pem_private_key(
         private_key_pem, password=None, backend=default_backend(),
@@ -324,6 +369,36 @@ def load_and_verify_local_license() -> LicenseValidation:
     return verify_license(data)
 
 
+def license_model_key_secret(validation: Optional[LicenseValidation] = None) -> Optional[bytes]:
+    """The per-clinic model-key secret (32 raw bytes) from the local license.
+
+    Returns the secret ONLY when the local license verifies for THIS machine
+    (signature, machine binding, expiry) and carries a well-formed
+    `model_key_secret`; otherwise None, so src/utils/model_crypto.get_model_key
+    falls back to the install secret. Never raises (a broken license file must
+    not take the model key path down) and never logs the secret.
+
+    `validation` lets a caller that already verified the license reuse that
+    result instead of re-reading the file.
+    """
+    try:
+        result = validation if validation is not None else load_and_verify_local_license()
+    except Exception as e:                                   # pragma: no cover - defensive
+        logger.warning('model key: license check failed (%s: %s) — not using a license key',
+                       type(e).__name__, e)
+        return None
+    if not result.valid or result.license is None:
+        return None
+    secret_hex = result.license.model_key_secret
+    if secret_hex is None:
+        return None
+    if not is_valid_model_key_secret(secret_hex):
+        logger.warning('model key: license.dat carries a malformed model_key_secret '
+                       '(reason=license_model_key_malformed) — not using it')
+        return None
+    return bytes.fromhex(secret_hex)
+
+
 # ============================================================================
 # CLI for vendor + customer use
 # ============================================================================
@@ -368,6 +443,7 @@ def _cli_issue(args):
         sys.exit(1)
     private_key_pem = Path(args.private_key).read_bytes()
 
+    secret_hex = generate_model_key_secret() if getattr(args, 'with_model_key', False) else None
     license_obj = License(
         customer=args.customer,
         machine_id=args.machine_id,
@@ -377,15 +453,36 @@ def _cli_issue(args):
         features=args.features.split(',') if args.features else ['chest', 'brain_2d', 'head_ct', 'mammography'],
         seat_count=args.seats,
         notes=args.notes or '',
+        model_key_secret=secret_hex,
     )
     license_data = sign_license(license_obj, private_key_pem)
-    Path(args.output).write_text(license_data)
+    _write_private_text(Path(args.output), license_data)
     print(f'✓ Wrote {args.output}')
     print(f'   Customer:   {license_obj.customer}')
     print(f'   Tier:       {license_obj.tier}')
     print(f'   Expires:    {license_obj.expires_at}')
     print(f'   Features:   {", ".join(license_obj.features)}')
     print(f'   Seats:      {license_obj.seat_count}')
+    if secret_hex is not None:
+        # Never the secret itself — only the fingerprint of the key it derives
+        # for this machine, which `python -m src.utils.model_crypto keyinfo`
+        # prints at the clinic so both sides can confirm they agree.
+        from src.utils.model_crypto import derive_key, key_fingerprint
+        kfp = key_fingerprint(derive_key(bytes.fromhex(secret_hex), license_obj.machine_id))
+        print(f'   Model key:  embedded in the signed payload (key fingerprint {kfp})')
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    """Write `text` to `path` readable by the owner only (0600): a license with
+    a model_key_secret is key material until it is delivered."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
 
 
 def _cli_verify(args):
@@ -412,7 +509,7 @@ def _cli_verify(args):
         sys.exit(1)
 
 
-def main():
+def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description='Sentinel license tool')
     sub = parser.add_subparsers(dest='cmd')
 
@@ -429,11 +526,14 @@ def main():
     p_issue.add_argument('--notes', default='')
     p_issue.add_argument('--private-key', required=True, help='path to vendor_private_key.pem')
     p_issue.add_argument('--output', default='license.dat')
+    p_issue.add_argument('--with-model-key', action='store_true',
+                         help='embed a fresh per-clinic model_key_secret in the signed payload '
+                              '(never printed); prefer packaging/provision_clinic.py for deliveries')
 
     p_verify = sub.add_parser('verify', help='Verify a license file')
     p_verify.add_argument('--license-file', help='path to license.dat')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.cmd == 'fingerprint':
         _cli_fingerprint()
     elif args.cmd == 'gen-keys':

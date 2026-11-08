@@ -20,7 +20,12 @@
                "ID пациента (PatientID)", "Дата исследования", "Модальность",
                "Область", "Описание исследования", "Заключение врача …");
                every sheet whose header row has the ID + conclusion columns.
-      * DOCX — paragraphs are parsed like the PDF text.
+      * DOCX — paragraphs AND tables (w:tbl → rows → cells → paragraphs, in
+               document reading order; a row's non-empty cells joined with
+               ' | ', one row per line; a row with ONE non-empty cell — a layout
+               table holding the whole report — keeps one line per paragraph;
+               nested tables are flattened into their cell) are parsed like the
+               PDF text.  "Заключение: | <text>" table rows are conclusion markers.
 
   WHY (bugs of the previous keyword parser this replaces)
     1. modality was "МСКТ" for every report because the letterhead says
@@ -119,7 +124,8 @@ HEADER_RE = re.compile(r'^\s*(?P<title>\S.{0,180}?)\s*\((?P<date>\d{4}-\d{2}-\d{
 LONE_MODALITY_RE = re.compile(r'^\s*([A-Za-zА-Яа-яЁё\-]{2,24})\s*$')
 # the conclusion marker at a line start; the boilerplate sentence
 # "Заключение не является диагнозом…" is NOT a marker
-CONCLUSION_RE = re.compile(r'^\s*(?:заключение|выводы?)\s*[:.]?\s*(?P<rest>.*)$', re.IGNORECASE)
+# (a .docx table row "Заключение: | <text>" is a marker too: the cell separator is skipped)
+CONCLUSION_RE = re.compile(r'^\s*(?:заключение|выводы?)\s*[:.]?\s*(?:\|\s*)?(?P<rest>.*)$', re.IGNORECASE)
 CONCLUSION_PREFIX_RE = re.compile(r'^\s*(МСКТ|МРТ|КТ|СКТ|MRI|MR|CT)\b', re.IGNORECASE)
 # any of these ends the conclusion / description and never reaches the CSV
 BOILERPLATE_PATTERNS = [
@@ -224,23 +230,89 @@ def pdf_text(path: Path) -> str:
     return ''
 
 
+_W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+DOCX_CELL_SEP = ' | '
+# block containers whose children are read in order like the body's (content controls,
+# custom XML, tracked insertions / moves); anything else (sectPr, bookmarks, w:del …) is skipped
+_DOCX_CONTAINERS = {_W + t for t in ('sdt', 'sdtContent', 'customXml', 'ins', 'moveTo', 'smartTag')}
+
+
+def _docx_paragraph(p: ET.Element) -> str:
+    """Text of one w:p: runs' w:t in order, w:br / w:cr → newline, w:tab → tab
+    (deleted text w:delText is never read)."""
+    parts: list[str] = []
+    for node in p.iter():
+        if node.tag == _W + 't':
+            parts.append(node.text or '')
+        elif node.tag in (_W + 'br', _W + 'cr'):
+            parts.append('\n')
+        elif node.tag == _W + 'tab':
+            parts.append('\t')
+    return ''.join(parts)
+
+
+def _docx_blocks(container: ET.Element) -> list[str]:
+    """Lines of a block container (w:body, w:tc, w:sdtContent …) in reading order."""
+    lines: list[str] = []
+    for child in container:
+        if child.tag == _W + 'p':
+            lines.append(_docx_paragraph(child))
+        elif child.tag == _W + 'tbl':
+            lines.extend(_docx_table(child))
+        elif child.tag in _DOCX_CONTAINERS:
+            lines.extend(_docx_blocks(child))
+    return lines
+
+
+def _docx_cells(row: ET.Element) -> list[ET.Element]:
+    """w:tc of a w:tr, including cells wrapped in content controls / custom XML."""
+    cells: list[ET.Element] = []
+    for child in row:
+        if child.tag == _W + 'tc':
+            cells.append(child)
+        elif child.tag in _DOCX_CONTAINERS:
+            cells.extend(_docx_cells(child))
+    return cells
+
+
+def _docx_rows(tbl: ET.Element) -> list[ET.Element]:
+    rows: list[ET.Element] = []
+    for child in tbl:
+        if child.tag == _W + 'tr':
+            rows.append(child)
+        elif child.tag in _DOCX_CONTAINERS:
+            rows.extend(_docx_rows(child))
+    return rows
+
+
+def _docx_table(tbl: ET.Element) -> list[str]:
+    """One line per table row: the non-empty cells (paragraphs joined with a space) joined with
+    ' | '. A row with a single non-empty cell (a layout table that holds the whole report, or a
+    vertically merged / spanned row) keeps one line per paragraph, so section headers and the
+    ЗАКЛЮЧЕНИЕ marker inside it stay at a line start. Empty cells (vMerge continuations) drop out."""
+    lines: list[str] = []
+    for row in _docx_rows(tbl):
+        cells = []
+        for tc in _docx_cells(row):
+            cell_lines = [ln for ln in (x.strip() for x in '\n'.join(_docx_blocks(tc)).split('\n')) if ln]
+            if cell_lines:
+                cells.append(cell_lines)
+        if not cells:
+            continue
+        if len(cells) == 1:
+            lines.extend(cells[0])
+        else:
+            lines.append(DOCX_CELL_SEP.join(' '.join(c) for c in cells))
+    return lines
+
+
 def docx_text(path: Path) -> str:
-    """Paragraph text of a .docx (word/document.xml), one paragraph per line."""
-    W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    """Text of a .docx (word/document.xml) in reading order: one paragraph per line, tables
+    as rows (see _docx_table). Headers / footers (letterhead, names) are not read."""
     with zipfile.ZipFile(path) as z:
         root = ET.fromstring(z.read('word/document.xml'))
-    lines = []
-    for p in root.iter(W + 'p'):
-        parts = []
-        for node in p.iter():
-            if node.tag == W + 't':
-                parts.append(node.text or '')
-            elif node.tag in (W + 'br', W + 'cr'):
-                parts.append('\n')
-            elif node.tag == W + 'tab':
-                parts.append('\t')
-        lines.append(''.join(parts))
-    return '\n'.join(lines)
+    body = root.find(_W + 'body')
+    return '\n'.join(_docx_blocks(body if body is not None else root))
 
 
 def _col_index(ref: str) -> int:

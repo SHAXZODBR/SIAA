@@ -1,7 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useAppStore } from '../store/appStore';
-import type { AppSettings, AvailableModel, HealthStatus, Lang } from '../types';
-import { probeHealth, listAvailableModels } from '../services/api';
+import type { AiSettings, AppSettings, AvailableModel, HealthStatus, Lang, ModelImportResult } from '../types';
+import {
+  probeHealth, listAvailableModels, getHealth, getAiSettings, putAiSettings, importModelBundle,
+  describeModelImportError, describeApiError, downloadDiagnostics, InvalidPayloadError,
+} from '../services/api';
+import { isAdminRole, ipcErrorKey, AI_SOURCE_KEYS } from '../services/adminTools';
 import { statusWord } from '../services/findingTranslations';
 import { useT, useLang, LANGS, langName, dictionarySizes } from '../i18n';
 import type { I18nKey } from '../i18n';
@@ -29,6 +33,12 @@ function isSection(v: string): v is SectionId {
  * Preferences. Only settings that this build actually honours are shown —
  * clinic identity (letterhead), server endpoints, language, live model and
  * license status, the real shortcut table and product identity.
+ *
+ * Administrator tools (v1.1.0, enabled only for role 'admin'; the server
+ * enforces the same with an admin JWT):
+ *   AI models → "Show unvalidated (pending) detectors"  GET/PUT /settings/ai
+ *   AI models → "Import model bundle"   shell IPC model-bundle:import → POST /models/import
+ *   About     → "Export diagnostics"    GET /diagnostics → shell IPC diagnostics:save
  */
 export default function SettingsModal() {
   const { settingsOpen, settingsSection, closeSettings, settings, updateSettings } = useAppStore();
@@ -281,9 +291,10 @@ function LanguageSection({ settings, update }: SectionProps) {
 // ─── AI models ───────────────────────────────────────────────────────────────
 
 function AISection() {
-  const { health, settings } = useAppStore();
+  const { health, settings, currentUser, setHealth } = useAppStore();
   const t = useT();
   const lang = useLang();
+  const admin = isAdminRole(currentUser?.role);
   const models = health?.models ? Object.entries(health.models) : [];
   const [registry, setRegistry] = useState<AvailableModel[] | null>(null);
   const [loadingRegistry, setLoadingRegistry] = useState(false);
@@ -301,6 +312,13 @@ function AISection() {
   }, []);
 
   useEffect(() => { if (health?.reachable) loadRegistry(); }, [health?.reachable, loadRegistry]);
+
+  // After an admin change the status bar, model list and registry must show the
+  // server's new state at once instead of waiting for the next health poll.
+  const refreshServerState = useCallback(async () => {
+    setHealth(await getHealth());
+    await loadRegistry();
+  }, [setHealth, loadRegistry]);
 
   const serverLabel = !health || !health.reachable
     ? t('common.offline')
@@ -339,6 +357,8 @@ function AISection() {
           </div>
         </div>
 
+        <PendingDetectorsCard admin={admin} onChanged={refreshServerState} />
+
         <div>
           <div className="text-[10px] font-bold text-ink-500 uppercase tracking-wider mb-2">{t('settings.loadedModels')}</div>
           {models.length === 0 ? (
@@ -349,6 +369,11 @@ function AISection() {
                 <div key={key} className="flex items-center justify-between px-3 py-2 bg-ink-850 rounded-lg border border-ink-800 text-xs">
                   <div className="min-w-0">
                     <div className="text-ink-100 font-mono truncate">{key}</div>
+                    {m.identity && (
+                      <div className="text-[10px] text-ink-300 font-mono truncate" data-identity={m.identity}>
+                        {t('settings.modelIdentity', { identity: m.identity })}
+                      </div>
+                    )}
                     {m.reason && <div className="text-[10px] text-ink-500 truncate">{m.reason}</div>}
                   </div>
                   <span className={`severity-pill flex-shrink-0 ${m.loaded ? 'severity-normal' : 'severity-critical'}`}>
@@ -402,10 +427,192 @@ function AISection() {
           )}
         </div>
 
+        <ModelBundleImport admin={admin} onImported={refreshServerState} />
+
         <div className="p-3 bg-ink-850 rounded-lg border border-ink-800 text-[11px] text-ink-400 leading-relaxed">
           {t('settings.aiFixedNote')}
         </div>
       </div>
+    </div>
+  );
+}
+
+function AdminHint() {
+  const t = useT();
+  return <div className="text-[11px] text-ink-500 mt-2">🔒 {t('settings.adminOnlyHint')}</div>;
+}
+
+/**
+ * Decision D1 toggle. Admins read the setting from GET /settings/ai; other
+ * roles see the value /health reports, with the switch disabled.
+ */
+function PendingDetectorsCard({ admin, onChanged }: { admin: boolean; onChanged: () => Promise<void> }) {
+  const { health, addNotification } = useAppStore();
+  const t = useT();
+  const reachable = !!health?.reachable;
+  const [ai, setAi] = useState<AiSettings | null>(null);
+  const [state, setState] = useState<'idle' | 'loading' | 'saving' | 'error'>('idle');
+
+  const load = useCallback(async () => {
+    if (!admin) return;
+    setState('loading');
+    try {
+      setAi(await getAiSettings());
+      setState('idle');
+    } catch (e) {
+      console.warn('GET /settings/ai failed:', describeApiError(e).detail);
+      setState('error');
+    }
+  }, [admin]);
+
+  useEffect(() => { if (reachable) load(); }, [reachable, load]);
+
+  const effective: AiSettings | null = ai ?? health?.aiSettings ?? null;
+  const on = !!effective?.showPendingDetectors;
+  const busy = state === 'loading' || state === 'saving';
+  const disabled = !admin || !reachable || !effective || busy;
+
+  const toggle = async () => {
+    if (disabled) return;
+    const requested = !on;
+    setState('saving');
+    try {
+      const saved = await putAiSettings(requested);
+      setAi(saved);
+      setState('idle');
+      addNotification({
+        type: saved.showPendingDetectors ? 'warning' : 'success',
+        title: t(saved.showPendingDetectors ? 'settings.pendingEnabledToast' : 'settings.pendingDisabledToast'),
+        message: t('settings.pendingToastBody'),
+      });
+      await onChanged();
+    } catch (e) {
+      setState('idle');
+      const message = e instanceof InvalidPayloadError ? t('settings.ipcErrPayload') : t(describeApiError(e).messageKey);
+      console.warn('PUT /settings/ai failed:', e instanceof Error ? e.message : e);
+      addNotification({ type: 'error', title: t('settings.aiSettingsSaveFailed'), message });
+    }
+  };
+
+  return (
+    <div className={`p-4 rounded-lg border ${on ? 'border-moderate/50 bg-moderate/10' : 'border-ink-800 bg-ink-850'}`}>
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="text-sm font-semibold text-ink-100">{t('settings.pendingTitle')}</div>
+            {on && <span className="severity-pill severity-moderate text-[9px]">⚠ {t('settings.pendingOnBadge')}</span>}
+          </div>
+          <div className="text-[11px] text-ink-400 mt-1 leading-relaxed">{t('settings.pendingDesc')}</div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={on}
+          aria-label={t('settings.pendingTitle')}
+          title={admin ? undefined : t('settings.adminOnly')}
+          disabled={disabled}
+          onClick={toggle}
+          className={`relative mt-0.5 inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors ${
+            on ? 'bg-moderate' : 'bg-ink-700'
+          } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+        >
+          <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+        </button>
+      </div>
+      {on && <div className="mt-3 text-[11px] text-moderate leading-relaxed">{t('settings.pendingOnWarning')}</div>}
+      <div className="mt-2 flex items-center gap-3 text-[10px] text-ink-500">
+        {effective && <span>{t('settings.aiSource', { source: t(AI_SOURCE_KEYS[effective.source]) })}</span>}
+        {busy && <span>{state === 'saving' ? t('settings.saving') : t('settings.loadingValue')}</span>}
+      </div>
+      {reachable && !effective && !busy && (
+        <div className="mt-2 flex items-center gap-2 text-[11px] text-ink-400">
+          <span>{t('settings.aiSettingsUnavailable')}</span>
+          {admin && <button onClick={load} className="btn-ghost !py-0.5 !px-2 text-[10px]">{t('common.retry')}</button>}
+        </div>
+      )}
+      {!admin && <AdminHint />}
+    </div>
+  );
+}
+
+/**
+ * Per-clinic model delivery (decision D3): the shell copies the picked zip to
+ * DATA_DIR/model_inbox/, the server verifies, test-decrypts and swaps it in
+ * (rolling back on any failure). Only the server ever touches the weights.
+ */
+function ModelBundleImport({ admin, onImported }: { admin: boolean; onImported: () => Promise<void> }) {
+  const { health, addNotification } = useAppStore();
+  const t = useT();
+  const lang = useLang();
+  const bridge = typeof window !== 'undefined' ? window.electronAPI : undefined;
+  const [busy, setBusy] = useState(false);
+  const [last, setLast] = useState<ModelImportResult | null>(null);
+  const reachable = !!health?.reachable;
+
+  const run = async () => {
+    if (!admin || !reachable || busy || !bridge?.importModelBundle) return;
+    setBusy(true);
+    try {
+      const staged = await bridge.importModelBundle({ dataDirHint: health?.dataDir ?? null });
+      if (!staged.ok) {
+        if (staged.canceled) return;
+        console.warn('model bundle staging failed:', staged.error, staged.detail);
+        addNotification({
+          type: 'error',
+          title: t('settings.importFailed'),
+          message: `${t('settings.importErrStaging')} ${t(ipcErrorKey(staged.error))}`,
+        });
+        return;
+      }
+      try {
+        const res = await importModelBundle(staged.path);
+        setLast(res);
+        addNotification({
+          type: 'success',
+          title: t('settings.importDone'),
+          message: t('settings.importDoneBody', { identity: res.identity, status: statusWord(res.status, lang) }),
+        });
+        await onImported();
+      } catch (e) {
+        const info = describeModelImportError(e);
+        console.warn('POST /models/import failed:', info.failure, info.httpStatus, info.reason);
+        const code = info.reason ? ` ${t('settings.reasonCode', { code: info.reason.slice(0, 120) })}` : '';
+        addNotification({ type: 'error', title: t('settings.importFailed'), message: `${t(info.messageKey)}${code}` });
+      }
+    } catch (e) {
+      // The bridge resolves {ok:false} by design; a rejection means the IPC itself broke.
+      console.error('model-bundle:import IPC failed:', e);
+      addNotification({ type: 'error', title: t('settings.importFailed'), message: t('settings.ipcErrInternal') });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="p-4 bg-ink-850 rounded-lg border border-ink-800">
+      <div className="text-sm font-semibold text-ink-100 mb-1">{t('settings.importBundle')}</div>
+      <div className="text-[11px] text-ink-500 mb-3 leading-relaxed">{t('settings.importBundleDesc')}</div>
+      {!bridge?.importModelBundle ? (
+        <div className="text-xs text-ink-400">{t('settings.importBundleNotElectron')}</div>
+      ) : (
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            onClick={run}
+            disabled={!admin || !reachable || busy}
+            title={admin ? undefined : t('settings.adminOnly')}
+            className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {busy ? t('settings.importing') : t('settings.importBundle')}
+          </button>
+          {!reachable && <span className="text-[11px] text-ink-500">{t('health.aiServerDown')}</span>}
+          {last && (
+            <span className="text-[11px] text-normal font-mono">
+              {t('settings.importDoneBody', { identity: last.identity, status: statusWord(last.status, lang) })}
+            </span>
+          )}
+        </div>
+      )}
+      {!admin && <AdminHint />}
     </div>
   );
 }
@@ -494,7 +701,74 @@ function AboutSection() {
             <div className="text-ink-200 font-mono">MONAI · TorchXRayVision</div>
           </div>
         </div>
+        <DiagnosticsExport />
       </div>
+    </div>
+  );
+}
+
+/**
+ * Support bundle: GET /diagnostics (admin; the server excludes PHI, previews,
+ * the DB, license.dat and keys) → native save dialog through the shell. In a
+ * plain browser (dev) the zip is handed to the browser's download instead.
+ */
+function DiagnosticsExport() {
+  const { currentUser, health, addNotification } = useAppStore();
+  const t = useT();
+  const admin = isAdminRole(currentUser?.role);
+  const reachable = !!health?.reachable;
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    if (!admin || !reachable || busy) return;
+    setBusy(true);
+    try {
+      const dl = await downloadDiagnostics();
+      const bridge = window.electronAPI;
+      if (bridge?.saveDiagnostics) {
+        const res = await bridge.saveDiagnostics(dl.bytes, dl.filename);
+        if (res.ok) {
+          addNotification({ type: 'success', title: t('about.diagnosticsSaved'), message: t('about.diagnosticsSavedBody', { path: res.path }) });
+        } else if (!res.canceled) {
+          console.warn('diagnostics:save failed:', res.error, res.detail);
+          addNotification({ type: 'error', title: t('about.diagnosticsFailed'), message: t(ipcErrorKey(res.error)) });
+        }
+      } else {
+        const url = URL.createObjectURL(new Blob([dl.bytes as BlobPart], { type: 'application/zip' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = dl.filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        addNotification({ type: 'success', title: t('about.diagnosticsSaved'), message: t('about.diagnosticsDownloadedBody', { name: dl.filename }) });
+      }
+    } catch (e) {
+      const message = e instanceof InvalidPayloadError ? t('settings.ipcErrPayload') : t(describeApiError(e).messageKey);
+      console.warn('diagnostics export failed:', e instanceof Error ? e.message : e);
+      addNotification({ type: 'error', title: t('about.diagnosticsFailed'), message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-4 p-4 bg-ink-850 rounded-lg border border-ink-800">
+      <div className="text-sm font-semibold text-ink-100 mb-1">{t('about.diagnostics')}</div>
+      <div className="text-[11px] text-ink-500 mb-3 leading-relaxed">{t('about.diagnosticsDesc')}</div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={run}
+          disabled={!admin || !reachable || busy}
+          title={admin ? undefined : t('settings.adminOnly')}
+          className="btn-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {busy ? t('about.exporting') : t('about.exportDiagnostics')}
+        </button>
+        {!reachable && <span className="text-[11px] text-ink-500">{t('health.aiServerDown')}</span>}
+      </div>
+      {!admin && <AdminHint />}
     </div>
   );
 }
