@@ -38,6 +38,13 @@
     rank-based AUC of the study mean probability. For 'new' also a threshold
     sweep (DESCRIPTIVE ONLY — the shipped threshold stays 0.50) and per-finding
     detection from the studies.csv 'label' column.
+    With --index (the batch index: patient_age / birth + study date), 'age_new':
+    does the model beat AGE ALONE (AUC of the age, patient-level bootstrap CI
+    of the difference), its AUC between patients within 5 years of age, the
+    age rule 'age >= T' at the model's sensitivity and flags per age band.
+    With --priority (report_priority.py output), 'priority_new': how the flag
+    treats studies with a priority finding (mass, recent infarct, ...) versus
+    the rest. Both describe the 'new' group only; neither is a gate.
 
   WHY
     When a batch gets its reports, the first question is how the frozen,
@@ -45,6 +52,11 @@
     That is the closest thing to a prospective validation this product has:
     it goes into the clinic documentation and it tells us whether a retrain is
     needed. It must run BEFORE the batch is used for training.
+    On new1 (2026-11-14) the shipped model was matched by patient age alone
+    (AUC 0.779 vs 0.776) and flagged 29 of 30 normal studies from the age of
+    40: most 'abnormal' reports describe age-typical change. age_new and
+    priority_new print that for every batch, so no model looks good by
+    learning age.
 
   HONEST SCOPE
     The model was frozen before these reports existed, so 'new' is a genuine
@@ -54,7 +66,7 @@
     pre-registered consecutive cohort.
 
   OUTPUT
-    --out JSON (kind 'prospective_eval', schema_version 1), written atomically,
+    --out JSON (kind 'prospective_eval', schema_version 2), written atomically,
     plus a compact summary on stdout. Counts only: no patient ids and no study
     folders, neither in the JSON nor on stdout.
 
@@ -62,7 +74,8 @@
     python scripts/eval_prospective.py --model models/brain_triage_finetuned \
         --set data/sets/<batch> --seen data/local_finetune_bin \
         --seen data/train_release_<tag> --holdout data/holdout_patients_v1.txt \
-        --matched data/<batch>_matched.csv \
+        --matched data/<batch>_matched.csv --index data/<batch>_index.csv \
+        --priority data/<batch>_priority.csv \
         --out data/release/<tag>/prospective_eval.json --device mps
 
   EXIT CODES
@@ -71,15 +84,18 @@
     2  unusable inputs: model dir missing / not loadable / without the
        abnormal class / with files that do not match its MANIFEST.json, set
        without PNG files, a study key under both classes or in both splits,
-       a --seen / --holdout / --matched path that is missing
+       a --seen / --holdout / --matched / --index / --priority path that is
+       missing (an existing but unusable --index / --priority is a note only)
 ================================================================================
 """
 from __future__ import annotations
 import argparse, csv, json, os, sys
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # scripts/ is not a package
@@ -91,7 +107,7 @@ G, Y, R, B, NC = '\033[0;32m', '\033[1;33m', '\033[0;31m', '\033[0;34m', '\033[0
 
 EXIT_OK = 0
 EXIT_UNUSABLE = 2
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2                             # 2: + age_new, priority_new (null without --index / --priority)
 
 SET_SPLITS = ('train', 'val')                  # a per-batch set: every study is scored
 SEEN_TRAIN_SPLITS = ('train', 'tune')          # the shipped model was fitted / epoch-selected on these
@@ -347,6 +363,238 @@ def same_date_keys(keys, table: dict[str, dict], matched: Path) -> tuple[Optiona
     return out, None
 
 
+# ------------------------------------------------------------------ age (--index) and priority findings (--priority)
+#
+# WHY: on new1 (2026-11-14) the shipped model was matched by PATIENT AGE ALONE (AUC 0.779 vs 0.776) and
+# flagged almost every study from the age of 40, because most 'abnormal' reports describe age-typical change.
+# These blocks print that comparison for every new batch, so no future model can look good by learning age,
+# and they count how the flag treats the ~10 % of studies with a finding that should move the read up the list.
+
+AGE_MATCH_WINDOW_YEARS = 5.0
+AGE_BANDS = (('under 40', 0.0, 40.0), ('40-59', 40.0, 60.0), ('60+', 60.0, float('inf')))
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_SEED = 20261114                      # fixed: the same batch must print the same interval every run
+MAX_PLAUSIBLE_AGE = 130.0
+_AGE_CODE_DIVISOR = {'Y': 1.0, 'M': 12.0, 'W': 52.0, 'D': 365.0}
+
+
+def parse_age(patient_age: str, birth_date: str = '', study_date: str = '') -> Optional[float]:
+    """Age in years at the study: DICOM AS 'NNNY' / 'NNNM' (/12) / 'NNNW' (/52) / 'NNND' (/365), else
+    birth date + study date (YYYYMMDD). None for anything else, a negative or an implausible (> 130) age."""
+    s = (patient_age or '').strip().upper()
+    if len(s) >= 2 and s[:-1].isdigit() and s[-1] in _AGE_CODE_DIVISOR:
+        years = int(s[:-1]) / _AGE_CODE_DIVISOR[s[-1]]
+        return years if years <= MAX_PLAUSIBLE_AGE else None
+    try:
+        b = datetime.strptime((birth_date or '').strip(), '%Y%m%d').date()
+        d = datetime.strptime((study_date or '').strip(), '%Y%m%d').date()
+    except ValueError:
+        return None
+    years = (d - b).days / 365.25
+    return years if 0.0 <= years <= MAX_PLAUSIBLE_AGE else None
+
+
+def load_index_ages(index: Path) -> tuple[Optional[dict[str, float]], Optional[str]]:
+    """study_folder → age in years from a batch index csv (the first row of a folder with a usable age
+    wins). (None, note) when the file is unreadable or lacks the columns: never a crash."""
+    try:
+        with open(index, encoding='utf-8-sig', newline='') as fh:      # -sig: a csv re-saved by Excel has a BOM
+            reader = csv.DictReader(fh)
+            rows = list(reader)
+            cols = set(reader.fieldnames or [])
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        return None, f'--index unreadable ({type(e).__name__}): age_new omitted'
+    if 'study_folder' not in cols or not ({'patient_age'} <= cols or {'patient_birth_date', 'study_date'} <= cols):
+        return None, ('--index has no study_folder column or neither patient_age nor patient_birth_date + '
+                      'study_date: age_new omitted')
+    ages: dict[str, float] = {}
+    for r in rows:
+        folder = r.get('study_folder') or ''
+        if not folder or folder in ages:
+            continue
+        a = parse_age(r.get('patient_age') or '', r.get('patient_birth_date') or '', r.get('study_date') or '')
+        if a is not None:
+            ages[folder] = a
+    return ages, None
+
+
+def load_priority(priority: Path) -> tuple[Optional[dict[str, tuple[str, list[str]]]], Optional[str],
+                                           Optional[str]]:
+    """study_folder → (priority 'yes' | 'no' | '', [reasons]) from a report_priority.py file, plus its
+    rules_version. A folder listed twice keeps the strongest answer (yes > no > ''), so a duplicate can never
+    hide a priority finding. (None, None, note) when unreadable or without the columns."""
+    try:
+        with open(priority, encoding='utf-8-sig', newline='') as fh:   # -sig: a csv re-saved by Excel has a BOM
+            reader = csv.DictReader(fh)
+            rows = list(reader)
+            cols = set(reader.fieldnames or [])
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        return None, None, f'--priority unreadable ({type(e).__name__}): priority_new omitted'
+    if not {'study_folder', 'priority'} <= cols:
+        return None, None, '--priority has no study_folder / priority column: priority_new omitted'
+    rank = {'yes': 2, 'no': 1, '': 0}
+    out: dict[str, tuple[str, list[str]]] = {}
+    versions = set()
+    for r in rows:
+        folder = r.get('study_folder') or ''
+        if not folder:
+            continue
+        p = (r.get('priority') or '').strip().lower()
+        p = p if p in rank else ''
+        reasons = [x.strip().lower() for x in (r.get('reasons') or '').split(';') if x.strip()]
+        if folder not in out or rank[p] > rank[out[folder][0]]:
+            out[folder] = (p, reasons)
+        v = (r.get('rules_version') or '').strip()
+        if v:
+            versions.add(v)
+    return out, (','.join(sorted(versions)) or None), None
+
+
+def _auc_np(scores: np.ndarray, labels: np.ndarray) -> Optional[float]:
+    """The same mid-rank AUC as auc(), vectorised for the bootstrap (labels: bool, True = positive)."""
+    n1 = int(labels.sum())
+    n0 = len(labels) - n1
+    if not n1 or not n0:
+        return None
+    _, inv, counts = np.unique(scores, return_inverse=True, return_counts=True)
+    mid = np.cumsum(counts) - (counts - 1) / 2.0
+    return float((mid[inv][labels].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
+
+
+def age_matched_auc(pos: list[tuple[float, float]], neg: list[tuple[float, float]],
+                    window: float = AGE_MATCH_WINDOW_YEARS) -> tuple[Optional[float], int]:
+    """(AUC, n pairs) over abnormal / normal pairs of (score, age) whose ages differ by <= window years:
+    how often the model ranks the abnormal study higher BETWEEN PATIENTS OF SIMILAR AGE (ties 1/2)."""
+    wins = 0.0
+    n = 0
+    for sp, ap in pos:
+        for sn, an in neg:
+            if abs(ap - an) <= window:
+                n += 1
+                wins += 1.0 if sp > sn else 0.5 if sp == sn else 0.0
+    return (wins / n if n else None), n
+
+
+def auc_difference_ci(rows: list[tuple[str, float, float, bool]], resamples: int = BOOTSTRAP_RESAMPLES,
+                      seed: int = BOOTSTRAP_SEED) -> Optional[list[float]]:
+    """95 % percentile interval of AUC(model) - AUC(age) over rows (patient, score, age, is_abnormal),
+    resampling PATIENTS with replacement (all studies of a drawn patient come along: studies of one patient
+    are not independent). Resamples without both classes are skipped. None with < 2 patients per class."""
+    by_pid: dict[str, list[int]] = defaultdict(list)
+    for i, (pid, _, _, _) in enumerate(rows):
+        by_pid[pid].append(i)
+    pids = sorted(by_pid)
+    if sum(1 for p in pids if any(rows[i][3] for i in by_pid[p])) < 2 or \
+            sum(1 for p in pids if any(not rows[i][3] for i in by_pid[p])) < 2:
+        return None
+    score = np.array([r[1] for r in rows], dtype=float)
+    age = np.array([r[2] for r in rows], dtype=float)
+    lab = np.array([r[3] for r in rows], dtype=bool)
+    groups = [np.array(by_pid[p], dtype=int) for p in pids]
+    rng = np.random.default_rng(seed)
+    diffs = []
+    for _ in range(resamples):
+        idx = np.concatenate([groups[j] for j in rng.integers(0, len(groups), len(groups))])
+        a_m, a_a = _auc_np(score[idx], lab[idx]), _auc_np(age[idx], lab[idx])
+        if a_m is not None and a_a is not None:
+            diffs.append(a_m - a_a)
+    if not diffs:
+        return None
+    lo, hi = np.percentile(diffs, [2.5, 97.5])
+    return [float(lo), float(hi)]
+
+
+def _median(v: list[float]) -> Optional[float]:
+    return float(np.median(v)) if v else None
+
+
+def age_block(studies: esl.StudyProbs, table: dict[str, dict], ages: dict[str, float],
+              abnormal_class: str = 'abnormal') -> dict:
+    """The 'age_new' block over one group (the never-seen studies) at the shipped protocol: does the model
+    beat age alone, and does it still rank abnormal above normal between patients of similar age?"""
+    decide = esl.gate_fn(esl.PROTOCOL_AGGREGATION, esl.PROTOCOL_THRESHOLD)
+    rows: list[tuple[str, float, float, bool, bool]] = []    # (patient, score, age, is_abnormal, flagged)
+    n_without = 0
+    for (key, cls), probs in studies.items():
+        row = table.get(key)
+        a = ages.get(row['study_folder']) if row is not None else None
+        if a is None:
+            n_without += 1
+            continue
+        rows.append((esl.patient_id_of(key), study_mean(probs), a, cls == abnormal_class, decide(probs)))
+    pos = [r for r in rows if r[3]]
+    neg = [r for r in rows if not r[3]]
+    am, n_pairs = age_matched_auc([(r[1], r[2]) for r in pos], [(r[1], r[2]) for r in neg])
+
+    model_sens = _ratio(sum(1 for r in pos if r[4]), len(pos))
+    rule = None
+    if model_sens is not None:
+        best = 0
+        for t in range(0, int(max(r[2] for r in rows)) + 2):
+            if sum(1 for r in pos if r[2] >= t) / len(pos) >= model_sens:
+                best = t
+        rule = {'age_from': best,
+                'sensitivity': sum(1 for r in pos if r[2] >= best) / len(pos),
+                'specificity': _ratio(sum(1 for r in neg if r[2] < best), len(neg))}
+
+    bands = []
+    for name, lo, hi in AGE_BANDS:
+        bp = [r for r in pos if lo <= r[2] < hi]
+        bn = [r for r in neg if lo <= r[2] < hi]
+        abn_flagged = sum(1 for r in bp if r[4])
+        norm_flagged = sum(1 for r in bn if r[4])
+        bands.append({'band': name, 'n_abnormal': len(bp), 'abnormal_flagged': abn_flagged,
+                      'n_normal': len(bn), 'normal_flagged': norm_flagged,
+                      'sensitivity': _ratio(abn_flagged, len(bp)),
+                      'specificity': _ratio(len(bn) - norm_flagged, len(bn))})
+    return {'n_with_age': len(rows), 'n_without_age': n_without,
+            'median_age': {'normal': _median([r[2] for r in neg]), 'abnormal': _median([r[2] for r in pos])},
+            'auc_model': auc([r[1] for r in pos], [r[1] for r in neg]),
+            'auc_age_alone': auc([r[2] for r in pos], [r[2] for r in neg]),
+            'auc_difference_ci95': auc_difference_ci([r[:4] for r in rows]),
+            'auc_age_matched': am, 'age_matched_pairs': n_pairs,
+            'age_match_window_years': int(AGE_MATCH_WINDOW_YEARS),
+            'age_rule_at_model_sensitivity': rule,
+            'bands': bands,
+            'normal_reports_aged_60_plus': sum(1 for r in neg if r[2] >= 60.0)}
+
+
+def priority_block(studies: esl.StudyProbs, table: dict[str, dict], prio: dict[str, tuple[str, list[str]]],
+                   rules_version: Optional[str], ages: Optional[dict[str, float]]) -> dict:
+    """The 'priority_new' block: how the shipped flag treats studies whose report carries a priority
+    finding ('yes') versus the rest ('no'). Unknown ('' or no row) studies are counted and left out.
+    by_reason counts the 'yes' studies under each rule family that fired."""
+    decide = esl.gate_fn(esl.PROTOCOL_AGGREGATION, esl.PROTOCOL_THRESHOLD)
+    yes: list[tuple[float, Optional[float], bool]] = []
+    no: list[tuple[float, Optional[float], bool]] = []
+    n_unknown = 0
+    by_reason: dict[str, dict] = {}
+    for (key, _), probs in studies.items():
+        row = table.get(key)
+        p, reasons = prio.get(row['study_folder'], ('', [])) if row is not None else ('', [])
+        if p not in ('yes', 'no'):
+            n_unknown += 1
+            continue
+        a = ages.get(row['study_folder']) if ages is not None else None
+        flagged = decide(probs)
+        (yes if p == 'yes' else no).append((study_mean(probs), a, flagged))
+        if p == 'yes':
+            for reason in dict.fromkeys(reasons):
+                e = by_reason.setdefault(reason, {'n': 0, 'flagged': 0})
+                e['n'] += 1
+                e['flagged'] += int(flagged)
+    age_auc = None
+    if ages is not None:
+        age_auc = auc([a for _, a, _ in yes if a is not None], [a for _, a, _ in no if a is not None])
+    return {'rules_version': rules_version,
+            'n_priority': len(yes), 'priority_flagged': sum(1 for r in yes if r[2]),
+            'n_other': len(no), 'other_flagged': sum(1 for r in no if r[2]),
+            'n_unknown': n_unknown,
+            'auc_model': auc([s for s, _, _ in yes], [s for s, _, _ in no]),
+            'auc_age_alone': age_auc,
+            'by_reason': dict(sorted(by_reason.items(), key=lambda kv: (-kv[1]['n'], kv[0])))}
+
+
 # ------------------------------------------------------------------ evaluation
 
 def verify_model_pin(model_dir: Path) -> bool:
@@ -366,8 +614,10 @@ def verify_model_pin(model_dir: Path) -> bool:
 
 
 def evaluate(model_dir, set_dir, seen=(), holdout=None, matched=None, device: str = 'cpu',
-             abnormal_class: str = 'abnormal', predictor=None) -> dict:
-    """The full prospective evaluation → the JSON payload. Raises UnusableInput."""
+             abnormal_class: str = 'abnormal', predictor=None, index=None, priority=None) -> dict:
+    """The full prospective evaluation → the JSON payload. Raises UnusableInput.
+    index / priority (optional) add the 'age_new' / 'priority_new' blocks; an unusable file there is a
+    note and a null block (informational, never a reason to refuse the evaluation)."""
     model_dir, set_dir = Path(model_dir), Path(set_dir)
     notes: list[str] = []
     if not set_dir.is_dir():
@@ -381,6 +631,10 @@ def evaluate(model_dir, set_dir, seen=(), holdout=None, matched=None, device: st
         holdout_ids = esl.load_ids(Path(holdout))
     if matched is not None and not Path(matched).is_file():
         raise UnusableInput(f'--matched {matched}: file not found')
+    if index is not None and not Path(index).is_file():
+        raise UnusableInput(f'--index {index}: file not found')
+    if priority is not None and not Path(priority).is_file():
+        raise UnusableInput(f'--priority {priority}: file not found')
     seen_train, seen_val, seen_batch, seen_notes = load_seen_patients(seen)
     notes += seen_notes
     if not seen:
@@ -438,6 +692,33 @@ def evaluate(model_dir, set_dir, seen=(), holdout=None, matched=None, device: st
         findings, n_unmapped = findings_table(by_group['new'], table, abnormal_class)
         if n_unmapped:
             notes.append(f"{n_unmapped} 'new' study(ies) have no studies.csv row: left out of findings_new")
+    ages = None
+    age_new = None
+    if index is None:
+        notes.append('no --index given: age_new omitted (the model is not compared with age alone)')
+    else:
+        ages, note = load_index_ages(Path(index))
+        if note:
+            notes.append(note)
+        elif table is None:
+            ages = None
+            notes.append('age_new omitted: studies.csv is missing or unusable (no study key → study folder map)')
+        else:
+            age_new = age_block(by_group['new'], table, ages, abnormal_class)
+            if age_new['n_without_age']:
+                notes.append(f"{age_new['n_without_age']} 'new' study(ies) have no usable age in --index: "
+                             'left out of age_new')
+    priority_new = None
+    if priority is None:
+        notes.append('no --priority given: priority_new omitted')
+    else:
+        prio, rules_version, note = load_priority(Path(priority))
+        if note:
+            notes.append(note)
+        elif table is None:
+            notes.append('priority_new omitted: studies.csv is missing or unusable (no study key → study folder map)')
+        else:
+            priority_new = priority_block(by_group['new'], table, prio, rules_version, ages)
     if not by_group['new']:
         notes.append("group 'new' is empty: every scored patient was seen by this model or is in the holdout")
     notes.append('threshold_sweep_new is descriptive only: the shipped decision threshold stays '
@@ -452,10 +733,14 @@ def evaluate(model_dir, set_dir, seen=(), holdout=None, matched=None, device: st
             'inputs': {'set': str(set_dir), 'seen': [str(s) for s in seen],
                        'holdout': str(holdout) if holdout is not None else None,
                        'matched': str(matched) if matched is not None else None,
+                       'index': str(index) if index is not None else None,
+                       'priority': str(priority) if priority is not None else None,
                        'n_png': n_png, 'n_studies': len(studies)},
             'groups': groups,
             'threshold_sweep_new': threshold_sweep(by_group['new'], abnormal_class),
             'findings_new': findings,
+            'age_new': age_new,
+            'priority_new': priority_new,
             'notes': notes}
 
 
@@ -471,6 +756,11 @@ def write_json_atomic(out: Path, payload: dict) -> None:
 
 def _f(v: Optional[float]) -> str:
     return '  —  ' if v is None else f'{v:.3f}'
+
+
+def _age(v: Optional[float]) -> str:
+    """An age in years for the printed summary: whole years are enough to read."""
+    return '—' if v is None else f'{v:.0f}'
 
 
 def _ci(ci) -> str:
@@ -510,6 +800,33 @@ def print_summary(payload: dict) -> None:
                 print(f"    {name:28s} detected        {e['detected']:4d} / {e['total']:<4d} ({e['rate']:.2f})")
             else:
                 print(f"    {name:28s} wrongly flagged {e['wrongly_flagged']:4d} / {e['total']:<4d} ({e['rate']:.2f})")
+    a = payload.get('age_new')
+    if a:
+        ci = a['auc_difference_ci95']
+        ci_s = '[ —  ]' if ci is None else f'[{ci[0]:+.3f} to {ci[1]:+.3f}]'
+        print(f"\n  {B}age (never-seen){NC}  {a['n_with_age']} studies with an age, {a['n_without_age']} without;"
+              f"  median age normal {_age(a['median_age']['normal'])} / abnormal {_age(a['median_age']['abnormal'])}")
+        print(f"    AUC model {_f(a['auc_model'])}   age alone {_f(a['auc_age_alone'])}"
+              f"   model minus age 95% CI {ci_s}")
+        print(f"    AUC between patients within {a['age_match_window_years']} years of age "
+              f"{_f(a['auc_age_matched'])} ({a['age_matched_pairs']} pairs)")
+        rule = a['age_rule_at_model_sensitivity']
+        if rule:
+            print(f"    the rule 'age >= {rule['age_from']}' alone: sensitivity {_f(rule['sensitivity'])}"
+                  f"  specificity {_f(rule['specificity'])} (at the model's sensitivity)")
+        for b in a['bands']:
+            print(f"    {b['band']:9s} abnormal flagged {b['abnormal_flagged']:4d} / {b['n_abnormal']:<4d}"
+                  f" normal flagged {b['normal_flagged']:4d} / {b['n_normal']:<4d}"
+                  f" sens {_f(b['sensitivity'])}  spec {_f(b['specificity'])}")
+        print(f"    normal reports aged 60+: {a['normal_reports_aged_60_plus']}")
+    p = payload.get('priority_new')
+    if p:
+        print(f"\n  {B}priority findings (never-seen){NC}  rules {p['rules_version'] or '—'}")
+        print(f"    priority flagged {p['priority_flagged']:4d} / {p['n_priority']:<4d}"
+              f"  other flagged {p['other_flagged']:4d} / {p['n_other']:<4d}  unknown {p['n_unknown']}")
+        print(f"    AUC priority vs other: model {_f(p['auc_model'])}  age alone {_f(p['auc_age_alone'])}")
+        for reason, e in p['by_reason'].items():
+            print(f"    {reason:28s} flagged {e['flagged']:4d} / {e['n']}")
     for note in payload['notes']:
         print(f"  {Y}note:{NC} {note}")
 
@@ -525,6 +842,10 @@ def main(argv=None) -> int:
                          'set (studies.csv, no dataset_manifest.json) counts as seen as a whole; repeatable')
     ap.add_argument('--holdout', default=None, help='locked holdout patient ids, one per line')
     ap.add_argument('--matched', default=None, help='matched.csv of the batch (enables new_same_date)')
+    ap.add_argument('--index', default=None,
+                    help='<batch>_index.csv (patient_age / birth + study date): enables age_new')
+    ap.add_argument('--priority', default=None,
+                    help='<batch>_priority.csv from report_priority.py: enables priority_new')
     ap.add_argument('--out', required=True, help='prospective_eval.json path')
     ap.add_argument('--device', default='mps')
     ap.add_argument('--abnormal-class', default='abnormal')
@@ -532,7 +853,8 @@ def main(argv=None) -> int:
 
     try:
         payload = evaluate(args.model, args.set, seen=args.seen, holdout=args.holdout, matched=args.matched,
-                           device=args.device, abnormal_class=args.abnormal_class)
+                           device=args.device, abnormal_class=args.abnormal_class,
+                           index=args.index, priority=args.priority)
     except UnusableInput as e:
         print(f"  {R}✗ {e}{NC}")
         return EXIT_UNUSABLE

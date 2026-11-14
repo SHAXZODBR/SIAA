@@ -53,10 +53,13 @@ Qaror bir necha soniya oladi va erkin matn talab qilmaydi. Uni **baholash jurnal
 ```
 study_id | date | radiologist | modality | ai_triage_flag (yes/no) | triage_decision (agree/disagree/na) |
 tumor_flag (yes/no/none) | tumor_decision (agree/disagree/na) | report_finding_class (normal/tumor/stroke/atrophy/hemorrhage/other) |
+age_band (under 40 / 40-59 / 60+) | priority_finding (yes/no) |
 draft_used (yes/no) | time_to_read_min | model_fingerprint | comment (optional, no PHI)
 ```
 
 «Ahamiyatli patologiya» ta’rifini pilot rahbari oldindan belgilaydi (tavsiya: davolash taktikasini o‘zgartiradigan yoki kuzatuvni talab qiladigan har qanday topilma; tasodifiy normal variantlar norma hisoblanadi). Qaror bo‘yicha kelishmovchiliklarni pilot rahbari hal qiladi; uning qarori yakuniy va qayd etiladi.
+
+Yana ikki ustun natijani to‘g‘ri talqin qilishga yordam beradi. **age_band**: tekshiruv kunidagi bemorning yosh guruhi (tug‘ilgan sana emas, guruh). **priority_finding**: imzolangan xulosada ushbu tekshiruvni boshqalardan oldin o‘qishni talab qiladigan topilma — hajmli hosila, yaqinda o‘tkazilgan infarkt, qon quyilishi, demiyelinizatsiya, chora talab qiladigan gidrosefaliya yoki xulosa shoshilinch qo‘shimcha tekshiruvga yuboradigan har qanday topilma — tasvirlangan bo‘lsa *yes*; surunkali yoshga xos o‘zgarishlar (mikroangiopatiya, yengil atrofiya), tasodifiy variantlar va normal tekshiruvlar uchun *no*. Yetkazib beruvchining o‘z tekshiruvida belgi bemor yoshiga kuchli bog‘liq bo‘lgan va 40 yoshdan boshlab deyarli har bir tekshiruvga qo‘yilgan, shuning uchun faqat umumiy ko‘rsatkichlar vositani aslidagidan yaxshiroq ko‘rsatishi mumkin.
 
 ## 6. Baholangan test to‘plami
 
@@ -74,6 +77,8 @@ draft_used (yes/no) | time_to_read_min | model_fingerprint | comment (optional, 
 - **Sezgirlik** = belgilangan ÷ (barcha patologik, baholangan); **spetsifiklik** = belgilanmagan ÷ (barcha normal, baholangan); har biri **95 % ishonch oralig‘i** bilan (Wilson usuli).
 - Kuzatilgan tarqalganlikdagi ijobiy va salbiy bashorat qiymati (PPV, NPV); umumiy belgilash darajasi.
 - Yetkazib beruvchining tasdiqlangan ko‘rsatkichlari (178 ta mahalliy bemorda sezgirlik 0,90, spetsifiklik 0,47) va reliz darvozasi pollari (0,85 / 0,40) bilan solishtirish: pilot ishonch oralig‘ining **quyi chegarasi** har bir poldan yuqori ekanini ko‘rsating.
+- Xuddi shu sezgirlik va spetsifiklik **har bir yosh guruhida** (40 yoshgacha, 40–59, 60 va undan katta) hamda ularning yonida o‘sha tekshiruvlarda «40 va undan katta yoshdagi har bir bemorni belgilash» oddiy qoidasining natijasi. AI belgisi ustuvorlikni belgilashga faqat shu qoidadan yaxshiroq bo‘lgan joyda yordam beradi.
+- **Ustuvor topilmalar:** *priority_finding = yes* bo‘lgan tekshiruvlar orasida belgilanganlar ulushi va qolgan barcha tekshiruvlar orasida belgilanganlar ulushi. Tavsifiy: triaj detektori bu farqni ajratishga o‘qitilmagan.
 
 ### 7.2 Ikkilamchi (tavsifiy)
 
@@ -124,6 +129,8 @@ Dasturiy ta’minot versiyasi: 1.1.0   Triaj modeli barmoq izi: ____________   O
 1. Kiritish: tahlil qilingan tekshiruvlar ___ ; baholangan ___ (normal ___ / patologik ___); qo‘llanilmaydi ___ (sabablari)
 2. Triaj detektori: sezgirlik ___ (95 % IO ___–___); spetsifiklik ___ (95 % IO ___–___); PPV ___; NPV ___; belgilash darajasi ___
    Tasdiqlangan ko‘rsatkichlar / darvoza pollari bilan solishtirish: ____________
+   Yosh guruhlari bo‘yicha (40 gacha | 40–59 | 60+): sezgirlik ___ | ___ | ___ ; spetsifiklik ___ | ___ | ___ ; «40 va undan katta» qoidasi: sezgirlik ___ spetsifiklik ___
+   Ustuvor topilmalar: belgilangan ___ / ___ ; qolgan tekshiruvlar: belgilangan ___ / ___
 3. O‘sma detektori (tavsifiy): roziman ___ / rozi emasman ___ ; normal tekshiruvlarda yolg‘on belgilar ___
 4. Hisobot qoralamalari: ishlatilgan ___% ; tahrirlangan ___% ; odatiy tuzatishlar: ____________
 5. O‘qish vaqti: boshlang‘ich mediana ___ daq. (IQR ___) ; pilot medianasi ___ daq. (IQR ___)

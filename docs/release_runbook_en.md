@@ -282,9 +282,43 @@ it has never seen?** It runs after `build` and **before** `combine` / `train` us
   never `new`), `all`, and `new_same_date` (the `new` studies whose report and images are from the same
   day: the cleanest reference label). A patient of an earlier set counts as seen even if the shipped
   model never trained on that set — the `new` group errs on the safe side.
+- The stage runs two commands. First `scripts/report_priority.py` reads the matched reports and writes
+  `data/<batch>_priority.csv`: for each study, whether the report carries a **priority finding** — a
+  finding that should move the read up the list (mass, recent infarct, haemorrhage, demyelination, true
+  hydrocephalus, mass effect, vascular lesion, infection, urgent referral or contrast advised). It reads
+  the reports of the release's modality (`--modality`, MR by default); with `--modality any` it reads MR
+  reports only, so the priority lines then cover MR studies only. Then
+  `scripts/eval_prospective.py` also gets `--index data/<batch>_index.csv` (patient ages) and
+  `--priority data/<batch>_priority.csv`.
 - Output: `data/release/<tag>/prospective_eval.json` (`kind: prospective_eval`), the full table in
   `logs/prospective.log`, and one line after the stage:
-  `prospective, never-seen patients: n N studies · sensitivity x · specificity y`.
+  `prospective, never-seen patients: n N studies · sensitivity x · specificity y · age alone AUC a (model m; model − age [lo, hi]), age-matched p · priority findings flagged k/K, others o/O`.
+  The AUCs have three decimals (0.779 against 0.776 must not read as a tie); `[lo, hi]` is the 95 %
+  interval of the difference model minus age.
+- **Why the age lines.** On 14 November 2026, on 518 never-seen studies, the shipped model was matched
+  by patient age alone (AUC 0.779 against 0.776); from the age of 40 almost every study was flagged.
+  The stage now prints this for every new batch:
+  - `age alone AUC` — how well the patient's age by itself separates abnormal from normal reports;
+    `model` — the model's AUC on the same studies. `age-matched` — between two patients of similar age
+    (within 5 years), how often the model ranks the abnormal study higher (0.5 = chance).
+  - In the JSON (`age_new`): the 95 % interval of the difference model minus age, the age rule that
+    reaches the model's sensitivity ("age ≥ T") with its specificity, and the flag rates by age band
+    (under 40, 40–59, 60+).
+  - `priority findings flagged k/K` — how many studies with a priority finding the shipped threshold
+    flags; `others o/O` — how many of all other studies it flags too. In the JSON: `priority_new`,
+    with counts per finding (`by_reason`).
+- **A model that does not beat the age baseline is not evidence of detection.** If the model's AUC is
+  not clearly above the age-alone AUC (the interval of the difference includes 0), or the age-matched
+  value is close to 0.5, the model has mostly learned age. Say so in the hand-over notes; do not quote
+  its sensitivity as detection.
+- **The priority rules are provisional** (`rules-v2`): keyword rules on the report conclusion, not checked
+  against a radiologist yet. Read the priority counts as an estimate. The version is in the
+  `rules_version` column of `data/<batch>_priority.csv` and in `priority_new.rules_version`; do not
+  compare counts made with different versions.
+- **The index table is required.** Without `data/<batch>_index.csv` (written by `index`) the guard
+  before `prospective` stops the stage before anything runs (`… missing (index stage output …)`):
+  restore the file, or re-run the index stage (`--from index`, needs the drive). An index that has no
+  age columns is not an error: the age lines are then empty and `notes` says why.
 - **Read the headline group `new`** (`groups.new` in the JSON): `n_studies` / `n_patients`, `tp fn tn fp`,
   `sensitivity` with `sensitivity_ci95`, `specificity` with `specificity_ci95`, `balanced_accuracy`,
   `ppv`, `npv`, `flag_rate`, `prevalence`, `auc`. Look at the width of the intervals before the point
@@ -297,6 +331,11 @@ it has never seen?** It runs after `build` and **before** `combine` / `train` us
   old model on them. A release promoted by an older version of the script, before this stage existed,
   has no `prospective` record: `run … --resume` finishes it (`bump`, `bundle`) and `run` / `status`
   show `prospective skipped (promoted before this stage existed)`.
+- **A prospective result from before the age lines** (its JSON has no `age_new` / `priority_new`) is not
+  reused silently: `run … --resume` runs the stage again and prints
+  `stage prospective re-run: recorded before the age baseline and the priority-finding counts existed`;
+  `status` marks it too. Only the shipped model is scored again — nothing after it re-runs because of
+  this. After `promote` it stays frozen as it is.
 - **These numbers — not the gate's — describe real-world performance on new patients.** The gate set is
   reused release after release and the candidate is chosen against it; the prospective model was
   frozen before these reports existed. Honest limits: the reference labels come from the routine
@@ -314,7 +353,7 @@ it has never seen?** It runs after `build` and **before** `combine` / `train` us
 | 2 | `label` | `scripts/label_reports.py --reports … --out data/<batch>_labels.csv [--import-llm-labels <jsonl>]` then `… --benchmark` | 9-class + abnormal distribution, `needs_review` share; benchmark agreement + confusion vs the 894-patient reference | benchmark agreement on `abnormal` ≥ 0.90 (exit non-zero otherwise); `needs_review` < 15 %; `normal` a sizeable share |
 | 3 | `match` | `scripts/match_images_to_reports.py [--images …] --index … --labels … --out data/<batch>_matched.csv` | matched / unmatched brain studies, `match_quality` histogram | most brain studies matched; quality mostly "same id + same date"; a few "only report for patient" |
 | 4 | `build` | `scripts/build_training_set.py … --out data/sets/<batch> --mode binary --abnormal-col abnormal --skip-needs-review --modality MR` | slices written per class, the modality rule (rows dropped, studies excluded), `studies.csv` | ≈ 5 slices per study; `studies.csv` rows = matched brain studies minus `needs_review` minus rows dropped as CT; head CT counted as excluded, never as slices |
-| 5 | `prospective` | `scripts/eval_prospective.py --model models/brain_triage_finetuned --set data/sets/<batch> --seen <earlier sets> [--seen data/train_release_<previous tag>] --holdout data/holdout_patients_v1.txt --matched data/<batch>_matched.csv --out data/release/<tag>/prospective_eval.json --device mps` | `NEW PATIENTS (never seen by this model)` with sensitivity / specificity and 95 % CI, a table per group, a threshold sweep (descriptive) | `prospective_eval.json` written; `new` group not empty; numbers read and kept (informational, never a gate — section 4d) |
+| 5 | `prospective` | `scripts/report_priority.py --matched data/<batch>_matched.csv --labels data/<batch>_labels.csv --out data/<batch>_priority.csv [--modality MR]`, then `scripts/eval_prospective.py --model models/brain_triage_finetuned --set data/sets/<batch> --seen <earlier sets> [--seen data/train_release_<previous tag>] --holdout data/holdout_patients_v1.txt --matched data/<batch>_matched.csv --index data/<batch>_index.csv --priority data/<batch>_priority.csv --out data/release/<tag>/prospective_eval.json --device mps` | priority-finding counts; `NEW PATIENTS (never seen by this model)` with sensitivity / specificity and 95 % CI, the age-alone AUC and the priority-finding lines, a table per group, a threshold sweep (descriptive) | `data/<batch>_priority.csv` and `prospective_eval.json` written; `new` group not empty; model AUC compared with the age-alone AUC; numbers read and kept (informational, never a gate — section 4d) |
 | 6 | `combine` | `scripts/combine_training_sets.py --sets data/local_finetune_bin … data/sets/<batch> --holdout data/holdout_patients_v1.txt [--train-lock …] --out data/train_release_<tag>` | per-batch counts, class counts per split (train / val / tune), label conflicts (last set wins), train-locked counts, holdout check | **0** train/val/tune patient overlap; all 178 holdout patients in `val`; one class per patient; `tune/` present; `dataset_manifest.json` written |
 | 7 | `train` | `training/finetune_brain_classifier.py … --base-model models/brain_triage_finetuned --epochs 12 --device mps --select-split tune --output models/brain_triage_candidate_<tag>` | per-epoch loss + accuracy; best epoch chosen on `tune/`, never on `val` (the gate set) | loss falls then plateaus; no NaN; `training_metrics.json` written with `checkpoint_selection.split = tune` |
 | 8 | `gate` | `scripts/eval_study_level.py --model <candidate> --data data/train_release_<tag>/val --write-manifest --min-sens 0.85 --min-spec 0.40 --compare-with models/brain_triage_finetuned` | study-level sens/spec with 95 % CI for candidate and old model, `promotion` verdict, holdout coverage | gate **passed**, `promotion.promote = true`, `protocol` = production (mean of 5 central slices @0.50, registry predictor), `holdout_covered = true`, `MANIFEST.json` written next to the candidate |
@@ -328,7 +367,8 @@ Guard rails the orchestrator enforces **before `train`**: label benchmark passed
 `tune/` present (the trainer runs with `--select-split tune`; a missing `tune/` stops the release),
 ≥ 20 GB free (the drive is not checked: `train` reads only the local release set). **Before
 `prospective`**: the release set the shipped model was trained on (if any) is present and unchanged, so
-it is passed as `--seen` — or `--train-lock` names it as a folder (section 4d). **Before `combine`**: the
+it is passed as `--seen` — or `--train-lock` names it as a folder (section 4d); a missing
+`data/<batch>_index.csv` stops the stage too (the age baseline needs the patient ages). **Before `combine`**: the
 same set is present and unchanged (its patients are locked to `train`), or `--train-lock` is given.
 **Before `bundle`**: gate passed and promotion true in the promoted
 model, plus every rule `promote_model.py` enforces (release floors, production protocol, release val
@@ -516,7 +556,7 @@ for each clinic in `data/licenses/ledger.csv`.
 ## 9. Resume, status and troubleshooting
 
 - `/Users/shakhzodbtr/venv/bin/python scripts/release_pipeline.py status --batch <batch>` — table of stages (pending / running / done / archived / failed) with log paths, guard verdicts and the gate verdict; the tag comes from `data/release/LATEST`.
-- `--resume` skips a stage recorded as `done` whose outputs exist and whose inputs are unchanged (sha256 of the input files: `studies.csv` of every combined set — for a legacy set without one, its sorted file listing, hidden files such as Finder's `.DS_Store` ignored — the holdout and train-lock files, `dataset_manifest.json`, the candidate weights, the LLM-label JSONL; for `parse` also the order of the report sources when there are several, for `build` the `--modality` value, for `prospective` the `MANIFEST.json` of the shipped model, for `train` the `--base-model` and `--epochs` values); otherwise the stage re-runs.
+- `--resume` skips a stage recorded as `done` whose outputs exist and whose inputs are unchanged (sha256 of the input files: `studies.csv` of every combined set — for a legacy set without one, its sorted file listing, hidden files such as Finder's `.DS_Store` ignored — the holdout and train-lock files, `dataset_manifest.json`, the candidate weights, the LLM-label JSONL; for `parse` also the order of the report sources when there are several, for `build` the `--modality` value, for `prospective` the `MANIFEST.json` of the shipped model and the batch's labels and index tables, for `train` the `--base-model` and `--epochs` values); otherwise the stage re-runs.
 - `promote` **moves** the candidate folder into `models/brain_triage_finetuned`. It records `archived_candidate` in `state.json` and marks `train` and `gate` as `archived` (= done), so a resume after promote runs only what is left (`bump`, `bundle`). A stage whose outputs are gone also counts as done when a later stage is done, unless `--from` / `--only` names it. After promote, `prospective` / `combine` / `train` / `gate` / `promote` never run again under the same tag (the gate would compare the new candidate with itself; combine would rewrite the val set the promoted model's eval is pinned to; prospective would score the new model on its own training patients), and a `--resume` treats every stage up to `promote` as frozen even if an upstream file changed since — only `bump` and `bundle` are left. Changes made after promote go into the next release (new tag).
 - A release promoted by an older version of the script (before the `prospective` stage existed) is finished the same way: `run --batch <batch> --resume` runs `bump` and `bundle`; `prospective` shows as `skipped (promoted before this stage existed)` in `run` and `status` and is never run under that tag.
 - A `build` recorded by an older version, before the MR-only rule, counts as `--modality any`: a `--resume` before promote re-runs `build` under the rule (`stage build re-run: inputs changed`) and with it every later stage.
@@ -543,6 +583,7 @@ Evidence paths are relative to `data/release/<tag>/` unless they start with `dat
 | ☐ | Reports parsed with modality from section headers, every delivery passed oldest first, no names in any CSV | `data/<batch>_reports.csv`, `logs/parse.log` |
 | ☐ | Training set MR only (`--modality MR`), head CT counted as excluded | `logs/build.log`, `data/sets/<batch>/studies.csv` → `modality` |
 | ☐ | Prospective numbers of the shipped model on never-seen patients read and kept (informational) | `prospective_eval.json` → `groups.new`, `logs/prospective.log` |
+| ☐ | Model AUC compared with the age-alone AUC and the priority-finding counts read (a model that does not beat age alone is not evidence of detection) | `prospective_eval.json` → `age_new`, `priority_new`; `data/<batch>_priority.csv` |
 | ☐ | Label benchmark ≥ 0.90 on `abnormal` | `logs/label.log`, `state.json` → `guards.label_benchmark` |
 | ☐ | ≥ 300 normal studies matched (or a documented reason to proceed) | `state.json` → `guards.matched_counts` / `guards.pre_train`, `logs/guards.log` |
 | ☐ | 0 train/val/tune overlap, 178 holdout ids in val | `data/train_release_<tag>/dataset_manifest.json`, `logs/guards.log` |

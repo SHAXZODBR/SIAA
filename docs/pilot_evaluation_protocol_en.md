@@ -51,10 +51,13 @@ The decision takes seconds and needs no free text. Record it in the **adjudicati
 ```
 study_id | date | radiologist | modality | ai_triage_flag (yes/no) | triage_decision (agree/disagree/na) |
 tumor_flag (yes/no/none) | tumor_decision (agree/disagree/na) | report_finding_class (normal/tumor/stroke/atrophy/hemorrhage/other) |
+age_band (under 40 / 40-59 / 60+) | priority_finding (yes/no) |
 draft_used (yes/no) | time_to_read_min | model_fingerprint | comment (optional, no PHI)
 ```
 
 "Relevant abnormality" is defined in advance by the pilot lead (recommended: any finding that changes management or requires follow-up; incidental normal variants count as normal). Disagreements about a decision are settled by the pilot lead, whose decision is final and recorded.
+
+Two further columns make the result interpretable. **age_band**: the patient's age group on the day of the study (the band, not the birth date). **priority_finding**: *yes* when the signed report describes a finding that should have moved this study up the reading list — a mass, a recent infarct, a haemorrhage, demyelination, hydrocephalus that needs action, or anything the report sends for urgent follow-up; *no* for chronic age-typical change (microangiopathy, mild atrophy), incidental variants and normal studies. In the vendor's own check the flag followed patient age closely and was raised on almost every study from the age of 40, so the overall figures alone can look better than the tool is.
 
 ## 6. The adjudicated test set
 
@@ -72,6 +75,8 @@ With 60 abnormal and 40 normal studies the 95% confidence intervals are roughly 
 - **Sensitivity** = flagged ÷ (all abnormal, adjudicated); **specificity** = not flagged ÷ (all normal, adjudicated); each with a **95% confidence interval** (Wilson score method).
 - Positive and negative predictive value at the observed prevalence; overall flag rate.
 - Comparison against the vendor's validated figures (sensitivity 0.90, specificity 0.47 on 178 local patients) and against the release-gate floors (0.85 / 0.40): report whether the **lower bound** of the pilot CI is above each floor.
+- The same sensitivity and specificity **in each age band** (under 40, 40–59, 60 and over), and beside them the result of the plain rule "flag every patient aged 40 or more" on the same studies. The AI flag helps prioritisation only where it does better than this rule.
+- **Priority findings:** the share of studies with *priority_finding = yes* that were flagged, and the share of all other studies that were flagged. Descriptive: the triage detector was not trained for this distinction.
 
 ### 7.2 Secondary (descriptive)
 
@@ -122,6 +127,8 @@ Software version: 1.1.0   Triage model fingerprint: ____________   Tumor model f
 1. Enrolment: studies analysed ___ ; adjudicated ___ (normal ___ / abnormal ___); not applicable ___ (reasons)
 2. Triage detector: sensitivity ___ (95% CI ___–___); specificity ___ (95% CI ___–___); PPV ___; NPV ___; flag rate ___
    Comparison with validated figures / gate floors: ____________
+   By age band (under 40 | 40-59 | 60+): sensitivity ___ | ___ | ___ ; specificity ___ | ___ | ___ ; rule "age 40 or more": sensitivity ___ specificity ___
+   Priority findings: flagged ___ of ___ ; other studies flagged ___ of ___
 3. Tumor detector (descriptive): agree ___ / disagree ___ ; false flags among normals ___
 4. Report drafts: used ___% ; edited ___% ; typical corrections: ____________
 5. Time-to-read: baseline median ___ min (IQR ___) ; pilot median ___ min (IQR ___)

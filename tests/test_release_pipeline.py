@@ -41,6 +41,15 @@ CONTRACT_SCRIPTS = {
     "bundle": "packaging/publish_model_bundle.py",
 }
 HOLDOUT_IDS = ["9001", "9002", "9003"]
+# synthetic age_new / priority_new blocks (the contract shape of eval_prospective.py --index / --priority)
+AGE_NEW = {"n_with_age": 510, "n_without_age": 8, "median_age": {"normal": 31.0, "abnormal": 52.0},
+           "auc_model": 0.776, "auc_age_alone": 0.779, "auc_difference_ci95": [-0.05, 0.04],
+           "auc_age_matched": 0.62, "age_matched_pairs": 4100, "age_match_window_years": 5,
+           "age_rule_at_model_sensitivity": {"age_from": 22, "sensitivity": 0.93, "specificity": 0.31},
+           "bands": [], "normal_reports_aged_60_plus": 2}
+PRIORITY_NEW = {"rules_version": "rules-v1", "n_priority": 45, "priority_flagged": 41, "n_other": 473,
+                "other_flagged": 397, "n_unknown": 0, "auc_model": 0.7, "auc_age_alone": 0.6,
+                "by_reason": {"mass": {"n": 12, "flagged": 12}}}
 
 
 def _load_module():
@@ -172,13 +181,27 @@ class FakeRunner:
             out = repo / self._arg(argv, "--out")
             (out / "train" / "normal").mkdir(parents=True, exist_ok=True)
             (out / "studies.csv").write_text("patient_id,cls\n")
+        elif script.endswith("report_priority.py"):
+            # the shape report_priority.py writes (synthetic: patient ids >= 9000000, dates in 2031)
+            out = repo / self._arg(argv, "--out")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("study_folder,patient_id,report_study_date,priority,reasons,wm_grade,focal,rules_version\n"
+                           "A0,9000001,20310105,yes,mass,0,yes,rules-v1\n"
+                           "S0,9000002,20310106,no,,1,no,rules-v1\n")
         elif script.endswith("eval_prospective.py"):
-            # the shape eval_prospective.py writes; exit 0 = it ran (never a gate)
+            # the shape eval_prospective.py writes; exit 0 = it ran (never a gate). Without --index /
+            # --priority the new blocks are null (an older command line), never absent. Like the real
+            # script, a --index / --priority path that does not exist is unusable input: exit 2, no JSON.
+            for flag in ("--index", "--priority"):
+                if flag in argv and not (repo / self._arg(argv, flag)).is_file():
+                    return 2
             out = repo / self._arg(argv, "--out")
             out.parent.mkdir(parents=True, exist_ok=True)
             group = {"n_studies": 412, "sensitivity": 0.92, "specificity": 0.27}
             out.write_text(json.dumps({"kind": "prospective_eval", "model": self._arg(argv, "--model"),
-                                       "groups": {"all": group, "new": group}}))
+                                       "groups": {"all": group, "new": group},
+                                       "age_new": AGE_NEW if "--index" in argv else None,
+                                       "priority_new": PRIORITY_NEW if "--priority" in argv else None}))
         elif script.endswith("combine_training_sets.py"):
             out = repo / self._arg(argv, "--out")
             splits = (("train", "abnormal", ["10", "11"]), ("train", "normal", ["12"]),
@@ -249,7 +272,7 @@ def test_stage_order_is_fixed(rp, fake_repo, tmp_path):
     assert rp.stage_names(stages) == list(EXPECTED_ORDER)
     for s in stages:
         assert s.cmds, s.name
-        assert any(CONTRACT_SCRIPTS[s.name] in c for c in s.cmds[0]), (s.name, s.cmds[0])
+        assert any(CONTRACT_SCRIPTS[s.name] in c for cmd in s.cmds for c in cmd), (s.name, s.cmds)
     # every stage-name subcommand is accepted by the parser
     for name in EXPECTED_ORDER:
         assert name in rp.SUBCOMMANDS
@@ -1671,18 +1694,46 @@ def test_prospective_command_line(rp, fake_repo, tmp_path):
     (fake_repo / "data" / "sets" / "older" / "studies.csv").write_text("patient_id,cls\n")
     cfg = _cfg(rp, tmp_path, fake_repo, "--device", "cpu")
     s = _stage(rp, cfg, "prospective")
-    assert len(s.cmds) == 1
-    assert s.cmds[0] == [cfg.python, "scripts/eval_prospective.py", "--model", "models/brain_triage_finetuned",
+    assert len(s.cmds) == 2
+    # first the priority findings from the reports, then the eval that reads them (+ the ages)
+    assert s.cmds[0] == [cfg.python, "scripts/report_priority.py", "--matched", "data/fakebatch_matched.csv",
+                         "--labels", "data/fakebatch_labels.csv", "--out", "data/fakebatch_priority.csv",
+                         "--modality", "MR"]                    # the same modality as the set (build)
+    assert s.cmds[1] == [cfg.python, "scripts/eval_prospective.py", "--model", "models/brain_triage_finetuned",
                          "--set", "data/sets/fakebatch", "--seen", "data/local_finetune_bin",
                          "--seen", "data/sets/older", "--holdout", "data/holdout_patients_v1.txt",
                          "--matched", "data/fakebatch_matched.csv",
+                         "--index", "data/fakebatch_index.csv", "--priority", "data/fakebatch_priority.csv",
                          "--out", "data/release/brain-triage-vTEST/prospective_eval.json", "--device", "cpu"]
+    assert cfg.priority_csv == "data/fakebatch_priority.csv"
     assert s.inputs == ["data/sets/fakebatch/studies.csv", "data/fakebatch_matched.csv",
+                        "data/fakebatch_labels.csv", "data/fakebatch_index.csv",
                         "data/holdout_patients_v1.txt", "ls:data/local_finetune_bin",
                         "data/sets/older/studies.csv", "models/brain_triage_finetuned/MANIFEST.json"]
-    assert s.outputs == ["data/release/brain-triage-vTEST/prospective_eval.json"]
-    # its only guard rail checks the trained-on release set (none for this legacy-trained model)
+    assert s.outputs == ["data/release/brain-triage-vTEST/prospective_eval.json", "data/fakebatch_priority.csv"]
+    # its guard rail checks the trained-on release set (none for this legacy-trained model) and the index
+    # table: eval_prospective.py refuses a missing --index file, so a missing index is an ERROR here
+    errors, warnings = rp.GUARDS["prospective"](cfg, {})
+    assert warnings == [] and len(errors) == 1 and "data/fakebatch_index.csv missing" in errors[0]
+    (fake_repo / "data" / "fakebatch_index.csv").write_text("study_folder,patient_age\n")
     assert rp.GUARDS["prospective"](cfg, {}) == ([], []) and "prospective" not in rp.NEEDS_ROOT
+
+
+@pytest.mark.parametrize("modality,expected", [("CT", ["--modality", "CT"]), ("MR", ["--modality", "MR"]),
+                                               ("any", [])])
+def test_report_priority_reads_the_reports_of_the_set_modality(rp, fake_repo, tmp_path, capsys, modality, expected):
+    """A CT release must score priority from CT reports: without --modality report_priority.py reads MR
+    reports only, and every 'new' CT study would be 'unknown' (0/0 on the headline). It has no 'any':
+    with --modality any it keeps MR, and the plan says so."""
+    cfg = _cfg(rp, tmp_path, fake_repo, "--modality", modality)
+    cmd = _stage(rp, cfg, "prospective").cmds[0]
+    assert cmd[cmd.index("--out") + 2:] == expected
+    build = _stage(rp, cfg, "build").cmds[0]
+    assert (build[build.index("--modality") + 1] if "--modality" in build else "any") == modality
+    assert rp.main(["plan", *_base_args(tmp_path, fake_repo), "--modality", modality]) == 0
+    out = capsys.readouterr().out
+    assert ("priority from MR reports only (--modality any)" if modality == "any"
+            else f"priority from {modality} reports") in out
 
 
 def test_prospective_scores_the_shipped_model_whatever_base_model_training_starts_from(rp, fake_repo, tmp_path):
@@ -1692,7 +1743,7 @@ def test_prospective_scores_the_shipped_model_whatever_base_model_training_start
     cfg = _cfg(rp, tmp_path, fake_repo, "--base-model", "google/vit-base-patch16-224")
     assert cfg.base_model == "google/vit-base-patch16-224"
     s = _stage(rp, cfg, "prospective")
-    cmd = s.cmds[0]
+    cmd = s.cmds[-1]
     assert cmd[cmd.index("--model") + 1] == rp.BASE_MODEL == "models/brain_triage_finetuned"
     assert "google/vit-base-patch16-224" not in cmd
     assert "opt:base_model" not in s.inputs and f"{rp.BASE_MODEL}/MANIFEST.json" in s.inputs
@@ -1859,7 +1910,7 @@ def test_rerelease_of_the_same_batch_passes_the_trained_on_release_set_as_seen(r
         (fake_repo / "data" / "v2_trained_ids.txt").write_text("10\n11\n")
         cfg = rp.config_from_args(rp.build_parser().parse_args(["plan", *_v3_args(tmp_path, fake_repo, *extra)]))
         s = _stage(rp, cfg, "prospective")
-        cmd = s.cmds[0]
+        cmd = s.cmds[-1]
         seen = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--seen"]
         assert seen == ["data/local_finetune_bin", V2_SET], (extra, cmd)
         assert f"{V2_SET}/dataset_manifest.json" in s.inputs, extra
@@ -1900,18 +1951,22 @@ def test_missing_trained_on_set_fails_the_prospective_stage_before_it_runs(rp, f
 
 
 def test_legacy_trained_model_keeps_the_exact_prospective_command(rp, fake_repo, tmp_path):
-    """The shipped model trained on data/local_finetune_bin only (no release set): the command and the
-    inputs stay byte for byte what the release in progress recorded — even with a --train-lock dir."""
+    """The shipped model trained on data/local_finetune_bin only (no release set): no trained-on set is
+    added to --seen — even with a --train-lock dir. (The command gained --index / --priority on
+    2026-11-14; a record from before them is re-run, see the legacy-state tests below.)"""
     lock = fake_repo / "data" / "some_set"
     (lock / "train" / "normal").mkdir(parents=True)
+    (fake_repo / "data" / "fakebatch_index.csv").write_text("study_folder,patient_age\n")
     for extra in ((), ("--train-lock", "data/some_set")):
         cfg = _cfg(rp, tmp_path, fake_repo, "--device", "cpu", *extra)
         s = _stage(rp, cfg, "prospective")
-        assert s.cmds[0] == [cfg.python, "scripts/eval_prospective.py", "--model", "models/brain_triage_finetuned",
+        assert s.cmds[1] == [cfg.python, "scripts/eval_prospective.py", "--model", "models/brain_triage_finetuned",
                              "--set", "data/sets/fakebatch", "--seen", "data/local_finetune_bin",
                              "--holdout", "data/holdout_patients_v1.txt", "--matched", "data/fakebatch_matched.csv",
+                             "--index", "data/fakebatch_index.csv", "--priority", "data/fakebatch_priority.csv",
                              "--out", "data/release/brain-triage-vTEST/prospective_eval.json", "--device", "cpu"]
         assert s.inputs == ["data/sets/fakebatch/studies.csv", "data/fakebatch_matched.csv",
+                            "data/fakebatch_labels.csv", "data/fakebatch_index.csv",
                             "data/holdout_patients_v1.txt", "ls:data/local_finetune_bin",
                             "models/brain_triage_finetuned/MANIFEST.json"]
         assert rp.guard_pre_prospective(cfg, {}) == ([], [])
@@ -1990,3 +2045,260 @@ def test_resume_without_the_drive_passes_the_train_guard(rp, fake_repo, tmp_path
     assert "drive not mounted" not in out and "guard rails before train passed" in out
     assert "training/finetune_brain_classifier.py" in _scripts(runner.calls)
     assert "drive mounted" not in " ".join(rp.GUARD_TEXT["train"])
+
+
+# ------------------------------- age baseline + priority findings (2026-11-14) --
+
+def _plain(out: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", out)
+
+
+def _make_legacy_prospective(repo: Path, tag: str = "brain-triage-vTEST") -> None:
+    """Rewrite a finished prospective record into exactly what the version before 2026-11-14 left behind
+    (the real data/release/brain-triage-v2): one command, the old inputs (no labels / index csv), a JSON
+    without age_new / priority_new, no priority csv."""
+    sp = repo / "data" / "release" / tag / "state.json"
+    st = json.loads(sp.read_text())
+    rec = st["stages"]["prospective"]
+    for k in ("data/fakebatch_labels.csv", "data/fakebatch_index.csv"):
+        rec["input_sha256s"].pop(k)
+        rec["inputs"].remove(k)
+    rec["cmds"] = rec["cmds"][-1:]
+    rec["cmd"] = rec["cmds"][0]
+    rec["outputs"] = [o for o in rec["outputs"] if not o.endswith("_priority.csv")]
+    sp.write_text(json.dumps(st))
+    report = repo / "data" / "release" / tag / "prospective_eval.json"
+    d = json.loads(report.read_text())
+    d.pop("age_new")
+    d.pop("priority_new")
+    report.write_text(json.dumps(d))
+    (repo / "data" / "fakebatch_priority.csv").unlink()
+
+
+def test_headline_appends_age_baseline_and_priority_counts(rp, tmp_path):
+    p = tmp_path / "prospective_eval.json"
+    group = {"n_studies": 518, "sensitivity": 0.9, "specificity": 0.3}
+    base = "prospective, never-seen patients: n 518 studies · sensitivity 0.900 · specificity 0.300"
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": {"new": group},
+                             "age_new": AGE_NEW, "priority_new": PRIORITY_NEW}))
+    # three decimals: age alone 0.779 vs model 0.776 must not read as a tie; the interval is on the line
+    assert rp.prospective_headline(p) == (base + " · age alone AUC 0.779 (model 0.776; model − age "
+                                          "[-0.050, 0.040]), age-matched 0.620"
+                                          " · priority findings flagged 41/45, others 397/473")
+    no_ci = dict(AGE_NEW, auc_difference_ci95=None)
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": {"new": group}, "age_new": no_ci}))
+    assert rp.prospective_headline(p) == base + " · age alone AUC 0.779 (model 0.776), age-matched 0.620"
+    # null blocks (no index / priority file) and an older JSON (no keys): the headline is unchanged
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": {"new": group},
+                             "age_new": None, "priority_new": None}))
+    assert rp.prospective_headline(p) == base and not rp.prospective_predates_age_priority(p)
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": {"new": group}}))
+    assert rp.prospective_headline(p) == base and rp.prospective_predates_age_priority(p)
+    # one block only; a missing number prints a dash, never crashes
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": {"new": group}, "age_new": None,
+                             "priority_new": {"n_priority": 3, "priority_flagged": None}}))
+    assert rp.prospective_headline(p) == base + " · priority findings flagged —/3, others —/—"
+    assert not rp.prospective_predates_age_priority(tmp_path / "missing.json")
+
+
+def test_prospective_runs_priority_then_eval_and_prints_the_age_line(rp, fake_repo, tmp_path, monkeypatch,
+                                                                    plenty_of_disk, capsys):
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--skip-tests"]) == 0
+    out = _plain(capsys.readouterr().out)
+    scripts = _scripts(runner.calls)
+    i_pri, i_eval = scripts.index("scripts/report_priority.py"), scripts.index("scripts/eval_prospective.py")
+    assert scripts.index("scripts/build_training_set.py") < i_pri == i_eval - 1
+    pro = runner.calls[i_eval]
+    assert pro[pro.index("--index") + 1] == "data/fakebatch_index.csv"
+    assert pro[pro.index("--priority") + 1] == "data/fakebatch_priority.csv"
+    assert ("prospective, never-seen patients: n 412 studies · sensitivity 0.920 · specificity 0.270 · "
+            "age alone AUC 0.779 (model 0.776; model − age [-0.050, 0.040]), age-matched 0.620 · "
+            "priority findings flagged 41/45, "
+            "others 397/473") in out
+    rec = _state(fake_repo)["stages"]["prospective"]
+    assert rec["status"] == "done" and len(rec["cmds"]) == 2 and "report_priority.py" in rec["cmds"][0]
+    assert "data/fakebatch_priority.csv" in rec["outputs"]
+    for k in ("data/fakebatch_labels.csv", "data/fakebatch_index.csv"):
+        assert rec["input_sha256s"][k] not in ("missing", None), k
+    # the good text names the new file and lines; the guard ran without the index warning
+    assert "data/fakebatch_priority.csv" in out and "age-alone AUC" in out
+    assert "index stage output" not in out
+
+
+def test_prospective_failure_of_report_priority_stops_before_the_eval(rp, fake_repo, tmp_path, monkeypatch,
+                                                                     plenty_of_disk, capsys):
+    runner = FakeRunner(fake_repo, fail_on="report_priority.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    out = capsys.readouterr().out
+    assert "stage prospective FAILED (exit 1)" in out and "scripts/report_priority.py" in out
+    assert "scripts/eval_prospective.py" not in _scripts(runner.calls)
+    assert _state(fake_repo)["stages"]["prospective"]["failed_cmd"].split()[1] == "scripts/report_priority.py"
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--skip-tests"])
+    assert rc == 0 and _state(fake_repo)["stages"]["prospective"]["status"] == "done"
+
+
+def test_missing_index_is_a_guard_error_and_nothing_runs(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk,
+                                                         capsys):
+    """The real eval_prospective.py refuses a missing --index file (exit 2), and the age baseline must be
+    printed for every batch: a missing index table stops the stage at the guard, before report_priority.py
+    rewrites anything — never a 'warning, the stage still runs' that then fails (review 2026-11-14)."""
+    runner = FakeRunner(fake_repo, fail_on="combine_training_sets.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    index = fake_repo / "data" / "fakebatch_index.csv"
+    saved = index.read_bytes()
+    index.unlink()                                                    # consumed by match; gone since
+    capsys.readouterr()
+    n = len(runner.calls)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--only", "prospective"]) == rp.EXIT_USAGE
+    out = _plain(capsys.readouterr().out)
+    assert "data/fakebatch_index.csv missing (index stage output" in out
+    assert "guard rails before prospective failed — nothing was run" in out
+    assert runner.calls[n:] == []
+    assert _state(fake_repo)["guards"]["pre_prospective"]["passed"] is False
+    # the fake eval behaves like the real one: without the guard the stage would FAIL, not warn
+    assert runner([rp.VENV_PYTHON, "scripts/eval_prospective.py", "--index", "data/fakebatch_index.csv",
+                   "--out", "x.json"], tmp_path / "log", fake_repo) == 2
+    # restored: the stage runs
+    index.write_bytes(saved)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--only", "prospective"]) == 0
+    assert "age alone AUC 0.779" in _plain(capsys.readouterr().out)
+
+
+def test_legacy_prospective_record_is_rerun_on_resume_and_nothing_else(rp, fake_repo, tmp_path, monkeypatch,
+                                                                      plenty_of_disk, capsys):
+    """The real data/release/brain-triage-v2: prospective done by the previous version (old inputs, no
+    age_new / priority_new, no priority csv), combine + train done, gate FAILED, promote not run. A
+    --resume must re-run prospective with a reason that says why (never reuse it silently), leave
+    combine / train alone, and gate again."""
+    runner = FakeRunner(fake_repo, eval_rc=rp.EVAL_GATE_FAILED)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    _make_legacy_prospective(fake_repo)
+    capsys.readouterr()
+    cfg = rp.config_from_args(rp.build_parser().parse_args(["run", *_base_args(tmp_path, fake_repo), "--resume"]))
+    st = _state(fake_repo)
+    assert st["stages"]["gate"]["status"] == "failed" and "promote" not in st["stages"]
+    done, why = rp.stage_is_done(cfg, _stage(rp, cfg, "prospective"), st)
+    assert not done and why == rp.PREDATES_AGE_PRIORITY
+    assert rp.stage_is_done(cfg, _stage(rp, cfg, "combine"), st) == (True, "")
+    # status says it too, before anything runs
+    assert rp.main(["status", *_base_args(tmp_path, fake_repo)]) == 0
+    assert "has no age_new / priority_new) — a --resume runs it again" in _plain(capsys.readouterr().out)
+
+    n = len(runner.calls)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume"]) == rp.EXIT_STAGE_FAILED
+    out = _plain(capsys.readouterr().out)
+    assert f"stage prospective re-run: {rp.PREDATES_AGE_PRIORITY}" in out
+    assert "stage combine already done — skipped" in out and "stage train already done — skipped" in out
+    assert _scripts(runner.calls[n:]) == ["scripts/report_priority.py", "scripts/eval_prospective.py",
+                                          "scripts/eval_study_level.py"]
+    assert "age alone AUC 0.779" in out and "GATE FAILED" in out
+    st = _state(fake_repo)
+    assert st["stages"]["prospective"]["status"] == "done"
+    assert "data/fakebatch_index.csv" in st["stages"]["prospective"]["input_sha256s"]
+    assert (fake_repo / "data" / "fakebatch_priority.csv").is_file()
+    # now current: a further --resume keeps it
+    cfg = rp.config_from_args(rp.build_parser().parse_args(["run", *_base_args(tmp_path, fake_repo), "--resume"]))
+    assert rp.stage_is_done(cfg, _stage(rp, cfg, "prospective"), st) == (True, "")
+
+
+def test_legacy_prospective_without_input_record_is_still_rerun(rp, fake_repo, tmp_path, monkeypatch, capsys):
+    """Even a record with no input_sha256s (nothing to compare) is not reused when its JSON predates
+    the age / priority blocks — the JSON check does not depend on the fingerprints."""
+    runner = FakeRunner(fake_repo, fail_on="combine_training_sets.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    _make_legacy_prospective(fake_repo)
+    sp = fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json"
+    st = json.loads(sp.read_text())
+    st["stages"]["prospective"].pop("input_sha256s")
+    sp.write_text(json.dumps(st))
+    cfg = rp.config_from_args(rp.build_parser().parse_args(["run", *_base_args(tmp_path, fake_repo), "--resume"]))
+    # priority csv missing and no later stage done: the missing output is reported first — still a re-run
+    done, why = rp.stage_is_done(cfg, _stage(rp, cfg, "prospective"), st)
+    assert not done and "data/fakebatch_priority.csv" in why
+    (fake_repo / "data" / "fakebatch_priority.csv").write_text("study_folder\n")
+    assert rp.stage_is_done(cfg, _stage(rp, cfg, "prospective"), st) == (False, rp.PREDATES_AGE_PRIORITY)
+
+
+def test_legacy_prospective_stays_frozen_after_promote(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk,
+                                                       capsys):
+    """After promote the release dir holds the NEW model: the old prospective JSON (without the age
+    lines) is kept as it is — never re-run under that tag, and the release can still be finished."""
+    runner = FakeRunner(fake_repo, fail_on="publish_model_bundle.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    _make_legacy_prospective(fake_repo)
+    report = fake_repo / "data" / "release" / "brain-triage-vTEST" / "prospective_eval.json"
+    before = report.read_text()
+    capsys.readouterr()
+    n = len(runner.calls)
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--skip-tests"])
+    out = _plain(capsys.readouterr().out)
+    assert rc == 0, out
+    assert "stage prospective already done — skipped" in out and "cannot run again" not in out
+    assert "scripts/eval_prospective.py" not in _scripts(runner.calls[n:])
+    assert "scripts/report_priority.py" not in _scripts(runner.calls[n:])
+    assert "packaging/publish_model_bundle.py" in _scripts(runner.calls[n:])
+    assert report.read_text() == before
+    assert rp.main(["status", *_base_args(tmp_path, fake_repo)]) == 0
+    assert "has no age_new / priority_new) — frozen after promote" in _plain(capsys.readouterr().out)
+    n = len(runner.calls)
+    assert rp.main(["prospective", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_USAGE
+    assert "prospective cannot run again" in capsys.readouterr().out and len(runner.calls) == n
+
+
+def test_an_eval_without_the_new_blocks_warns_and_is_rerun_next_time(rp, fake_repo, tmp_path, monkeypatch,
+                                                                     plenty_of_disk, capsys):
+    """Defensive check: a prospective_eval.json without the age_new / priority_new keys (not written by
+    the current eval script). A real eval_prospective.py older than --index / --priority cannot get here —
+    argparse rejects the unknown arguments (exit 2) and the stage FAILS. Here the stage is done (never a
+    gate) but says so, and a --resume does not reuse it silently."""
+    class OldEval(FakeRunner):
+        def __call__(self, argv, log_path, cwd, dry_run=False):
+            rc = super().__call__(argv, log_path, cwd, dry_run)
+            if not dry_run and argv[1] == "scripts/eval_prospective.py":
+                out = self.repo / self._arg(argv, "--out")
+                d = json.loads(out.read_text())
+                d.pop("age_new"), d.pop("priority_new")
+                out.write_text(json.dumps(d))
+            return rc
+
+    runner = OldEval(fake_repo, fail_on="combine_training_sets.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    out = _plain(capsys.readouterr().out)
+    assert "has no age_new / priority_new: it was not written by the current scripts/eval_prospective.py" in out
+    assert _state(fake_repo)["stages"]["prospective"]["status"] == "done"
+    assert "age alone AUC" not in out
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--only", "prospective"])
+    assert rc == 0 and f"stage prospective re-run: {rp.PREDATES_AGE_PRIORITY}" in _plain(capsys.readouterr().out)
+
+
+def test_plan_dry_run_and_manual_steps_name_the_priority_file(rp, fake_repo, tmp_path, monkeypatch, capsys):
+    assert rp.main(["plan", *_base_args(tmp_path, fake_repo)]) == 0
+    out = capsys.readouterr().out
+    assert "writes data/fakebatch_priority.csv (priority findings from the reports)" in out
+    assert "age-alone AUC and the priority-finding counts" in out
+    stage5 = out[out.index("# --- stage 5: prospective"):out.index("# --- stage 6: combine")]
+    assert "scripts/report_priority.py --matched data/fakebatch_matched.csv --labels data/fakebatch_labels.csv " \
+           "--out data/fakebatch_priority.csv" in stage5
+    assert "--index data/fakebatch_index.csv --priority data/fakebatch_priority.csv" in stage5
+    assert "#     guard: the batch index table (patient ages) is present\n" in stage5
+    assert stage5.index("report_priority.py") < stage5.index("eval_prospective.py")
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert _scripts(runner.dry_calls).count("scripts/report_priority.py") == 1
+    assert "would check: the batch index table (patient ages)" in out
+    assert not (fake_repo / "data" / "release").exists()
+    cfg = _cfg(rp, tmp_path, fake_repo)
+    text = "\n".join(rp.manual_steps(cfg))
+    assert "data/fakebatch_priority.csv" in text and "age_new" in text and "priority_new" in text
+    assert "a model that does not beat the age-alone AUC is not evidence of detection" in text
+    assert "provisional" in text

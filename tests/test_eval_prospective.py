@@ -19,6 +19,13 @@ Covered:
   * missing studies.csv, empty 'new' group, a study key under both classes /
     in both splits, unusable model / set / --seen / --holdout → exit 2
   * no ids or study folders on stdout or in the JSON; the JSON keys
+  * --index (age_new): age parsing incl. month / week / day codes and the
+    birth-date fallback; a score that IS the age (difference 0, age-matched
+    AUC near 0.5) and one independent of age; missing ages; an index without
+    the columns; the deterministic patient-level bootstrap; bands and the
+    age rule on a hand-computed example
+  * --priority (priority_new): counts with unknown rows and reasons; the JSON
+    without the new arguments only gains two null keys and notes
 """
 from __future__ import annotations
 
@@ -367,8 +374,9 @@ def test_end_to_end_groups_findings_same_date_and_json(stub_model, tmp_path, cap
     assert not (out.parent / (out.name + ".tmp")).exists()
 
     assert set(payload) == {"kind", "schema_version", "evaluated_on", "model", "protocol", "inputs", "groups",
-                            "threshold_sweep_new", "findings_new", "notes"}
-    assert payload["kind"] == "prospective_eval" and payload["schema_version"] == 1
+                            "threshold_sweep_new", "findings_new", "age_new", "priority_new", "notes"}
+    assert payload["kind"] == "prospective_eval" and payload["schema_version"] == 2
+    assert payload["age_new"] is None and payload["priority_new"] is None      # no --index / --priority
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", payload["evaluated_on"])
     assert payload["model"] == {"path": str(stub_model), "identity": esl.model_identity(stub_model),
                                 "manifest_verified": False}          # the stub model dir has no MANIFEST.json
@@ -549,3 +557,291 @@ def test_model_without_a_manifest_is_scored_with_a_note(tmp_path, stub_model, ca
     payload = json.loads(out.read_text())
     assert payload["model"]["manifest_verified"] is False
     assert any("no MANIFEST.json" in n for n in payload["notes"])
+
+
+# ------------------------------------------------------------------ age (--index) and priority (--priority)
+
+INDEX_HEADER = ["study_folder", "patient_id", "patient_age", "patient_birth_date", "study_date", "modality"]
+PRIORITY_HEADER = ["study_folder", "patient_id", "report_study_date", "priority", "reasons", "wm_grade", "focal",
+                   "rules_version"]
+
+
+def test_parse_age_codes_and_birth_date_fallback():
+    assert ep.parse_age("045Y") == 45.0
+    assert ep.parse_age("010M") == pytest.approx(10 / 12)
+    assert ep.parse_age("003W") == pytest.approx(3 / 52)
+    assert ep.parse_age("020D") == pytest.approx(20 / 365)
+    assert ep.parse_age(" 006m ") == pytest.approx(0.5)
+    assert ep.parse_age("", "20010315", "20310315") == pytest.approx(30.0, abs=0.01)
+    assert ep.parse_age("45", "20010315", "20310315") == pytest.approx(30.0, abs=0.01)   # bad code → dates
+    assert ep.parse_age("045Y", "20010315", "20310315") == 45.0                          # the code wins
+    assert ep.parse_age("") is None and ep.parse_age("abcY") is None and ep.parse_age("Y") is None
+    assert ep.parse_age("", "20310316", "20310315") is None                              # born after the study
+    assert ep.parse_age("", "2001-03-15", "20310315") is None
+    assert ep.parse_age("150Y") is None
+
+
+def _age_set(ages_abn, ages_norm, scores_abn, scores_norm, pid_base=9001000):
+    """(studies, table, ages): one patient per study, study folder 'F<pid>'."""
+    studies, table, ages = {}, {}, {}
+    for cls, ag, sc, off in (("abnormal", ages_abn, scores_abn, 0), ("normal", ages_norm, scores_norm, 5000)):
+        for i, (a, s) in enumerate(zip(ag, sc)):
+            key = str(pid_base + off + i)
+            studies[(key, cls)] = [s]
+            table[key] = {"study_folder": f"F{key}", "label": "", "cls": cls}
+            if a is not None:
+                ages[f"F{key}"] = a
+    return studies, table, ages
+
+
+def test_age_block_hand_computed_bands_rule_and_matched_auc():
+    abn_age, abn_sc = [30, 45, 50, 65], [0.7, 0.9, 0.3, 0.6]        # flagged T T F T → model sens 0.75
+    nrm_age, nrm_sc = [25, 35, 42, 70], [0.1, 0.55, 0.95, 0.2]      # flagged F T T F
+    st, table, ages = _age_set(abn_age, nrm_age, abn_sc, nrm_sc)
+    a = ep.age_block(st, table, ages)
+    assert (a["n_with_age"], a["n_without_age"]) == (8, 0)
+    assert a["median_age"] == {"normal": 38.5, "abnormal": 47.5}
+    assert a["auc_model"] == pytest.approx(ep.auc(abn_sc, nrm_sc))
+    assert a["auc_age_alone"] == pytest.approx(ep.auc(abn_age, nrm_age))
+    # pairs within 5 years: 30-25 win, 30-35 win, 45-42 loss (0.9 < 0.95), 65-70 win
+    assert a["age_matched_pairs"] == 4 and a["auc_age_matched"] == pytest.approx(0.75)
+    assert a["age_match_window_years"] == 5
+    # 'age >= T' sensitivity: 1.0 up to 30, 0.75 for 31..45, 0.5 for 46..50 → oldest T keeping 0.75 is 45
+    assert a["age_rule_at_model_sensitivity"] == {"age_from": 45, "sensitivity": 0.75, "specificity": 0.75}
+    assert a["bands"] == [
+        {"band": "under 40", "n_abnormal": 1, "abnormal_flagged": 1, "n_normal": 2, "normal_flagged": 1,
+         "sensitivity": 1.0, "specificity": 0.5},
+        {"band": "40-59", "n_abnormal": 2, "abnormal_flagged": 1, "n_normal": 1, "normal_flagged": 1,
+         "sensitivity": 0.5, "specificity": 0.0},
+        {"band": "60+", "n_abnormal": 1, "abnormal_flagged": 1, "n_normal": 1, "normal_flagged": 0,
+         "sensitivity": 1.0, "specificity": 1.0}]
+    assert a["normal_reports_aged_60_plus"] == 1
+    assert a["auc_difference_ci95"] is not None                     # 4 patients per class
+
+
+def test_age_bands_with_empty_denominators_and_band_edges():
+    st, table, ages = _age_set([39.99, 40.0, 59.99], [60.0], [0.9, 0.9, 0.9], [0.9])
+    a = ep.age_block(st, table, ages)
+    bands = {b["band"]: b for b in a["bands"]}
+    assert (bands["under 40"]["n_abnormal"], bands["40-59"]["n_abnormal"], bands["60+"]["n_abnormal"]) == (1, 2, 0)
+    assert bands["under 40"]["specificity"] is None and bands["60+"]["sensitivity"] is None
+    assert bands["60+"]["specificity"] == 0.0 and a["normal_reports_aged_60_plus"] == 1
+    assert a["auc_difference_ci95"] is None                         # < 2 patients per class
+    only_normal = ep.age_block(*_age_set([], [30.0, 50.0], [], [0.2, 0.7]))
+    assert only_normal["age_rule_at_model_sensitivity"] is None and only_normal["auc_model"] is None
+
+
+def test_score_that_is_the_age_matches_age_alone():
+    """A 'model' that only learned age: AUC difference exactly 0, and between patients of similar age it
+    is close to a coin flip."""
+    rng = np.random.default_rng(11)
+    ages = rng.uniform(20, 80, 400)
+    is_abn = rng.random(400) < 1 / (1 + np.exp(-(ages - 50) / 8))   # older → more often 'abnormal'
+    abn_age = [float(a) for a, y in zip(ages, is_abn) if y]
+    nrm_age = [float(a) for a, y in zip(ages, is_abn) if not y]
+    st, table, amap = _age_set(abn_age, nrm_age, [a / 100 for a in abn_age], [a / 100 for a in nrm_age])
+    a = ep.age_block(st, table, amap)
+    assert a["auc_age_alone"] > 0.8
+    assert a["auc_model"] == pytest.approx(a["auc_age_alone"])
+    assert a["auc_difference_ci95"] == pytest.approx([0.0, 0.0], abs=1e-12)
+    assert 0.4 < a["auc_age_matched"] < 0.65 and a["age_matched_pairs"] > 1000
+    brute = sum(1 for x in abn_age for y in nrm_age if abs(x - y) <= 5.0)
+    assert a["age_matched_pairs"] == brute
+
+
+def test_score_independent_of_age_beats_age_alone():
+    rng = np.random.default_rng(12)
+    abn_age, nrm_age = list(rng.uniform(20, 80, 150)), list(rng.uniform(20, 80, 150))
+    abn_sc = list(np.clip(rng.normal(0.7, 0.15, 150), 0, 1))
+    nrm_sc = list(np.clip(rng.normal(0.3, 0.15, 150), 0, 1))
+    a = ep.age_block(*_age_set(abn_age, nrm_age, abn_sc, nrm_sc))
+    assert 0.38 < a["auc_age_alone"] < 0.62 and a["auc_model"] > 0.9
+    assert a["auc_age_matched"] == pytest.approx(a["auc_model"], abs=0.05)
+    lo, hi = a["auc_difference_ci95"]
+    assert 0 < lo < a["auc_model"] - a["auc_age_alone"] < hi
+
+
+def test_month_coded_infants_and_missing_ages(tmp_path):
+    idx = tmp_path / "idx.csv"
+    _csv(idx, INDEX_HEADER, [["F9001000", "9001000", "006M", "", "20310101", "MR"],
+                             ["F9001001", "9001001", "003W", "", "20310101", "MR"],
+                             ["F9001001", "9001001", "040Y", "", "20310101", "MR"],    # first usable row wins
+                             ["F9006000", "9006000", "020D", "", "20310101", "MR"],
+                             ["F9006001", "9006001", "", "", "", "MR"],                  # no age at all
+                             ["F9006002", "9006002", "", "19910101", "20310101", "MR"]])
+    ages, note = ep.load_index_ages(idx)
+    assert note is None and set(ages) == {"F9001000", "F9001001", "F9006000", "F9006002"}
+    assert ages["F9001000"] == pytest.approx(0.5) and ages["F9001001"] == pytest.approx(3 / 52)
+    st, table, _ = _age_set([None, None], [None, None, None], [0.9, 0.2], [0.6, 0.1, 0.3])
+    st[("9006003", "normal")] = [0.3]                                # a 'new' study without a studies.csv row
+    a = ep.age_block(st, table, ages)
+    assert (a["n_with_age"], a["n_without_age"]) == (4, 2)
+    assert a["bands"][0]["n_abnormal"] == 2 and a["bands"][0]["n_normal"] == 1
+    assert a["bands"][1]["n_normal"] == 1                            # 40 years from the birth date
+    assert a["median_age"]["abnormal"] == pytest.approx((0.5 + 3 / 52) / 2)
+
+
+def test_index_without_columns_or_unreadable_is_a_note(tmp_path):
+    bad = tmp_path / "idx.csv"
+    _csv(bad, ["study_folder", "modality"], [["F1", "MR"]])
+    ages, note = ep.load_index_ages(bad)
+    assert ages is None and "age_new omitted" in note
+    _csv(bad, ["patient_age", "study_date"], [["045Y", "20310101"]])
+    assert ep.load_index_ages(bad)[0] is None
+    raw = tmp_path / "raw.csv"
+    raw.write_bytes(b"\xff\xfe\x00bad")
+    ages, note = ep.load_index_ages(raw)
+    assert ages is None and "unreadable" in note
+    bad_p = tmp_path / "p.csv"
+    _csv(bad_p, ["study_folder", "reasons"], [["F1", "mass"]])
+    prio, version, note = ep.load_priority(bad_p)
+    assert prio is None and "priority_new omitted" in note
+
+
+def test_bootstrap_is_deterministic_and_patient_level():
+    rows = [(f"{9002000 + i // 2}", float(s), float(a), bool(y)) for i, (s, a, y) in
+            enumerate(zip(np.linspace(0, 1, 40), np.linspace(20, 80, 40)[::-1], [i % 3 == 0 for i in range(40)]))]
+    ci1, ci2 = ep.auc_difference_ci(rows), ep.auc_difference_ci(rows)
+    assert ci1 == ci2 and ci1[0] <= ci1[1]
+    assert ep.auc_difference_ci(rows, seed=ep.BOOTSTRAP_SEED + 1) != ci1
+    # two patients with abnormal studies but only ONE normal patient → no interval
+    few = [("9002100", 0.9, 50.0, True), ("9002101", 0.8, 40.0, True),
+           ("9002102", 0.1, 30.0, False), ("9002102_s2", 0.2, 31.0, False)]
+    few = [(ep.esl.patient_id_of(p), s, a, y) for p, s, a, y in few]
+    assert ep.auc_difference_ci(few) is None
+
+
+def test_auc_np_equals_auc():
+    rng = np.random.default_rng(5)
+    s = np.round(rng.random(60), 1)
+    y = rng.random(60) < 0.4
+    assert ep._auc_np(s, y) == pytest.approx(ep.auc(list(s[y]), list(s[~y])))
+    assert ep._auc_np(s, np.zeros(60, dtype=bool)) is None
+
+
+def test_priority_block_counts_unknown_and_reasons(tmp_path):
+    pf = tmp_path / "prio.csv"
+    _csv(pf, PRIORITY_HEADER, [
+        ["F9003000", "9003000", "20310101", "yes", "mass;recent_infarct", "1", "yes", "rules-v1"],
+        ["F9003001", "9003001", "20310101", "yes", "mass", "0", "yes", "rules-v1"],
+        ["F9003002", "9003002", "20310101", "no", "", "2", "no", "rules-v1"],
+        ["F9008000", "9008000", "20310101", "no", "", "0", "no", "rules-v1"],
+        ["F9008001", "9008001", "20310101", "", "", "", "", "rules-v1"],
+        ["F9008002", "9008002", "20310101", "no", "", "0", "no", "rules-v1"],
+        ["F9008002", "9008002", "20310101", "yes", "haemorrhage", "0", "yes", "rules-v1"],   # yes wins
+    ])
+    prio, version, note = ep.load_priority(pf)
+    assert note is None and version == "rules-v1" and prio["F9008002"] == ("yes", ["haemorrhage"])
+    st, table, ages = _age_set([60, 30, 70], [20, 25, 50, 33], [0.9, 0.3, 0.8], [0.6, 0.1, 0.7, 0.2],
+                               pid_base=9003000)
+    p = ep.priority_block(st, table, prio, version, None)
+    # yes: F9003000 (0.9 flagged), F9003001 (0.3), F9008002 (0.7 flagged); no: F9003002 (0.8 flagged), F9008000
+    # (0.6 flagged); unknown: F9008001 ('') and F9008003 (no row)
+    assert (p["n_priority"], p["priority_flagged"], p["n_other"], p["other_flagged"], p["n_unknown"]) == \
+        (3, 2, 2, 2, 2)
+    assert p["by_reason"] == {"mass": {"n": 2, "flagged": 1}, "haemorrhage": {"n": 1, "flagged": 1},
+                              "recent_infarct": {"n": 1, "flagged": 1}}
+    assert p["auc_model"] == pytest.approx(ep.auc([0.9, 0.3, 0.7], [0.8, 0.6]))
+    assert p["auc_age_alone"] is None and p["rules_version"] == "rules-v1"
+    p2 = ep.priority_block(st, table, prio, version, ages)
+    assert p2["auc_age_alone"] == pytest.approx(ep.auc([60, 30, 50], [70, 20]))
+
+
+def _index_and_priority(tmp_path: Path) -> tuple[Path, Path]:
+    """For _batch: new studies J (abn 0.9, 45 y), K (abn 0.3, ~45.15 y from dates), C (normal 0.6, 6 months),
+    D (normal 0.1, no index row)."""
+    idx = tmp_path / "batch_x_index.csv"
+    _csv(idx, INDEX_HEADER, [["STUDY_J", "9000010", "045Y", "", "20310105", "MR"],
+                             ["STUDY_K", "9000010", "", "19860105", "20310301", "MR"],
+                             ["STUDY_C", "90000101", "006M", "", "20310110", "MR"],
+                             ["STUDY_A", "9000001", "070Y", "", "20310112", "MR"]])
+    pf = tmp_path / "batch_x_priority.csv"
+    _csv(pf, PRIORITY_HEADER, [["STUDY_J", "9000010", "20310105", "yes", "mass", "1", "yes", "rules-v1"],
+                               ["STUDY_K", "9000010", "20310301", "no", "", "1", "no", "rules-v1"],
+                               ["STUDY_C", "90000101", "20310110", "", "", "", "", "rules-v1"],
+                               ["STUDY_D", "9000020", "20310111", "yes", "haemorrhage;mass", "0", "yes", "rules-v1"],
+                               ["STUDY_A", "9000001", "20310112", "yes", "mass", "0", "yes", "rules-v1"]])
+    return idx, pf
+
+
+def test_end_to_end_with_index_and_priority(stub_model, tmp_path, capsys):
+    b = _batch(tmp_path)
+    idx, pf = _index_and_priority(tmp_path)
+    out = tmp_path / "pe.json"
+    assert ep.main(_argv(b, stub_model, out) + ["--index", str(idx), "--priority", str(pf)]) == 0
+    stdout = capsys.readouterr().out
+    text = out.read_text(encoding="utf-8")
+    payload = json.loads(text)
+    a = payload["age_new"]
+    assert (a["n_with_age"], a["n_without_age"]) == (3, 1)
+    assert a["auc_model"] == 0.5 and a["auc_age_alone"] == 1.0
+    assert a["age_rule_at_model_sensitivity"] == {"age_from": 45, "sensitivity": 1.0, "specificity": 1.0}
+    assert a["bands"][0]["normal_flagged"] == 1 and a["bands"][0]["specificity"] == 0.0
+    assert a["bands"][1]["abnormal_flagged"] == 1 and a["bands"][1]["n_abnormal"] == 2
+    assert a["normal_reports_aged_60_plus"] == 0                    # the 70-year-old is seen, not new
+    assert any("no usable age" in n for n in payload["notes"])
+    p = payload["priority_new"]
+    assert (p["n_priority"], p["priority_flagged"], p["n_other"], p["other_flagged"], p["n_unknown"]) == \
+        (2, 1, 1, 0, 1)
+    assert p["by_reason"] == {"mass": {"n": 2, "flagged": 1}, "haemorrhage": {"n": 1, "flagged": 0}}
+    assert p["auc_model"] == 0.5 and p["auc_age_alone"] == 0.0 and p["rules_version"] == "rules-v1"
+    assert "age (never-seen)" in stdout and "priority findings (never-seen)" in stdout
+    assert "age >= 45" in stdout
+    _assert_no_ids(stdout, b)
+    _assert_no_ids(text, b)
+
+
+def test_new_arguments_change_no_existing_number(stub_model, tmp_path):
+    """Without --index / --priority the payload only gains two null keys and two notes; with them, every
+    existing key keeps its value."""
+    b = _batch(tmp_path)
+    idx, pf = _index_and_priority(tmp_path)
+    plain = ep.evaluate(stub_model, b["set"], seen=[str(b["seen"])], holdout=b["holdout"], matched=b["matched"])
+    full = ep.evaluate(stub_model, b["set"], seen=[str(b["seen"])], holdout=b["holdout"], matched=b["matched"],
+                       index=idx, priority=pf)
+    assert plain["age_new"] is None and plain["priority_new"] is None
+    assert sum(1 for n in plain["notes"] if "no --index" in n or "no --priority" in n) == 2
+    assert (plain["inputs"]["index"], plain["inputs"]["priority"]) == (None, None)
+    assert (full["inputs"]["index"], full["inputs"]["priority"]) == (str(idx), str(pf))
+    strip = lambda d: {k: ({kk: vv for kk, vv in v.items() if kk not in ("index", "priority")} if k == "inputs" else v)
+                       for k, v in d.items() if k not in ("age_new", "priority_new", "notes")}
+    assert strip(plain) == strip(full)
+    assert [n for n in plain["notes"] if "--index" not in n and "--priority" not in n] == \
+        [n for n in full["notes"] if "--index" not in n and "--priority" not in n and "no usable age" not in n]
+
+
+def test_bom_in_index_and_priority_is_accepted(stub_model, tmp_path):
+    """A csv re-saved by Excel starts with a UTF-8 BOM: the study_folder column must still be found,
+    or the age baseline silently disappears behind a misleading 'no study_folder column' note."""
+    b = _batch(tmp_path)
+    idx, pf = _index_and_priority(tmp_path)
+    plain = ep.evaluate(stub_model, b["set"], seen=[str(b["seen"])], holdout=b["holdout"], matched=b["matched"],
+                        index=idx, priority=pf)
+    for fp in (idx, pf):
+        fp.write_bytes(b"\xef\xbb\xbf" + fp.read_bytes())
+    bom = ep.evaluate(stub_model, b["set"], seen=[str(b["seen"])], holdout=b["holdout"], matched=b["matched"],
+                      index=idx, priority=pf)
+    assert bom["age_new"] is not None and bom["priority_new"] is not None
+    assert bom["age_new"] == plain["age_new"] and bom["priority_new"] == plain["priority_new"]
+    assert not any("omitted" in n for n in bom["notes"])
+
+
+def test_index_and_priority_failures(stub_model, tmp_path):
+    b = _batch(tmp_path)
+    out = tmp_path / "pe.json"
+    assert ep.main(_argv(b, stub_model, out) + ["--index", str(tmp_path / "absent.csv")]) == 2
+    assert ep.main(_argv(b, stub_model, out) + ["--priority", str(tmp_path / "absent.csv")]) == 2
+    assert not out.exists()
+    bad = tmp_path / "bad.csv"
+    _csv(bad, ["modality"], [["MR"]])
+    assert ep.main(_argv(b, stub_model, out) + ["--index", str(bad), "--priority", str(bad)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["age_new"] is None and payload["priority_new"] is None
+    assert any("age_new omitted" in n for n in payload["notes"])
+    assert any("priority_new omitted" in n for n in payload["notes"])
+    # no studies.csv → no study key → folder map: a note, not a crash
+    b2 = _batch(tmp_path / "b2", with_studies_csv=False)
+    idx, pf = _index_and_priority(tmp_path)
+    payload = ep.evaluate(stub_model, b2["set"], index=idx, priority=pf)
+    assert payload["age_new"] is None and payload["priority_new"] is None
+    assert sum(1 for n in payload["notes"] if "no study key" in n) == 2

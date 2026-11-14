@@ -291,9 +291,44 @@ cd ~/Desktop/Siaa_ai/sentinel
   (исследования группы `new`, у которых заключение и снимки одного дня: самая чистая эталонная метка). Пациент из более раннего набора
   считается увиденным, даже если поставляемая модель на этом наборе не обучалась, — группа `new`
   ошибается в безопасную сторону.
+- Этап выполняет две команды. Сначала `scripts/report_priority.py` читает сопоставленные заключения и
+  записывает `data/<batch>_priority.csv`: для каждого исследования — есть ли в заключении **приоритетная
+  находка**, то есть находка, из-за которой исследование нужно прочитать раньше (объёмное образование,
+  свежий инфаркт, кровоизлияние, демиелинизация, истинная гидроцефалия, масс-эффект, сосудистое
+  поражение, инфекция, срочное направление или рекомендация контраста). Он читает заключения той же
+  модальности, что и релиз (`--modality`, по умолчанию MR); при `--modality any` — только заключения MR,
+  и тогда строки о приоритетных находках относятся только к исследованиям MR. Затем
+  `scripts/eval_prospective.py` получает ещё `--index data/<batch>_index.csv` (возраст пациентов) и
+  `--priority data/<batch>_priority.csv`.
 - Результат: `data/release/<tag>/prospective_eval.json` (`kind: prospective_eval`), полная таблица в
   `logs/prospective.log` и одна строка после этапа:
-  `prospective, never-seen patients: n N studies · sensitivity x · specificity y`.
+  `prospective, never-seen patients: n N studies · sensitivity x · specificity y · age alone AUC a (model m; model − age [lo, hi]), age-matched p · priority findings flagged k/K, others o/O`.
+  AUC печатаются с тремя знаками (0,779 против 0,776 не должно выглядеть как ничья); `[lo, hi]` —
+  95 % интервал разницы «модель минус возраст».
+- **Зачем строки про возраст.** 14 ноября 2026 года на 518 никогда не виденных исследованиях
+  поставляемая модель оказалась не лучше одного только возраста пациента (AUC 0,779 против 0,776); с
+  40 лет отмечалось почти каждое исследование. Теперь этап печатает это для каждой новой партии:
+  - `age alone AUC` — насколько хорошо один только возраст пациента отделяет заключения с патологией от
+    нормы; `model` — AUC модели на тех же исследованиях. `age-matched` — для двух пациентов близкого
+    возраста (разница до 5 лет) как часто модель ставит исследование с патологией выше (0,5 = случайно).
+  - В JSON (`age_new`): 95 % интервал разницы «модель минус возраст», правило по возрасту («возраст ≥ T»),
+    которое достигает чувствительности модели, с его специфичностью, и доля отмеченных по возрастным
+    группам (до 40, 40–59, 60+).
+  - `priority findings flagged k/K` — сколько исследований с приоритетной находкой отмечает порог
+    поставляемой модели; `others o/O` — сколько из всех остальных исследований он тоже отмечает. В JSON:
+    `priority_new`, со счётчиками по каждой находке (`by_reason`).
+- **Модель, которая не лучше одного только возраста, не доказывает обнаружение.** Если AUC модели явно
+  не превышает AUC одного только возраста (интервал разницы включает 0) или значение `age-matched` близко к 0,5,
+  модель в основном выучила возраст. Укажите это в сопроводительных заметках; не приводите её
+  чувствительность как обнаружение.
+- **Правила приоритетных находок предварительные** (`rules-v2`): это правила по ключевым словам в
+  заключении, ещё не проверенные рентгенологом. Читайте счётчики приоритетных находок как оценку.
+  Версия правил записана в столбце `rules_version` файла `data/<batch>_priority.csv` и в
+  `priority_new.rules_version`; не сравнивайте счётчики, полученные разными версиями.
+- **Таблица индекса обязательна.** Без `data/<batch>_index.csv` (её пишет `index`) проверка перед
+  `prospective` останавливает этап до запуска (`… missing (index stage output …)`): восстановите файл
+  или выполните этап индексации заново (`--from index`, нужен диск). Индекс без столбцов возраста — не
+  ошибка: строки про возраст тогда пусты, а причина указана в `notes`.
 - **Читайте главную группу `new`** (`groups.new` в JSON): `n_studies` / `n_patients`, `tp fn tn fp`,
   `sensitivity` с `sensitivity_ci95`, `specificity` с `specificity_ci95`, `balanced_accuracy`, `ppv`,
   `npv`, `flag_rate`, `prevalence`, `auc`. Сначала смотрите на ширину интервалов, потом на сами значения.
@@ -307,6 +342,11 @@ cd ~/Desktop/Siaa_ai/sentinel
   единственное измерение старой модели на них. У релиза, продвинутого старой версией скрипта, когда
   этого этапа ещё не было, записи `prospective` нет: `run … --resume` его завершает (`bump`, `bundle`),
   а `run` / `status` показывают `prospective skipped (promoted before this stage existed)`.
+- **Результат prospective, записанный до строк про возраст** (в его JSON нет `age_new` / `priority_new`),
+  молча не переиспользуется: `run … --resume` выполняет этап заново и печатает
+  `stage prospective re-run: recorded before the age baseline and the priority-finding counts existed`;
+  `status` тоже это отмечает. Заново оценивается только поставляемая модель — из-за этого больше
+  ничего не перезапускается. После `promote` результат остаётся замороженным как есть.
 - **Именно эти числа, а не числа гейта, описывают реальную работу на новых пациентах.** Набор гейта
   используется из релиза в релиз, и кандидата выбирают по нему; модель в проспективной проверке
   заморожена до появления этих заключений. Честные ограничения: эталонные метки взяты из рутинного
@@ -324,7 +364,7 @@ cd ~/Desktop/Siaa_ai/sentinel
 | 2 | `label` | `scripts/label_reports.py --reports … --out data/<batch>_labels.csv [--import-llm-labels <jsonl>]`, затем `… --benchmark` | распределение 9 классов + abnormal, доля `needs_review`; согласие бенчмарка + матрица ошибок против эталона на 894 пациента | согласие бенчмарка по `abnormal` ≥ 0,90 (иначе ненулевой код выхода); `needs_review` < 15 %; заметная доля `normal` |
 | 3 | `match` | `scripts/match_images_to_reports.py [--images …] --index … --labels … --out data/<batch>_matched.csv` | сопоставленные / несопоставленные исследования мозга, гистограмма `match_quality` | большинство исследований мозга сопоставлено; качество в основном «тот же id + та же дата»; немного «единственное заключение пациента» |
 | 4 | `build` | `scripts/build_training_set.py … --out data/sets/<batch> --mode binary --abnormal-col abnormal --skip-needs-review --modality MR` | записанные срезы по классам, правило модальности (отброшенные строки, исключённые исследования), `studies.csv` | ≈ 5 срезов на исследование; строк в `studies.csv` = сопоставленные исследования мозга минус `needs_review` минус строки, отброшенные как CT; КТ головы считается исключённым, срезов из него нет |
-| 5 | `prospective` | `scripts/eval_prospective.py --model models/brain_triage_finetuned --set data/sets/<batch> --seen <earlier sets> [--seen data/train_release_<previous tag>] --holdout data/holdout_patients_v1.txt --matched data/<batch>_matched.csv --out data/release/<tag>/prospective_eval.json --device mps` | `NEW PATIENTS (never seen by this model)` с чувствительностью / специфичностью и 95 % ДИ, таблица по группам, перебор порогов (описательный) | `prospective_eval.json` записан; группа `new` не пуста; числа прочитаны и сохранены (информационно, никогда не гейт — раздел 4d) |
+| 5 | `prospective` | `scripts/report_priority.py --matched data/<batch>_matched.csv --labels data/<batch>_labels.csv --out data/<batch>_priority.csv [--modality MR]`, затем `scripts/eval_prospective.py --model models/brain_triage_finetuned --set data/sets/<batch> --seen <earlier sets> [--seen data/train_release_<previous tag>] --holdout data/holdout_patients_v1.txt --matched data/<batch>_matched.csv --index data/<batch>_index.csv --priority data/<batch>_priority.csv --out data/release/<tag>/prospective_eval.json --device mps` | счётчики приоритетных находок; `NEW PATIENTS (never seen by this model)` с чувствительностью / специфичностью и 95 % ДИ, AUC одного возраста и строки приоритетных находок, таблица по группам, перебор порогов (описательный) | `data/<batch>_priority.csv` и `prospective_eval.json` записаны; группа `new` не пуста; AUC модели сравнён с AUC одного возраста; числа прочитаны и сохранены (информационно, никогда не гейт — раздел 4d) |
 | 6 | `combine` | `scripts/combine_training_sets.py --sets data/local_finetune_bin … data/sets/<batch> --holdout data/holdout_patients_v1.txt [--train-lock …] --out data/train_release_<tag>` | счётчики по партиям, классы по сплитам (train / val / tune), конфликты меток (побеждает последний набор), число закреплённых за train, проверка holdout | **0** пересечений пациентов train/val/tune; все 178 отложенных пациентов в `val`; один класс на пациента; есть `tune/`; записан `dataset_manifest.json` |
 | 7 | `train` | `training/finetune_brain_classifier.py … --base-model models/brain_triage_finetuned --epochs 12 --device mps --select-split tune --output models/brain_triage_candidate_<tag>` | loss + accuracy по эпохам; лучшая эпоха выбирается по `tune/`, никогда по `val` (набору гейта) | loss падает и выходит на плато; нет NaN; записан `training_metrics.json` с `checkpoint_selection.split = tune` |
 | 8 | `gate` | `scripts/eval_study_level.py --model <candidate> --data data/train_release_<tag>/val --write-manifest --min-sens 0.85 --min-spec 0.40 --compare-with models/brain_triage_finetuned` | чувствительность/специфичность на уровне исследования с 95 % ДИ для кандидата и старой модели, вердикт `promotion`, покрытие holdout | гейт **пройден**, `promotion.promote = true`, `protocol` = продакшн (среднее по 5 центральным срезам @0,50, предиктор реестра), `holdout_covered = true`, `MANIFEST.json` записан рядом с кандидатом |
@@ -339,7 +379,8 @@ train/val/tune нет и каждый holdout-id в `val`, есть `tune/` (т�
 без `tune/` релиз останавливается), ≥ 20 ГБ свободно (диск не проверяется: `train` читает только
 локальный релизный набор). **Перед `prospective`**: релизный набор, на котором обучена поставляемая
 модель (если он есть), на месте и не изменён, поэтому передаётся как `--seen`, — или `--train-lock`
-называет его папкой (раздел 4d). **Перед `combine`**: тот же набор на месте и не изменён (его пациенты
+называет его папкой (раздел 4d); без `data/<batch>_index.csv` этап тоже не запускается (для сравнения
+с возрастом нужен возраст пациентов). **Перед `combine`**: тот же набор на месте и не изменён (его пациенты
 закреплены за `train`), или задан `--train-lock`. **Перед `bundle`**: гейт
 пройден и promotion = true у продвинутой модели, плюс все правила `promote_model.py` (релизные пороги,
 продакшн-протокол, релизный val / покрытие holdout, оценка привязана к этим весам),
@@ -525,7 +566,7 @@ train/val/tune нет и каждый holdout-id в `val`, есть `tune/` (т�
 ## 9. Возобновление, статус и устранение неполадок
 
 - `/Users/shakhzodbtr/venv/bin/python scripts/release_pipeline.py status --batch <batch>` — таблица этапов (pending / running / done / archived / failed) с путями к логам, вердиктами проверок и вердиктом гейта; тег берётся из `data/release/LATEST`.
-- `--resume` пропускает этап со статусом `done`, чьи выходы на месте и входы не изменились (sha256 входных файлов: `studies.csv` каждого объединяемого набора — для старого набора без него отсортированный список файлов, — файлы holdout и train-lock, `dataset_manifest.json`, веса кандидата, JSONL с LLM-метками; скрытые файлы вроде `.DS_Store` из Finder не учитываются; для `parse` также порядок источников заключений, если их несколько, для `build` значение `--modality`, для `prospective` `MANIFEST.json` поставляемой модели, для `train` значения `--base-model` и `--epochs`); иначе этап выполняется заново.
+- `--resume` пропускает этап со статусом `done`, чьи выходы на месте и входы не изменились (sha256 входных файлов: `studies.csv` каждого объединяемого набора — для старого набора без него отсортированный список файлов, — файлы holdout и train-lock, `dataset_manifest.json`, веса кандидата, JSONL с LLM-метками; скрытые файлы вроде `.DS_Store` из Finder не учитываются; для `parse` также порядок источников заключений, если их несколько, для `build` значение `--modality`, для `prospective` `MANIFEST.json` поставляемой модели и таблицы меток и индекса партии, для `train` значения `--base-model` и `--epochs`); иначе этап выполняется заново.
 - `promote` **перемещает** папку кандидата в `models/brain_triage_finetuned`. Он записывает `archived_candidate` в `state.json` и помечает `train` и `gate` как `archived` (= выполнено), поэтому возобновление после promote выполняет только оставшееся (`bump`, `bundle`). Этап, чьих выходов уже нет, тоже считается выполненным, если выполнен более поздний этап, — если только его не называет `--from` / `--only`. После promote этапы `prospective` / `combine` / `train` / `gate` / `promote` под тем же тегом больше не запускаются (гейт сравнил бы нового кандидата с самим собой; combine переписал бы val-набор, к которому привязана оценка продвинутой модели; prospective оценил бы новую модель на её же обучающих пациентах), а `--resume` считает все этапы до `promote` замороженными, даже если какой-то входной файл с тех пор изменился, — остаются только `bump` и `bundle`. Изменения после promote идут в следующий релиз (новый тег).
 - Релиз, продвинутый старой версией скрипта (когда этапа `prospective` ещё не было), завершается так же: `run --batch <batch> --resume` выполняет `bump` и `bundle`; `prospective` в `run` и `status` показан как `skipped (promoted before this stage existed)` и под этим тегом никогда не запускается.
 - Этап `build`, записанный старой версией до правила «только МРТ», считается выполненным с `--modality any`: `--resume` до promote заново запускает `build` по правилу (`stage build re-run: inputs changed`), а с ним и все последующие этапы.
@@ -552,6 +593,7 @@ train/val/tune нет и каждый holdout-id в `val`, есть `tune/` (т�
 | ☐ | Заключения разобраны, модальность из заголовков секций, все поставки переданы от старой к новой, имён нет ни в одном CSV | `data/<batch>_reports.csv`, `logs/parse.log` |
 | ☐ | Обучающий набор только МРТ (`--modality MR`), КТ головы учтено как исключённое | `logs/build.log`, `data/sets/<batch>/studies.csv` → `modality` |
 | ☐ | Проспективные числа поставляемой модели на никогда не виденных пациентах прочитаны и сохранены (информационно) | `prospective_eval.json` → `groups.new`, `logs/prospective.log` |
+| ☐ | AUC модели сравнён с AUC одного возраста, счётчики приоритетных находок прочитаны (модель, которая не лучше одного только возраста, не доказывает обнаружение) | `prospective_eval.json` → `age_new`, `priority_new`; `data/<batch>_priority.csv` |
 | ☐ | Бенчмарк разметки ≥ 0,90 по `abnormal` | `logs/label.log`, `state.json` → `guards.label_benchmark` |
 | ☐ | ≥ 300 нормальных исследований сопоставлено (или задокументированная причина продолжать) | `state.json` → `guards.matched_counts` / `guards.pre_train`, `logs/guards.log` |
 | ☐ | 0 пересечений train/val/tune, 178 holdout-id в val | `data/train_release_<tag>/dataset_manifest.json`, `logs/guards.log` |

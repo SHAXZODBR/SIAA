@@ -211,7 +211,7 @@ by default (`release_pipeline.py --modality any` leaves the flag out):
 - The rule applies to the set being built. Sets that already exist — the batch-1 legacy set
   `data/local_finetune_bin`, earlier `data/sets/*` — are combined as built and never re-checked.
 
-### 4b. prospective (orchestrator stage after build) — `scripts/eval_prospective.py --model <shipped model> --set data/sets/<batch> [--seen <set>]… [--holdout data/holdout_patients_v1.txt] [--matched data/<batch>_matched.csv] --out data/release/<tag>/prospective_eval.json [--device mps]`
+### 4b. prospective (orchestrator stage after build) — `scripts/report_priority.py --matched data/<batch>_matched.csv --labels data/<batch>_labels.csv --out data/<batch>_priority.csv`, then `scripts/eval_prospective.py --model <shipped model> --set data/sets/<batch> [--seen <set>]… [--holdout data/holdout_patients_v1.txt] [--matched data/<batch>_matched.csv] [--index data/<batch>_index.csv] [--priority data/<batch>_priority.csv] --out data/release/<tag>/prospective_eval.json [--device mps]`
 Question: how does the model shipped TODAY do on patients it never saw? Runs BEFORE combine / train use
 the batch, with the shipped protocol of `eval_study_level.py` (one `make_predictor`, `collect_study_probs`
 on every split of the set, `PROTOCOL_AGGREGATION` @ `PROTOCOL_THRESHOLD`, `score_studies`, Wilson CIs).
@@ -237,8 +237,10 @@ incomplete `--seen` list, which would count trained-on patients as `new`; remedy
   specificity(+_ci95), balanced_accuracy, ppv, npv, flag_rate, prevalence, auc` (empty denominator →
   null). For `new` also `threshold_sweep_new` (descriptive only) and `findings_new` (per finding; a label
   that disagrees with its class folder is keyed `<label> (reference <cls>)`).
-- JSON: `kind: prospective_eval`, `schema_version: 1`, `evaluated_on`, `model {path, identity}`,
-  `protocol`, `inputs`, `groups`, `threshold_sweep_new`, `findings_new`, `notes` — written atomically,
+- JSON: `kind: prospective_eval`, `schema_version: 2`, `evaluated_on`, `model {path, identity}`,
+  `protocol`, `inputs` (`set`, `seen`, `holdout`, `matched`, `index`, `priority` — null when not given —
+  `n_png`, `n_studies`), `groups`, `threshold_sweep_new`, `findings_new`, `age_new`, `priority_new`
+  (both null with a note without a usable `--index` / `--priority`), `notes` — written atomically,
   counts only (no patient ids, no study folders, neither in the JSON nor on stdout). Stdout starts with
   `NEW PATIENTS (never seen by this model): …`.
 - exit 0 = it ran, whatever the numbers (never a gate); exit 2 = unusable input (path missing, set
@@ -246,8 +248,9 @@ incomplete `--seen` list, which would count trained-on patients as `new`; remedy
   The model's files are checked against its `MANIFEST.json` before scoring (`eval_study_level.
   check_manifest`): a mismatch is exit 2; a directory without a manifest is scored with a note and
   `model.manifest_verified: false`.
-- orchestrator: inputs `studies.csv`, the matched CSV, the holdout, the extra sets, the trained-on release
-  set (when added), the shipped model's `MANIFEST.json`; good =
+- orchestrator: inputs `studies.csv`, the matched CSV, the labels CSV, the index CSV, the holdout, the extra
+  sets, the trained-on release set (when added), the shipped model's `MANIFEST.json`; outputs the JSON and
+  `data/<batch>_priority.csv`; good =
   the JSON exists, parses, has `kind` `prospective_eval` and a `groups` object (else the stage is failed,
   and an invalid JSON is not done on `--resume`); prints `prospective, never-seen patients: n N studies ·
   sensitivity x · specificity y`. Never re-run after promote (it is in `NO_RERUN_AFTER_PROMOTE` and
@@ -255,6 +258,38 @@ incomplete `--seen` list, which would count trained-on patients as `new`; remedy
   state promoted by an older version (no `prospective` record) counts it as done with the reason
   `NOT_APPLICABLE_AFTER_PROMOTE`: `run` prints `stage prospective skipped (promoted before this stage
   existed)`, `status` shows `skipped (…)`, and `--resume` finishes bump + bundle.
+- age baseline and priority findings (added 2026-11-14, after the shipped model was matched by patient age
+  alone on 518 never-seen studies — AUC 0.779 vs 0.776). The stage runs TWO commands in order:
+  `scripts/report_priority.py --matched data/<batch>_matched.csv --labels data/<batch>_labels.csv --out
+  data/<batch>_priority.csv` (one row per matched brain report: `priority yes|no|''`, `reasons`, `wm_grade`,
+  `focal`, `rules_version` (`rules-v2` since the review of 2026-11-14; any rule change bumps it); exit 1 =
+  unusable input, nothing written → an ordinary stage failure; the orchestrator adds `--modality <MR|CT>`
+  as for build, nothing with `--modality any` = MR reports only; csv inputs may carry a UTF-8 BOM),
+  then `eval_prospective.py … --matched … --index data/<batch>_index.csv --priority data/<batch>_priority.csv
+  --out …`. The JSON gains `age_new` (age-alone AUC vs the model's, patient-level bootstrap CI of the
+  difference, age-matched AUC within 5 years, the age rule at the model's sensitivity, bands under 40 /
+  40-59 / 60+) and `priority_new` (priority-finding studies flagged vs other studies flagged, per reason) —
+  `null` with a note when the argument is missing or unusable. Group `new` only, shipped protocol and
+  threshold; never a gate. A model that does not beat the age baseline is not evidence of detection; the
+  priority rules are provisional.
+- orchestrator, age / priority: `Config.priority_csv` = `data/<batch>_priority.csv` (next to matched /
+  labels / index); inputs gain the labels CSV and the index CSV (always `data/<batch>_index.csv`: the
+  orchestrator has no option to move it), outputs gain the priority CSV. A missing index is an ERROR of
+  `guard_pre_prospective` (the stage is refused before report_priority.py runs): `eval_prospective.py`
+  exits 2 for a missing `--index` file, and the age baseline must be printed for every batch. An index
+  without usable age columns is not an error (`age_new` null with a note). The headline appends
+  `· age alone AUC a (model m; model − age [lo, hi]), age-matched p · priority findings flagged k/K,
+  others o/O` when the blocks are present and not null (`_age_priority_suffix`; three decimals, the
+  interval only when `auc_difference_ci95` is present); unchanged for an older JSON. Legacy record: a
+  prospective JSON without the `age_new` / `priority_new` KEYS (`prospective_predates_age_priority`) is not
+  done on `--resume` — `stage_is_done` returns `PREDATES_AGE_PRIORITY` (checked after the outputs-consumed
+  rule, so a missing priority CSV forgiven because combine is done does not hide it; the new labels / index
+  inputs alone would also re-run it as "inputs changed"). Nothing downstream depends on the prospective
+  outputs, so only this stage re-runs. After promote the frozen rule wins: the old JSON is kept, `status`
+  notes `… — frozen after promote`. A real `eval_prospective.py` older than `--index` / `--priority`
+  cannot produce such a run: argparse rejects the unknown arguments (exit 2) and the stage FAILS. A JSON
+  that still lacks the keys after a successful run (defensive check only) is done with a warning, never
+  reused by `--resume`.
 - honest scope: these numbers, not the gate's, describe performance on new patients; reference labels are
   report-derived (one reader, parsed), one clinic, not a pre-registered consecutive cohort; `needs_review`
   studies and (under the rule) non-MR studies are not in the set.
@@ -389,7 +424,9 @@ commands without running. Additions after the 2026-11 round:
   guard (`guard_pre_prospective`, in `GUARDS` / `GUARD_TEXT`) refuses the stage when the release set the
   shipped model was trained on is gone or rebuilt. After promote, a frozen stage with no record (a state
   promoted before `prospective` existed) is done with the reason `NOT_APPLICABLE_AFTER_PROMOTE`; an explicit
-  `prospective` / `combine` / `train` / `gate` / `promote` run after promote is still refused.
+  `prospective` / `combine` / `train` / `gate` / `promote` run after promote is still refused. The stage
+  runs `report_priority.py` then `eval_prospective.py --index … --priority …` (4b); a prospective record
+  from before the age / priority blocks is re-run by `--resume` unless the release is promoted.
 - Only `index` and `build` need the drive (`NEEDS_ROOT`); match gets `--images <root>` only when a root is
   configured. `main()` refuses up front only when the first stage that will actually run needs the drive;
   otherwise `cmd_run` runs the stages before it and stops at the first NEEDS_ROOT stage with

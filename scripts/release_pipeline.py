@@ -78,6 +78,20 @@
     separately: data/release/<tag>/prospective_eval.json. Informational, never a gate:
     exit 0 = it ran. Its guard rail refuses to run when that trained-on set is gone or rebuilt
     (restore it, or pass --train-lock <release set dir>).
+    Two commands: first report_priority.py writes data/<batch>_priority.csv (which matched report
+    carries a priority finding — mass, recent infarct, haemorrhage, …; provisional rules, version in
+    the file; --modality as for build, MR when --modality any), then
+    eval_prospective.py gets --index data/<batch>_index.csv and --priority <that file> and adds
+    'age_new' (the AUC of patient age alone, age-matched pairs, age bands) and 'priority_new' (how many
+    priority-finding studies vs other studies the shipped threshold flags). WHY: on 2026-11-14 the
+    shipped model was matched by age alone on 518 never-seen studies. The headline prints both. A
+    missing index table is a guard-rail ERROR (eval_prospective.py refuses a missing --index file, and
+    the age baseline must be printed for every batch): restore it or re-run --from index. An index
+    without usable age columns is not an error: the script then writes age_new null with a note.
+    An eval_prospective.py older than --index / --priority fails the stage (argparse, exit 2).
+    A prospective result written before these blocks
+    (no age_new / priority_new key) is re-run by --resume, never reused silently — except after
+    promote, where the stage stays frozen as it is.
 
   CANDIDATES (--candidates warm,fresh; default warm — decision D6 of docs/dev/finish_line_contract.md)
     warm   starts from --base-model (default the current release models/brain_triage_finetuned)
@@ -224,6 +238,8 @@ class Config:
     def labels_csv(self) -> str: return f'data/{self.batch}_labels.csv'
     @property
     def matched_csv(self) -> str: return f'data/{self.batch}_matched.csv'
+    @property
+    def priority_csv(self) -> str: return f'data/{self.batch}_priority.csv'
     @property
     def set_dir(self) -> str: return f'data/sets/{self.batch}'
     @property
@@ -710,8 +726,56 @@ def prospective_headline(p: Path) -> Optional[str]:
     new = groups.get('new') if isinstance(groups, dict) else None
     if not isinstance(new, dict):
         return None
-    return (f'prospective, never-seen patients: n {new.get("n_studies", "—")} studies · '
+    line = (f'prospective, never-seen patients: n {new.get("n_studies", "—")} studies · '
             f'sensitivity {_fmt(new.get("sensitivity"))} · specificity {_fmt(new.get("specificity"))}')
+    return line + _age_priority_suffix(_read_json(p))
+
+
+def _fmt3(x) -> str:
+    return f'{x:.3f}' if isinstance(x, (int, float)) and not isinstance(x, bool) else '—'
+
+
+def _count(x) -> str:
+    return str(x) if isinstance(x, int) and not isinstance(x, bool) else '—'
+
+
+def _age_priority_suffix(d: dict) -> str:
+    """' · age alone AUC … · priority findings flagged …' from the age_new / priority_new blocks.
+    WHY on the headline: on 2026-11-14 the shipped model was matched by patient age alone on never-seen
+    studies; a release reader must see the age baseline next to the model's numbers every time.
+    Three decimals (not two): on new1 age alone scored 0.779 and the model 0.776 — two decimals would print a
+    tie and hide that age alone was higher. The interval of the difference (model − age) is what the runbook
+    says to judge by, so it is on the line too when present.
+    Empty when the blocks are null or absent (an unusable index / priority file, or a JSON written before
+    the blocks existed)."""
+    out = ''
+    age = d.get('age_new')
+    if isinstance(age, dict):
+        ci = age.get('auc_difference_ci95')
+        ci_txt = (f'; model − age [{_fmt3(ci[0])}, {_fmt3(ci[1])}]'
+                  if isinstance(ci, (list, tuple)) and len(ci) == 2 else '')
+        out += (f' · age alone AUC {_fmt3(age.get("auc_age_alone"))} (model {_fmt3(age.get("auc_model"))}'
+                f'{ci_txt}), age-matched {_fmt3(age.get("auc_age_matched"))}')
+    pri = d.get('priority_new')
+    if isinstance(pri, dict):
+        out += (f' · priority findings flagged {_count(pri.get("priority_flagged"))}/{_count(pri.get("n_priority"))}, '
+                f'others {_count(pri.get("other_flagged"))}/{_count(pri.get("n_other"))}')
+    return out
+
+
+AGE_PRIORITY_KEYS = ('age_new', 'priority_new')
+
+
+def prospective_predates_age_priority(p: Path) -> bool:
+    """True when a (valid) prospective_eval.json was written before the age baseline and the
+    priority-finding counts existed: it has no 'age_new' / 'priority_new' key at all. A key that is
+    null means the new script ran without a usable index / priority file — that is current, not stale."""
+    d = _read_json(p)
+    return bool(d) and any(k not in d for k in AGE_PRIORITY_KEYS)
+
+
+PREDATES_AGE_PRIORITY = ('recorded before the age baseline and the priority-finding counts existed '
+                         '(prospective_eval.json has no age_new / priority_new)')
 
 
 def read_eval(model_dir: Path) -> dict:
@@ -757,15 +821,28 @@ def build_stages(cfg: Config) -> list[Stage]:
     prospective_cmd = [py, 'scripts/eval_prospective.py', '--model', BASE_MODEL, '--set', cfg.set_dir]
     for s in cfg.extra_sets + ([seen_release] if seen_release else []):
         prospective_cmd += ['--seen', s]
+    # --index / --priority: the age baseline and the priority-finding counts (review 2026-11-14: on
+    # never-seen studies the shipped model was matched by patient age alone). The priority table comes
+    # from the reports (report_priority.py, the stage's first command); the ages from the index stage's
+    # table, always data/<batch>_index.csv — eval_prospective.py refuses a missing --index file (exit 2),
+    # so the pre-prospective guard stops a run without it before anything is scored.
+    # report_priority.py reads the reports of the same modality as the set (build's --modality); with
+    # --modality any it keeps its default, MR (it has no 'any'): the priority lines then cover MR only.
+    # No opt:modality input is needed: a modality change rebuilds the set, whose studies.csv is an input.
+    priority_cmd = [py, 'scripts/report_priority.py', '--matched', cfg.matched_csv,
+                    '--labels', cfg.labels_csv, '--out', cfg.priority_csv]
+    if cfg.modality != MODALITY_ANY:
+        priority_cmd += ['--modality', cfg.modality]
     prospective_cmd += ['--holdout', cfg.holdout, '--matched', cfg.matched_csv,
+                        '--index', cfg.index_csv, '--priority', cfg.priority_csv,
                         '--out', cfg.prospective_json, '--device', cfg.device]
     seen_release_input = []
     if seen_release:
         seen_release_input = [f'{seen_release}/dataset_manifest.json'
                               if (cfg.repo / seen_release / 'dataset_manifest.json').is_file()
                               else set_input(cfg.repo, seen_release)]
-    prospective_inputs = [f'{cfg.set_dir}/studies.csv', cfg.matched_csv, cfg.holdout,
-                          *(set_input(cfg.repo, s) for s in cfg.extra_sets), *seen_release_input,
+    prospective_inputs = [f'{cfg.set_dir}/studies.csv', cfg.matched_csv, cfg.labels_csv, cfg.index_csv,
+                          cfg.holdout, *(set_input(cfg.repo, s) for s in cfg.extra_sets), *seen_release_input,
                           f'{BASE_MODEL}/MANIFEST.json']
 
     label_cmds = [[py, 'scripts/label_reports.py', '--reports', cfg.reports_csv, '--out', cfg.labels_csv]]
@@ -842,10 +919,14 @@ def build_stages(cfg: Config) -> list[Stage]:
               [build_cmd],
               inputs=[cfg.matched_csv, 'opt:modality'], outputs=[cfg.set_dir, f'{cfg.set_dir}/studies.csv'],
               good='≈ 5 slices per study, studies.csv row count = matched brain studies minus needs_review'),
-        Stage('prospective', 'Score the model shipped today on the new batch (never-seen patients reported apart)',
-              [prospective_cmd], inputs=prospective_inputs, outputs=[cfg.prospective_json],
-              good=f'{cfg.prospective_json} with kind "{PROSPECTIVE_KIND}"; the "new" group = patients no '
-                   'earlier set contains (informational, not a gate)'),
+        Stage('prospective', 'Score the model shipped today on the new batch (never-seen patients reported apart; '
+                             'age baseline + priority findings)',
+              [priority_cmd, prospective_cmd], inputs=prospective_inputs,
+              outputs=[cfg.prospective_json, cfg.priority_csv],
+              good=f'{cfg.priority_csv} (priority findings from the reports, provisional rules) and {cfg.prospective_json} '
+                   f'with kind "{PROSPECTIVE_KIND}"; the "new" group = patients no earlier set contains; the age-alone '
+                   'AUC and the priority-finding counts printed (informational, not a gate: a model that does not '
+                   'beat age alone is not evidence of detection)'),
         Stage('combine', 'Merge all sets, patient-level split (train / val / tune), locked holdout → val',
               [combine_cmd], inputs=combine_inputs,
               outputs=[cfg.release_set, manifest],
@@ -1083,9 +1164,16 @@ def guard_pre_train(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
 
 def guard_pre_prospective(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
     """The set the shipped model was trained on must be a --seen set, or 'new' is not never-seen
-    (fail closed: never score with an incomplete --seen list)."""
+    (fail closed: never score with an incomplete --seen list). The batch index table (patient ages) must
+    be present too: eval_prospective.py refuses a missing --index file (exit 2), and the age baseline is
+    the one line that shows whether a model learned age (review 2026-11-14) — so it is an error here,
+    stated before anything runs, not a stage failure after the priority table was already rewritten."""
     _seen, problem = prospective_seen_release(cfg)
-    return ([problem] if problem else []), []
+    errors = [problem] if problem else []
+    if not (cfg.repo / cfg.index_csv).is_file():
+        errors.append(f'{cfg.index_csv} missing (index stage output; the prospective stage needs the patient '
+                      f'ages for the age baseline) — restore it, or re-run the index stage (--from index)')
+    return errors, []
 
 
 def guard_pre_combine(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
@@ -1152,7 +1240,8 @@ GUARDS: dict[str, Callable[[Config, dict], tuple[list[str], list[str]]]] = {
 }
 GUARD_TEXT = {
     'prospective': ['the release set the shipped model was trained on (if any) is present and unchanged, '
-                    'so it is passed as --seen, or --train-lock names it as a directory'],
+                    'so it is passed as --seen, or --train-lock names it as a directory',
+                    'the batch index table (patient ages) is present'],
     'combine': ['the set the current model was trained on is present and unchanged (its patients are '
                 'locked to train), or --train-lock is given'],
     'train': ['label benchmark passed (or --skip-benchmark)',
@@ -1256,6 +1345,11 @@ def stage_is_done(cfg: Config, stage: Stage, state: dict,
         problem = prospective_problem(cfg.repo / cfg.prospective_json)
         if problem:
             return False, f'outputs invalid: {problem}'
+        # a result from before the age / priority lines is never reused silently (a promoted release
+        # returned above: frozen as it is). A missing priority csv forgiven by the outputs-consumed
+        # rule (a later stage is done) does not hide it.
+        if prospective_predates_age_priority(cfg.repo / cfg.prospective_json):
+            return False, PREDATES_AGE_PRIORITY
     recorded = rec.get('input_sha256s')
     if recorded and inputs_changed(recorded, input_fingerprints(cfg, stage, state)):
         return False, 'inputs changed since the last run'
@@ -1608,6 +1702,12 @@ def run_stage(cfg: Config, stage: Stage, state: dict) -> int:
         headline = prospective_headline(cfg.repo / cfg.prospective_json)
         if headline:
             print(f'  {headline}')
+        if prospective_predates_age_priority(cfg.repo / cfg.prospective_json):
+            # defensive only: a real eval_prospective.py older than --index / --priority fails the stage
+            # (argparse exit 2). A JSON without the keys (e.g. a hand-copied old file) is not a failure
+            # (nothing here is a gate), but never silent: a --resume runs it again
+            print(f'{Y}  ⚠ {cfg.prospective_json} has no age_new / priority_new: it was not written by the '
+                  f'current scripts/eval_prospective.py — the age baseline is missing from this release{NC}')
     return 0
 
 
@@ -1648,6 +1748,10 @@ def manual_steps(cfg: Config) -> list[str]:
         'Do NOT publish the draft release while it holds the full installer: on the public code '
         'repository that would make the model downloadable by anyone. Hand the installer to the clinic '
         'directly, with the new sensitivity / specificity and the model identity in the hand-over notes.',
+        f'Read the prospective lines before you describe the model ({cfg.prospective_json}: age_new, '
+        f'priority_new; {cfg.priority_csv}): a model that does not beat the age-alone AUC is not evidence of '
+        'detection — say so in the hand-over notes. The priority rules are provisional '
+        f'(their version is in the rules_version column of {cfg.priority_csv}).',
         f'Keep {cfg.release_dir}/ (state.json = stage + guard verdicts, logs/guards.log = guard evidence, '
         'logs/, bundle parts) until the hospital confirms the install.',
     ]
@@ -1673,7 +1777,10 @@ def cmd_plan(cfg: Config, stages: list[Stage]) -> int:
     print(f'# report sources (oldest delivery first): {" ".join(cfg.report_sources) or "(none)"}')
     print('# modality rule (build): ' + (f'none (--modality {MODALITY_ANY})' if cfg.modality == MODALITY_ANY
                                          else f'{cfg.modality} only (--modality {cfg.modality})'))
-    print(f'# prospective: scores the model shipped today ({BASE_MODEL}) before this release replaces it')
+    print(f'# prospective: scores the model shipped today ({BASE_MODEL}) before this release replaces it; '
+          f'writes {cfg.priority_csv} (priority findings from the reports) and prints the age-alone AUC and '
+          'the priority-finding counts for never-seen patients (informational, not a gate); priority from '
+          + (f'{cfg.modality} reports' if cfg.modality != MODALITY_ANY else 'MR reports only (--modality any)'))
     if cfg.multi:
         print('# candidates: ' + '; '.join(
             f'{c} from {cfg.candidate_base(c)}{" (--base-model-fresh)" if c == "fresh" else ""} → '
@@ -1716,6 +1823,11 @@ def cmd_status(cfg: Config, stages: list[Stage]) -> int:
               f'{rec.get("finished") or "":<20} {rec.get("log", "")}')
         if st == 'failed':
             print(f'           {R}{rec.get("verdict") or rec.get("failed_cmd") or rec.get("error", "")}{NC}')
+        if s.name == 'prospective' and st == 'done' and \
+                prospective_predates_age_priority(cfg.repo / cfg.prospective_json):
+            note = ('frozen after promote' if archived_candidate(state)
+                    else 'a --resume runs it again to add them')
+            print(f'           {Y}{PREDATES_AGE_PRIORITY} — {note}{NC}')
     if cfg.multi or state.get('candidates'):
         _print_candidate_table(cfg, state)
     for name, g in (state.get('guards') or {}).items():

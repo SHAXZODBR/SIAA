@@ -516,3 +516,124 @@ def test_release_runbook_never_publishes_the_draft_or_pastes_the_secret(lang):
     the full installer from the workflow artifacts — and it must keep the "do not publish" rule."""
     text = (DOCS / f"release_runbook_{lang}.md").read_text(encoding="utf-8")
     assert not runbook_publish_problems(text, lang), (lang, runbook_publish_problems(text, lang))
+
+
+# ---------------------------------------------------------------- the age limitation (measured 2026-11-14)
+
+AGE_LIMITATION = {
+    "en": ("**The flag follows patient age.**", "AUC 0.78 for both", "29 of 30 normal studies flagged",
+           "42 were flagged, but so were 396 of the other 472"),
+    "ru": ("**Флаг следует за возрастом пациента.**", "AUC 0,78 в обоих случаях", "отмечено 29 из 30 нормальных исследований",
+           "отмечено 42, но отмечены и 396 из остальных 472"),
+    "uz": ("**Belgi bemor yoshiga bog‘liq.**", "ikkalasida AUC 0,78", "30 ta normal tekshiruvdan 29 tasi belgilangan",
+           "42 tasi belgilangan, biroq qolgan 472 tadan 396 tasi ham belgilangan"),
+}
+PILOT_AGE_AND_PRIORITY = {
+    "en": ("age_band (under 40 / 40-59 / 60+) | priority_finding (yes/no)", "**in each age band**",
+           "flag every patient aged 40 or more", "By age band (under 40 | 40-59 | 60+)"),
+    "ru": ("возрастная_группа (до 40 / 40–59 / 60+) | приоритетная_находка (да/нет)", "**в каждой возрастной группе**",
+           "отмечать каждого пациента 40 лет и старше", "По возрастным группам (до 40 | 40–59 | 60+)"),
+    "uz": ("age_band (under 40 / 40-59 / 60+) | priority_finding (yes/no)", "**har bir yosh guruhida**",
+           "40 va undan katta yoshdagi har bir bemorni belgilash", "Yosh guruhlari bo‘yicha (40 gacha | 40–59 | 60+)"),
+}
+SALES_AGE_SENTENCE = {
+    "sales/one_pager_en.md": "the flag largely followed patient age: from the age of 40 almost every study was flagged",
+    "sales/one_pager_ru.md": "флаг во многом следовал за возрастом пациента: с 40 лет отмечалось почти каждое исследование",
+    "sales/one_pager_uz.md": "belgi asosan bemor yoshiga bog‘liq bo‘ldi: 40 yoshdan boshlab",
+    "sales/pilot_proposal_en.md": "the flag largely followed patient age (from the age of 40 almost every study was flagged)",
+    "sales/pilot_proposal_ru.md": "флаг во многом следовал за возрастом пациента (с 40 лет отмечалось почти каждое исследование)",
+}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_intended_use_states_that_the_flag_follows_patient_age(lang):
+    """November 2026: patient age alone predicts the report as well as the model does, and from the age of
+    40 almost every study is flagged. A clinic must be able to read this next to the validated figures
+    (docs/dev/model_findings_2026-11.md, section 6)."""
+    text = _doc("intended_use", lang)
+    for phrase in AGE_LIMITATION[lang]:
+        assert phrase in text, (lang, phrase)
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_pilot_protocol_reports_by_age_band_and_priority_finding(lang):
+    """The pilot must show whether the flag beats a plain age rule and whether it singles out priority
+    findings: the adjudication log has the two columns and the report has the two lines."""
+    text = _doc("pilot_evaluation_protocol", lang)
+    for phrase in PILOT_AGE_AND_PRIORITY[lang]:
+        assert phrase in text, (lang, phrase)
+
+
+@pytest.mark.parametrize("rel", sorted(SALES_AGE_SENTENCE))
+def test_sales_documents_say_that_the_flag_follows_age(rel):
+    assert SALES_AGE_SENTENCE[rel] in (DOCS / rel).read_text(encoding="utf-8"), rel
+
+
+# ------------------------------------------ release runbooks: age baseline (2026-11-14) --
+
+RELEASE_RUNBOOK_AGE_PRIORITY = {
+    "en": ("**A model that does not beat the age baseline is not evidence of detection.**",
+           "**The priority rules are provisional** (`rules-v2`)",
+           "`--index data/<batch>_index.csv` (patient ages)",
+           "`data/<batch>_priority.csv`",
+           "age alone AUC a (model m; model − age [lo, hi]), age-matched p · priority findings flagged k/K, "
+           "others o/O",
+           "**The index table is required.**",
+           "with `--modality any` it reads MR\n  reports only",
+           "**A prospective result from before the age lines**"),
+    "ru": ("**Модель, которая не лучше одного только возраста, не доказывает обнаружение.**",
+           "**Правила приоритетных находок предварительные** (`rules-v2`)",
+           "`--index data/<batch>_index.csv` (возраст пациентов)",
+           "`data/<batch>_priority.csv`",
+           "age alone AUC a (model m; model − age [lo, hi]), age-matched p · priority findings flagged k/K, "
+           "others o/O",
+           "**Таблица индекса обязательна.**",
+           "при `--modality any` — только заключения MR",
+           "Если AUC модели явно\n  не превышает AUC одного только возраста",
+           "отмечает порог\n    поставляемой модели",
+           "**Результат prospective, записанный до строк про возраст**"),
+}
+# Sentences the review of 2026-11-14 found false (a missing index only "warns" and the stage "still
+# runs"; in fact eval_prospective.py refuses a missing --index file) or unidiomatic: they must not return.
+RELEASE_RUNBOOK_RETIRED = {
+    "en": ("guard before `prospective` warns about it, the stage still runs",
+           "is only a warning (the age lines are then empty)"),
+    "ru": ("предупреждает об этом, этап всё равно выполняется",
+           "только предупреждение (строки\nпро возраст тогда пусты)",
+           "не\n  выше явно AUC", "отмечает порог\n    поставки;"),
+}
+
+
+@pytest.mark.parametrize("lang", sorted(RELEASE_RUNBOOK_RETIRED))
+def test_release_runbook_no_longer_says_a_missing_index_only_warns(lang):
+    text = _read(f"docs/release_runbook_{lang}.md")
+    for phrase in RELEASE_RUNBOOK_RETIRED[lang]:
+        assert phrase not in text, (lang, phrase)
+
+
+def test_release_contract_says_a_missing_index_is_an_error_and_schema_2():
+    text = _read("docs/dev/release_pipeline_contract.md")
+    for phrase in ("A missing index is an ERROR of\n  `guard_pre_prospective`", "`schema_version: 2`",
+                   "`age_new`, `priority_new`", "argparse rejects the unknown arguments (exit 2) and the stage FAILS"):
+        assert phrase in text, phrase
+    for phrase in ("A missing index is a WARNING", "`schema_version: 1`", "is done\n  with a warning, not failed"):
+        assert phrase not in text, phrase
+
+
+@pytest.mark.parametrize("lang", sorted(RELEASE_RUNBOOK_AGE_PRIORITY))
+def test_release_runbook_explains_the_age_baseline_and_priority_findings(lang):
+    """The prospective stage prints the age-alone AUC and the priority-finding counts for every batch
+    (on 2026-11-14 the shipped model was matched by patient age alone). The runbook that tells the
+    founder how to read the stage must say what the lines mean, in both languages."""
+    text = _read(f"docs/release_runbook_{lang}.md")
+    for phrase in RELEASE_RUNBOOK_AGE_PRIORITY[lang]:
+        assert phrase in text, (lang, phrase)
+
+
+def test_release_contract_names_the_priority_command_and_the_legacy_rule():
+    text = _read("docs/dev/release_pipeline_contract.md")
+    for phrase in ("scripts/report_priority.py --matched data/<batch>_matched.csv --labels data/<batch>_labels.csv",
+                   "--index data/<batch>_index.csv --priority data/<batch>_priority.csv",
+                   "`PREDATES_AGE_PRIORITY`", "A model that does not beat the age baseline is not evidence of detection",
+                   "priority rules are provisional"):
+        assert phrase in text, phrase
