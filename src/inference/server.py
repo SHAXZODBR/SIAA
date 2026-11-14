@@ -898,8 +898,8 @@ def put_settings_ai(req: AISettingsUpdate, request: Request, admin: dict = Depen
 
 # ==================== GET /diagnostics (admin) ====================
 # A support zip IT can e-mail to the vendor. PHI-safe by construction: only
-# status/identity/version data, log tails passed through the PHI redactor,
-# an audit tail with patient fields redacted. Never previews, the DB, the
+# status/identity/version data, log tails passed through the PHI and secret
+# redactors, an audit tail with patient fields redacted. Never previews, the DB, the
 # license file, keys or settings secrets.
 
 DIAG_LOG_TAIL_BYTES = 2 * 1024 * 1024
@@ -912,6 +912,49 @@ _PHI_TEXT_RE = re.compile(
     r'(?i)\b(patient[_ ]?id|patient[_ ]?name|patientid|patientname|accession(?:[_ ]?(?:number|no))?|'
     r'accessionnumber)(["\']?\s*[=:]\s*)(["\']?)([^"\',;|\s}]+)')
 _SECRET_NAME_RE = re.compile(r'(?i)(secret|passw|token|key|credential|user)')
+
+
+# Secret-shaped assignments in free text (log tails). The NAME may carry a prefix/
+# suffix (ORTHANC_PASSWORD, api_token, model_key_secret, SENTINEL_MODEL_KEY_HEX);
+# a bare "key" is NOT a secret name (model registry keys are diagnostic data).
+# A match starts only at the start of a name and prefix/suffix are bounded, so one
+# long run of name characters (UID lists, base64url) cannot backtrack for minutes.
+# Userinfo runs to the LAST '@' before the host (clients split there: u:p@ss@host).
+_SECRET_TEXT_NAME = (r'[A-Za-z0-9_.-]{0,40}?(?:pass(?:word|wd|phrase)|pwd|secret|token|api[-_ ]?key|apikey|'
+                     r'access[-_]?key|private[-_]?key|licen[cs]e[-_ ]?key|model[-_]?key(?:[-_]?(?:hex|secret))?|'
+                     r'credentials?|auth[-_]?key)[A-Za-z0-9_.-]{0,40}')
+_SECRET_TEXT_RE = re.compile(
+    r'(?i)(?<![A-Za-z0-9_.-])(' + _SECRET_TEXT_NAME + r')(["\']?[ \t]*[=:][ \t]*)'
+    r'("(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|'
+    # unquoted: the value runs on over spaces until the next "name=" / "name:" or the end of
+    # the line ("password=two words" must not leave "words" behind); linear, no nesting
+    r'[^\s,;}\]]+(?:[ \t]+(?![A-Za-z0-9_.-]+[ \t]*[=:])[^\s,;}\]]+)*)')
+_AUTH_HEADER_RE = re.compile(
+    r'(?i)\b((?:proxy-)?authorization["\']?[ \t]*[=:][ \t]*["\']?)(?:(bearer|basic|token|digest)[ \t]+)?[^\s"\',;}]+')
+_BEARER_RE = re.compile(r'(?i)\b(bearer)[ \t]+[A-Za-z0-9._~+/=-]{8,}')
+_URL_USERINFO_RE = re.compile(r'(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,30}://)[^/\s?#"\']*@')
+
+
+def _strip_url_userinfo(text: str) -> str:
+    """scheme://user:pass@host → scheme://host."""
+    return _URL_USERINFO_RE.sub(r'\1', text) if text and '://' in text else text
+
+
+def _redact_secret_text(text: str) -> str:
+    """Secrets in free text → [REDACTED]: password/token/secret/api key/licence and
+    model key assignments ("key=value", "key: value", '"key": "value"'), the
+    first-run admin banner's "password: …" line, Authorization headers, bearer
+    tokens, and userinfo in URLs."""
+    if not text:
+        return text
+    def _assign(m):
+        v = m.group(3)
+        q = v[0] if v[:1] in ('"', "'") else ''
+        return f"{m.group(1)}{m.group(2)}{q}{REDACTED}{q}"
+    out = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}{(m.group(2) + ' ') if m.group(2) else ''}{REDACTED}", text)
+    out = _SECRET_TEXT_RE.sub(_assign, out)
+    out = _BEARER_RE.sub(lambda m: f"{m.group(1)} {REDACTED}", out)
+    return _strip_url_userinfo(out)
 
 
 def _redact_text(text: str) -> str:
@@ -944,17 +987,22 @@ def _redact_obj(obj: Any) -> Any:
 
 
 def _redact_secrets(obj: Any) -> Any:
-    """Values of secret-looking keys (key/secret/token/password/user) → [REDACTED]."""
+    """Values of secret-looking keys (key/secret/token/password/user) → [REDACTED];
+    userinfo is stripped from URL-valued strings (ORTHANC_URL=http://u:p@host)."""
     if isinstance(obj, dict):
         return {k: (REDACTED if _SECRET_NAME_RE.search(str(k)) and v not in (None, '') else _redact_secrets(v))
                 for k, v in obj.items()}
     if isinstance(obj, list):
         return [_redact_secrets(v) for v in obj]
+    if isinstance(obj, str):
+        return _strip_url_userinfo(obj)
     return obj
 
 
 def _tail_text(path: Path, max_bytes: int = DIAG_LOG_TAIL_BYTES) -> str:
-    """Last `max_bytes` of a text file (cut at a line boundary), PHI-redacted."""
+    """Last `max_bytes` of a text file (cut at a line boundary), PHI- and
+    secret-redacted (the first-run admin banner writes the one-time password
+    to the log, see src/utils/auth.py)."""
     size = path.stat().st_size
     with open(path, 'rb') as fh:
         if size > max_bytes:
@@ -965,7 +1013,7 @@ def _tail_text(path: Path, max_bytes: int = DIAG_LOG_TAIL_BYTES) -> str:
         else:
             data = fh.read()
     text = data.decode('utf-8', errors='replace')
-    return '\n'.join(_redact_text(line) for line in text.split('\n'))
+    return '\n'.join(_redact_secret_text(_redact_text(line)) for line in text.split('\n'))
 
 
 def _versions_info() -> dict:

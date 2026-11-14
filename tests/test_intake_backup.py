@@ -433,3 +433,11 @@ def test_missing_single_report_file_error_hides_the_name(ib, drive, capsys):
     assert ib.main(a) == ib.EXIT_USAGE
     out = capsys.readouterr().out
     assert "does not exist" in out and "9000599_" in out and SYN_NAME not in out
+
+
+def test_interpreter_is_the_running_one_not_a_home_directory_path(ib):
+    assert ib.VENV_PYTHON == sys.executable
+    src = INTAKE.read_text(encoding="utf-8")
+    assert "/Users/" not in src and "/home/" not in src
+    args = ib.build_parser().parse_args(["--clinic", "shox", "--batch", "new9", "--dest", "/nonexistent"])
+    assert args.python == sys.executable

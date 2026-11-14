@@ -175,3 +175,134 @@ def test_redaction_helpers():
     assert obj == {"patient_name": "[REDACTED]", "nested": [{"accession_number": "[REDACTED]"}], "ok": 1}
     assert srv._redact_secrets({"SENTINEL_TLS_KEY": "/p", "SENTINEL_OFFLINE": "1"}) == \
         {"SENTINEL_TLS_KEY": "[REDACTED]", "SENTINEL_OFFLINE": "1"}
+
+
+# ---------------------------------------------------------------- secrets in log tails
+
+LOG_FMT = "{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {name}:{function}:{line} - {message}"   # src/utils/logger.py file sink
+SECRET_LINES = {
+    "pw-kv-9000Zq": "2031-01-02 10:00:00 | INFO | pacs - ORTHANC_PASSWORD=pw-kv-9000Zq connecting",
+    "pw-colon-9000Zq": "smtp password: pw-colon-9000Zq",
+    "pw-json-9000Zq": '{"user": "synthetic", "password": "pw-json-9000Zq", "port": 4242}',
+    "passwd-9000Zq": "passwd = passwd-9000Zq",
+    "tok-api-9000Zq": "settings loaded api_token=tok-api-9000Zq ok",
+    "sec-9000Zq": "client_secret: 'sec-9000Zq'",
+    "apikey-9000Zq": "X-Api-Key: apikey-9000Zq",
+    "apikey2-9000Zq": "api key = apikey2-9000Zq",
+    "bearer-9000Zq-abcdef": "GET /health Authorization: Bearer bearer-9000Zq-abcdef",
+    "basic-9000Zq": '"authorization": "Basic basic-9000Zq"',
+    "raw-bearer-9000Zq-xyz": "retrying with bearer raw-bearer-9000Zq-xyz",
+    "c" * 64: f'{{"model_key_secret": "{"c" * 64}", "tier": "pro"}}',
+    "lic-9000Zq": "licence_key=lic-9000Zq",
+    "url-pw-9000Zq": "PACS at http://pacsuser:url-pw-9000Zq@pacs.synthetic.test:8042/dicom-web",
+}
+ORDINARY = ["routing study to brain_triage key=brain_triage threshold=0.50",
+            "model brain_triage loaded on cpu in 1.2s",
+            "Default admin created with SENTINEL_ADMIN_PASSWORD from env — must_change_password is set"]
+
+
+@pytest.fixture
+def first_run_banner(monkeypatch, tmp_path, capsys) -> tuple[str, str]:
+    """The REAL first-run banner: AuthManager.create_default_admin on an empty
+    synthetic DB, captured from stdout and from a log sink in the app's file format.
+    Returns (log text, one-time password)."""
+    from loguru import logger
+    from src.utils.auth import AuthManager
+    from src.utils.database import SentinelDB
+    monkeypatch.delenv("SENTINEL_ADMIN_PASSWORD", raising=False)
+    sink = tmp_path / "banner.log"
+    sink_id = logger.add(str(sink), level="WARNING", format=LOG_FMT)
+    capsys.readouterr()
+    try:
+        AuthManager(SentinelDB(str(tmp_path / "banner.db"))).create_default_admin()
+    finally:
+        logger.remove(sink_id)
+    stdout = capsys.readouterr().out
+    m = re.search(r"password: (\S+)", stdout)
+    assert m and "FIRST-RUN ADMIN ACCOUNT CREATED" in stdout
+    pw = m.group(1)
+    text = stdout + sink.read_text(encoding="utf-8")
+    assert text.count(pw) >= 2                    # console + log file
+    return text, pw
+
+
+def test_log_tails_drop_admin_banner_password_and_secrets(api, bearer, diag_env, first_run_banner):
+    banner, pw = first_run_banner
+    for name in ("backend.log", "sentinel_2031-01-02.log"):
+        with open(diag_env["logs"] / name, "a", encoding="utf-8") as fh:
+            fh.write(banner + "\n" + "\n".join(SECRET_LINES.values()) + "\n" + "\n".join(ORDINARY) + "\n")
+    zf, _ = _fetch(api, bearer)
+    blob = b"".join(zf.read(n) for n in zf.namelist()).decode("utf-8", errors="replace")
+    assert pw not in blob, "first-run admin password leaked into the diagnostics zip"
+    for secret in SECRET_LINES:
+        assert secret not in blob, f"{secret!r} leaked into the diagnostics zip"
+    for log in ("logs/backend.log", "logs/sentinel_2031-01-02.log"):
+        text = zf.read(log).decode()
+        assert "FIRST-RUN ADMIN ACCOUNT CREATED" in text and "password: [REDACTED]" in text
+        assert "pacs.synthetic.test:8042/dicom-web" in text and "pacsuser" not in text
+        for line in ORDINARY:
+            assert line in text
+    assert FAKE_PID not in blob and FAKE_ACC not in blob          # PHI redaction still works
+
+
+def test_env_url_userinfo_is_stripped(api, bearer, diag_env, monkeypatch):
+    monkeypatch.setenv("ORTHANC_URL", "http://pacsuser:url-env-9000Zq@pacs.synthetic.test:8042/")
+    monkeypatch.setenv("SENTINEL_UPDATE_URL", "https://updates.synthetic.test/feed")
+    zf, _ = _fetch(api, bearer)
+    blob = b"".join(zf.read(n) for n in zf.namelist()).decode("utf-8", errors="replace")
+    assert "url-env-9000Zq" not in blob and "pacsuser" not in blob
+    env = json.loads(zf.read("settings_redacted.json"))["environment"]
+    assert env["ORTHANC_URL"] == "http://pacs.synthetic.test:8042/"
+    assert env["SENTINEL_UPDATE_URL"] == "https://updates.synthetic.test/feed"
+
+
+def test_secret_text_helper():
+    assert srv._redact_secret_text("  password: Ab-c_9000") == "  password: [REDACTED]"
+    assert srv._redact_secret_text('{"api_token": "t 9000"}') == '{"api_token": "[REDACTED]"}'
+    assert srv._redact_secret_text("Authorization: Bearer abcdefgh123") == "Authorization: Bearer [REDACTED]"
+    assert srv._redact_secret_text("ftp://u:p@h.test/x") == "ftp://h.test/x"
+    assert srv._redact_secret_text(ORDINARY[0]) == ORDINARY[0]
+
+
+def test_url_userinfo_with_raw_at_in_password_is_fully_stripped():
+    """Clients split userinfo at the LAST '@': no fragment of the password may survive."""
+    assert srv._redact_secret_text("Orthanc reachable at http://admin:p@ss9000@pacs.synthetic.test:8042/x") \
+        == "Orthanc reachable at http://pacs.synthetic.test:8042/x"
+    assert srv._redact_secrets({"ORTHANC_URL": "http://admin:p@ss9000@pacs.synthetic.test:8042"}) \
+        == {"ORTHANC_URL": "http://pacs.synthetic.test:8042"}
+    q = "https://pacs.synthetic.test/q?mail=a@b.test"
+    assert srv._redact_secret_text(q) == q                      # '@' after the path is not userinfo
+
+
+@pytest.mark.parametrize("line", ["token_" * 20000, "a_" * 200000, "1.2.840." * 50000,
+                                  "x" * 100000 + "://" + "y" * 100000])
+def test_secret_redaction_is_linear_on_long_lines(line):
+    """One long log line without spaces (UID lists, base64url dumps) must not stall the export."""
+    t0 = time.perf_counter()
+    srv._redact_secret_text(line)
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_secret_names_with_prefixes_still_redacted_after_anchoring():
+    assert srv._redact_secret_text("cfg.orthanc_password=pw-9000Zq") == "cfg.orthanc_password=[REDACTED]"
+    assert srv._redact_secret_text("--api-token=tk-9000Zq") == "--api-token=[REDACTED]"
+
+
+def test_secret_values_with_spaces_and_escaped_quotes_leave_nothing_behind():
+    """An unquoted value runs to the next assignment or the end of the line, and a JSON
+    string ends at its real closing quote, not at an escaped one."""
+    assert srv._redact_secret_text("password=two words pw9000Zq") == "password=[REDACTED]"
+    assert srv._redact_secret_text("password=two words pw9000Zq retries=3") == "password=[REDACTED] retries=3"
+    assert srv._redact_secret_text("token: ab cd9000Zq 10:42:07 done") == "token: [REDACTED] 10:42:07 done"
+    assert srv._redact_secret_text('{"password": "ab\\"cd-9000Zq", "port": 8042}') \
+        == '{"password": "[REDACTED]", "port": 8042}'
+    assert srv._redact_secret_text("{'secret': 'x\\'y9000Zq'}") == "{'secret': '[REDACTED]'}"
+    assert srv._redact_secret_text("key=brain_triage route=head_ct") == "key=brain_triage route=head_ct"
+
+
+@pytest.mark.parametrize("line", ["password=" + "a " * 100000, "password=x " + "a" * 200000,
+                                  'token: "' + "\\\\" * 100000, "secret=" + "a =" * 50000])
+def test_secret_value_matching_is_linear_too(line):
+    t0 = time.perf_counter()
+    srv._redact_secret_text(line)
+    assert time.perf_counter() - t0 < 1.0

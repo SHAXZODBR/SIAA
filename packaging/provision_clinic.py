@@ -37,6 +37,9 @@ REFUSALS (exit 1, reason code printed, nothing written):
   private_key         unreadable private key, or it does not match the public key embedded in
                       src/utils/license.py (the clinic app would reject the license)
   output_exists       <out>/<slug>_<fp8>/ already exists (a delivery is never overwritten)
+  output_in_repo      --out resolves (symlinks, relative paths) to a folder inside this repository:
+                      a delivery there is not git-ignored and the repository is public — use a
+                      folder outside it, e.g. ~/sentinel_deliveries/
 Failures after the checks (exit 2): bundle export / self-verification failed (manifest_mismatch,
 verify_failed, …) — the staging dir is removed. A ledger write failure after the delivery folder
 exists also exits 2 and prints the row to add by hand.
@@ -373,6 +376,36 @@ def append_ledger(ledger: Path, row: dict) -> None:
 # main flow
 # ----------------------------------------------------------------------------
 
+SAFE_OUT_HINT = Path.home() / 'sentinel_deliveries'
+
+
+def _same_folder_or_below(path: Path, root: Path) -> bool:
+    """True when `path` is `root` or lies below it, judged by file identity: on a
+    case-insensitive disk (the macOS and Windows default) `.../SENTINEL/x` is the
+    same place as `.../sentinel/x` although the two spellings compare unequal."""
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.exists() and os.path.samefile(ancestor, root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def check_out_outside_repo(out: Path) -> Path:
+    """Refuse an --out inside the repository (resolved: symlinks, `..`, relative
+    paths). A delivery holds license.dat with the clinic's model_key_secret; inside
+    the public repo it would be one `git add .` away from a push."""
+    resolved = Path(out).expanduser().resolve()
+    repo = REPO.resolve()
+    if resolved == repo or repo in resolved.parents or _same_folder_or_below(resolved, repo):
+        raise Refused('output_in_repo',
+                      f'--out {out} resolves to {resolved}, inside the repository {repo} — a delivery '
+                      f'there is not git-ignored and the repository is public. Choose a folder outside '
+                      f'it, e.g. --out {SAFE_OUT_HINT / _dt.date.today().isoformat()}')
+    return resolved
+
+
 def provision(*, fingerprint: str, customer: str, expires: str, tier: str, features: str,
               model: Path, private_key: Path, out: Path, ledger: Path) -> dict:
     """Run every check, build + self-verify the delivery, publish the folder, append the ledger.
@@ -383,6 +416,7 @@ def provision(*, fingerprint: str, customer: str, expires: str, tier: str, featu
     if not customer:
         raise Refused('bad_customer', '--customer is empty')
     expires = validate_expiry(expires)
+    out = check_out_outside_repo(out)     # write where the check looked (`~`, `..`, symlinks)
     feats = sorted({f.strip() for f in (features or DEFAULT_FEATURES).split(',') if f.strip()})
     model = Path(model)
     if not model.is_dir() or not all((model / n).is_file() for n in mc.BUNDLE_REQUIRED_FILES):

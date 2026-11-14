@@ -260,3 +260,53 @@ def test_cli_issue_with_model_key_never_prints_secret(tmp_path, trusted, monkeyp
     lic.main(["issue", "--customer", "Test Clinic", "--machine-id", MACHINE, "--expires", "2031-12-31",
               "--private-key", str(key_file), "--output", str(out2)])
     assert "model_key_secret" not in _payload_of(out2.read_text())
+
+
+# ---------------------------------------------------------------- gen-keys
+
+def test_gen_keys_defaults_to_vendor_keys_not_cwd(monkeypatch, tmp_path, capsys):
+    """The pair goes into vendor_keys/ (git-ignored private key), never the cwd."""
+    target = tmp_path / "vendor_keys"
+    monkeypatch.setattr(lic, "VENDOR_KEYS_DIR", target)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    lic.main(["gen-keys"])
+    assert list(cwd.iterdir()) == []
+    priv, pub = target / "vendor_private_key.pem", target / "vendor_public_key.pem"
+    assert priv.read_bytes().startswith(b"-----BEGIN PRIVATE KEY-----")
+    assert pub.read_bytes().startswith(b"-----BEGIN PUBLIC KEY-----")
+    import os, sys
+    if sys.platform != "win32":
+        assert (os.stat(priv).st_mode & 0o777) == 0o600
+    assert lic.VENDOR_KEYS_DIR.name == "vendor_keys"
+
+
+def test_gen_keys_out_dir_and_refuses_to_overwrite_private_key(tmp_path, capsys):
+    priv, pub = lic._generate_keypair(tmp_path)
+    assert priv == tmp_path / "vendor_private_key.pem"
+    before = priv.read_bytes()
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        lic._generate_keypair(tmp_path)
+    with pytest.raises(SystemExit) as ei:
+        lic.main(["gen-keys", "--out-dir", str(tmp_path)])
+    assert ei.value.code == 1
+    assert "REFUSED" in capsys.readouterr().out
+    assert priv.read_bytes() == before
+
+
+def test_private_key_is_ignored_anywhere_and_public_key_tracked():
+    import subprocess
+    from pathlib import Path
+    repo = Path(lic.__file__).resolve().parents[2]
+    gi = (repo / ".gitignore").read_text().splitlines()
+    assert "vendor_private_key.pem" in [l.strip() for l in gi]
+    try:
+        r = subprocess.run(["git", "check-ignore", "--no-index", "vendor_private_key.pem",
+                            "some/dir/vendor_private_key.pem", "vendor_keys/vendor_public_key.pem"],
+                           cwd=repo, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("git not available")
+    ignored = set(r.stdout.split())
+    assert {"vendor_private_key.pem", "some/dir/vendor_private_key.pem"} <= ignored
+    assert "vendor_keys/vendor_public_key.pem" not in ignored

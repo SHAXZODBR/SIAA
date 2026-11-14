@@ -456,13 +456,15 @@ train/val/tune нет и каждый holdout-id в `val`, есть `tune/` (т�
 2. **Раунд 1.** Начинайте каждый раунд с пустой папки частей: если более ранний запуск оставил
    `data/new1_review_all.jsonl.labels/` (раунд 2: `data/new1_disputed.jsonl.labels/`), сначала удалите её —
    запуск перезаписывает только нужные ему файлы частей, а сборщик читает все файлы частей, которые найдёт.
-   В Claude Code, в этом репозитории, запустите Workflow в прямом режиме (он работает только
-   внутри инструмента Workflow в Claude Code, не через `node`); `file` — абсолютный путь, `n_lines` — число,
-   которое напечатал `wc -l`:
+   В Claude Code запустите Workflow в прямом режиме (он работает только внутри инструмента Workflow в Claude
+   Code, не через `node`). `scriptPath` и `file` — абсолютные пути: замените `<repo>` абсолютным путём этого
+   репозитория (то, что печатает `pwd` в папке `sentinel/`, где лежат `training/` и `data/`). Агенты запускают
+   `awk` на `file` и пишут файлы частей рядом с ним, поэтому абсолютный путь работает из любой папки, в которой
+   начата сессия, а относительный — нет. `n_lines` — число, которое напечатал `wc -l`:
 
    ```
-   Workflow({ scriptPath: 'training/relabel_workflow.js',
-              args: { file: '/Users/shakhzodbtr/Desktop/Siaa_ai/sentinel/data/new1_review_all.jsonl',
+   Workflow({ scriptPath: '<repo>/training/relabel_workflow.js',
+              args: { file: '<repo>/data/new1_review_all.jsonl',
                       n_lines: <wc -l>, votes: 1 } })
    ```
    Агенты пишут ответы в `data/new1_review_all.jsonl.labels/`. Затем соберите раунд 1:
@@ -477,8 +479,8 @@ train/val/tune нет и каждый holdout-id в `val`, есть `tune/` (т�
    которое напечатал сборщик), затем снова сборщик — без `--disputed`, это последний раунд:
 
    ```
-   Workflow({ scriptPath: 'training/relabel_workflow.js',
-              args: { file: '/Users/shakhzodbtr/Desktop/Siaa_ai/sentinel/data/new1_disputed.jsonl',
+   Workflow({ scriptPath: '<repo>/training/relabel_workflow.js',
+              args: { file: '<repo>/data/new1_disputed.jsonl',
                       n_lines: <disputed rows>, votes: 3 } })
    ```
 

@@ -57,7 +57,7 @@
     the batch has more studies than the limit). A failed scan is a warning, not a
     failed intake.
 
-  USAGE (from sentinel/; PY=/Users/shakhzodbtr/venv/bin/python)
+  USAGE (from sentinel/; PY=<the repository venv's python>; --python defaults to the running interpreter)
     $PY scripts/intake_batch.py --src /Volumes/HOSPITAL/new2 --reports /Volumes/HOSPITAL/reports_new2 \\
         --clinic shox --batch new2 --dest /Volumes/SIAA_DATA
     $PY scripts/intake_batch.py ... --resume                    # continue / add reports later
@@ -89,7 +89,7 @@ from typing import Iterable, Optional
 G, Y, R, B, NC = '\033[0;32m', '\033[1;33m', '\033[0;31m', '\033[0;34m', '\033[0m'
 
 REPO = Path(__file__).resolve().parent.parent
-VENV_PYTHON = '/Users/shakhzodbtr/venv/bin/python'
+VENV_PYTHON = sys.executable            # the interpreter running this script; override with --python
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -572,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--scan-limit', type=int, default=SCAN_LIMIT_DEFAULT,
                     help=f'studies read by the header scan (index_new_studies.py --limit, default {SCAN_LIMIT_DEFAULT})')
     ap.add_argument('--no-scan', action='store_true', help='skip the DICOM header scan')
-    ap.add_argument('--python', default=sys.executable, help='interpreter for the header scan / printed command')
+    ap.add_argument('--python', default=VENV_PYTHON, help='interpreter for the header scan / printed command')
     return ap
 
 

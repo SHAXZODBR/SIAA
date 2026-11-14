@@ -211,7 +211,7 @@ The Windows uninstaller asks whether to delete the data folder. Answer **No** un
 - The audit log is a **hash chain**: every row stores the hash of the previous row (`prev_hash`) and its own (`row_hash`), so a deleted or edited row breaks the chain. `GET /audit/verify` (admin only) walks the chain end to end and returns `{ok, rows, checked, head_hash, first_broken}`. Run it after a restore from backup and before handing the database to anyone; if `ok` is `false`, record the row id in `first_broken` and report it to the vendor.
 - The desktop app itself logs only to its own console (developer tools are open only in development builds).
 
-When sending logs to the vendor, send `sentinel_*.log` / `backend.log` only; never the database.
+When sending logs to the vendor, send `sentinel_*.log` / `backend.log` only; never the database. Prefer *Export diagnostics* (§10): a log file copied by hand may still contain the first-run one-time admin password (§5), the export removes it.
 
 ---
 
@@ -322,7 +322,7 @@ Pytest smoke tests for the server (`tests\`) can be run by the vendor on request
 
 - `health.json` (the `/health` answer), `license.json` (licence status only — never the licence file), `ai_settings.json`;
 - `versions.json` (application, Python, PyTorch, transformers, operating system) and `models.json` (identity card of every model: name, SHA-256 fingerprint, validation status);
-- the tail of `logs\backend.log` (last 2 MB) and of the newest `sentinel_*.log` — already PHI-redacted (§7);
+- the tail of `logs\backend.log` (last 2 MB) and of the newest `sentinel_*.log` — already PHI-redacted (§7), with passwords (including the first-run one-time admin password), tokens, API / licence keys, `Authorization` headers and user:password parts of URLs replaced by `[REDACTED]`;
 - `audit_tail.jsonl` (last 200 audit entries, with patient ID / name fields replaced by `<redacted>`) and `settings_redacted.json`.
 
 It does **not** contain images or previews, the database, `license.dat`, `jwt_secret.key`, `model_key.bin` or any model file. Open the zip and glance through it before sending it; it is designed to be free of patient data.

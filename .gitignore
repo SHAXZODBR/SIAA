@@ -34,6 +34,9 @@ Thumbs.db
 # === Sentinel security ===
 # NEVER commit private keys or issued license files
 vendor_keys/vendor_private_key.pem
+# ...and in ANY directory (gen-keys --out-dir, or an older build that wrote
+# into the current directory); vendor_keys/vendor_public_key.pem stays tracked
+vendor_private_key.pem
 vendor_keys/*.private.*
 vendor_keys/*.dat
 *.private.pem

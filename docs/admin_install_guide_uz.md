@@ -211,7 +211,7 @@ Windows o‘chirish dasturi ma’lumotlar papkasini o‘chirish-o‘chirmaslikni
 - Audit jurnali — **xesh zanjiri**: har bir qator oldingi qatorning xeshini (`prev_hash`) va o‘zining xeshini (`row_hash`) saqlaydi, shuning uchun o‘chirilgan yoki tahrirlangan qator zanjirni buzadi. `GET /audit/verify` (faqat administrator) zanjirni boshidan oxirigacha tekshiradi va `{ok, rows, checked, head_hash, first_broken}` ni qaytaradi. Uni zaxira nusxadan tiklagandan keyin va bazani biror kishiga topshirishdan oldin bajaring; `ok: false` bo‘lsa, `first_broken` dagi qator identifikatorini qayd eting va yetkazib beruvchiga xabar bering.
 - Ish stoli ilovasining o‘zi faqat o‘z konsoliga yozadi (dasturchi asboblari faqat dasturchi yig‘ilmalarida ochiq).
 
-Jurnallarni yetkazib beruvchiga yuborishda faqat `sentinel_*.log` / `backend.log` ni yuboring; ma’lumotlar bazasini — hech qachon.
+Jurnallarni yetkazib beruvchiga yuborishda faqat `sentinel_*.log` / `backend.log` ni yuboring; ma’lumotlar bazasini — hech qachon. *Diagnostikani eksport qilish* (10-band) afzal: qo‘lda nusxalangan jurnalda birinchi ishga tushirishdagi bir martalik administrator paroli (5-band) qolishi mumkin, eksport uni olib tashlaydi.
 
 ---
 
@@ -322,7 +322,7 @@ Server uchun pytest tekshiruv testlarini (`tests\`) so‘rov bo‘yicha yetkazib
 
 - `health.json` (`/health` javobi), `license.json` (faqat litsenziya holati — litsenziya faylining o‘zi hech qachon emas), `ai_settings.json`;
 - `versions.json` (ilova, Python, PyTorch, transformers, operatsion tizim) va `models.json` (har bir modelning identifikatsiya kartasi: nomi, SHA-256 barmoq izi, tasdiqlash holati);
-- `logs\backend.log` ning oxiri (so‘nggi 2 MB) va eng yangi `sentinel_*.log` ning oxiri — identifikatorlari allaqachon yashirilgan (7-band);
+- `logs\backend.log` ning oxiri (so‘nggi 2 MB) va eng yangi `sentinel_*.log` ning oxiri — identifikatorlari allaqachon yashirilgan (7-band); parollar (birinchi ishga tushirishdagi bir martalik administrator paroli ham), tokenlar, API va litsenziya kalitlari, `Authorization` sarlavhalari va URL dagi user:password qismlari `[REDACTED]` bilan almashtirilgan;
 - `audit_tail.jsonl` (so‘nggi 200 ta audit yozuvi, bemor ID va ismi maydonlari `<redacted>` bilan almashtirilgan) va `settings_redacted.json`.
 
 Unda tasvirlar va prevyular, ma’lumotlar bazasi, `license.dat`, `jwt_secret.key`, `model_key.bin` va model fayllari **yo‘q**. Yuborishdan oldin zip ni ochib, ko‘zdan kechiring; u bemor ma’lumotlarisiz bo‘lishi uchun loyihalangan.

@@ -25,6 +25,12 @@
        (on Linux/Mac) /etc/machine-id, so moving the install to another
        PC invalidates the license.
 
+  HOW TO GENERATE THE VENDOR KEYPAIR (once):
+    python -m src.utils.license gen-keys [--out-dir <dir>]
+    Writes vendor_keys/vendor_private_key.pem (0600, git-ignored) and
+    vendor_keys/vendor_public_key.pem; refuses to overwrite an existing
+    private key.
+
   HOW TO ISSUE A LICENSE (for us, the vendor):
     python -m src.utils.license issue \
         --customer "Tashkent Hospital #1" \
@@ -93,8 +99,10 @@ except ImportError:
 # We ship this PUBLIC key in the binary. It's NOT a secret.
 # The matching PRIVATE key stays on the vendor's signing server only.
 #
-# To rotate keys: regenerate via `--gen-keys` and rebuild the app with the
-# new public key embedded.
+# To rotate keys: regenerate via `python -m src.utils.license gen-keys
+# [--out-dir <dir>]` (writes into vendor_keys/ by default and refuses to
+# overwrite an existing private key) and rebuild the app with the new public
+# key embedded.
 SENTINEL_PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyKGs1c1GWwy6bcJHzeUd
 f/WEGzXzjF+ATwBnzme35aywXmwp/o/mHt4CwMSoYUsUipxqUnmIVLDDq8HxGLiT
@@ -403,13 +411,35 @@ def license_model_key_secret(validation: Optional[LicenseValidation] = None) -> 
 # CLI for vendor + customer use
 # ============================================================================
 
-def _generate_keypair():
-    """Generate a fresh vendor signing keypair. Run this ONCE; embed the
-    public key into SENTINEL_PUBLIC_KEY_PEM and keep the private key
-    in a vault."""
+# Default home of the vendor keypair: <repo>/vendor_keys/. .gitignore ignores
+# vendor_private_key.pem in ANY directory; vendor_keys/vendor_public_key.pem is tracked.
+VENDOR_KEYS_DIR = Path(__file__).resolve().parents[2] / 'vendor_keys'
+PRIVATE_KEY_NAME = 'vendor_private_key.pem'
+PUBLIC_KEY_NAME = 'vendor_public_key.pem'
+
+
+def _generate_keypair(out_dir: Optional[Path] = None) -> tuple[Path, Path]:
+    """Generate a fresh vendor signing keypair into `out_dir` (default
+    <repo>/vendor_keys/, never the current working directory). Run this ONCE;
+    embed the public key into SENTINEL_PUBLIC_KEY_PEM and keep the private key
+    in a vault.
+
+    The private key is created exclusively (O_EXCL) and owner-only (0600 where
+    the platform supports it). An existing private key is never overwritten:
+    raises FileExistsError — losing it would orphan every issued licence.
+    Returns (private_key_path, public_key_path)."""
     if not _CRYPTO_AVAILABLE:
         print('cryptography library required: pip install cryptography')
         sys.exit(1)
+
+    out = Path(out_dir) if out_dir is not None else VENDOR_KEYS_DIR
+    priv_path = out / PRIVATE_KEY_NAME
+    pub_path = out / PUBLIC_KEY_NAME
+    if priv_path.exists():
+        raise FileExistsError(
+            f'{priv_path} already exists — refusing to overwrite the vendor private key '
+            f'(it signs every issued licence). Move it to an offline backup first, or pass '
+            f'--out-dir <empty folder> to generate a new pair elsewhere.')
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
 
@@ -423,12 +453,25 @@ def _generate_keypair():
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
-    Path('vendor_private_key.pem').write_bytes(priv_pem)
-    Path('vendor_public_key.pem').write_bytes(pub_pem)
-    print('✓ Generated vendor_private_key.pem (KEEP SECRET)')
-    print('✓ Generated vendor_public_key.pem (EMBED IN APP)')
+    out.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+    try:
+        fd = os.open(str(priv_path), flags, 0o600)
+    except FileExistsError:
+        raise FileExistsError(f'{priv_path} already exists — refusing to overwrite the vendor '
+                              f'private key') from None
+    with os.fdopen(fd, 'wb') as f:
+        f.write(priv_pem)
+    try:
+        os.chmod(str(priv_path), 0o600)     # no-op beyond read-only bits on Windows
+    except OSError:
+        pass
+    pub_path.write_bytes(pub_pem)
+    print(f'✓ Generated {priv_path} (KEEP SECRET)')
+    print(f'✓ Generated {pub_path} (EMBED IN APP)')
     print('\nReplace SENTINEL_PUBLIC_KEY_PEM in src/utils/license.py with:')
     print(pub_pem.decode())
+    return priv_path, pub_path
 
 
 def _cli_fingerprint():
@@ -514,7 +557,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     sub = parser.add_subparsers(dest='cmd')
 
     sub.add_parser('fingerprint', help='Print this machine\'s fingerprint')
-    sub.add_parser('gen-keys', help='Generate vendor RSA keypair (run once)')
+    p_gen = sub.add_parser('gen-keys', help='Generate vendor RSA keypair (run once)')
+    p_gen.add_argument('--out-dir', default=None,
+                       help='folder for the pair (default: <repo>/vendor_keys/); an existing '
+                            'vendor_private_key.pem is never overwritten')
 
     p_issue = sub.add_parser('issue', help='Sign a new license file')
     p_issue.add_argument('--customer', required=True)
@@ -537,7 +583,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.cmd == 'fingerprint':
         _cli_fingerprint()
     elif args.cmd == 'gen-keys':
-        _generate_keypair()
+        try:
+            _generate_keypair(Path(args.out_dir) if args.out_dir else None)
+        except FileExistsError as e:
+            print(f'✗ REFUSED: {e}')
+            sys.exit(1)
     elif args.cmd == 'issue':
         _cli_issue(args)
     elif args.cmd == 'verify':

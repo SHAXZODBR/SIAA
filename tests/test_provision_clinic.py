@@ -43,15 +43,10 @@ def prov():
 
 @pytest.fixture(scope="module")
 def vendor_keys(tmp_path_factory):
-    """A vendor keypair from license._generate_keypair (it writes into the cwd)."""
+    """A vendor keypair from license._generate_keypair, written into a tmp dir."""
     d = tmp_path_factory.mktemp("vendor_keys")
-    cwd = os.getcwd()
-    os.chdir(d)
-    try:
-        lic._generate_keypair()
-    finally:
-        os.chdir(cwd)
-    return d / "vendor_private_key.pem", (d / "vendor_public_key.pem").read_bytes()
+    priv, pub = lic._generate_keypair(d)
+    return priv, pub.read_bytes()
 
 
 @pytest.fixture
@@ -235,8 +230,8 @@ def test_fingerprint_refuses_absent_or_ambiguous_tokens(prov, raw):
 
 
 @pytest.mark.parametrize("name,slug", [("Synthetic Clinic #9", "synthetic-clinic-9"),
-                                       ("Клиника «Шифо» №2", "klinika-shifo-no2"),
-                                       ("Ўзбекистон Қон маркази", "ozbekiston-qon-markazi"),
+                                       ("Синтетик клиника «Шафтоли» №7", "sintetik-klinika-shaftoli-no7"),
+                                       ("Ўйдирма Қуёш синтетик маркази", "oydirma-quyosh-sintetik-markazi"),
                                        ("!!!", "clinic")])
 def test_customer_slug(prov, name, slug):
     assert prov.customer_slug(name) == slug
@@ -319,6 +314,52 @@ def test_refuses_to_overwrite_a_delivery(prov, trusted, tmp_path, capsys):
     assert len(list(csv.DictReader(ledger.open(encoding="utf-8")))) == 1
 
 
+@pytest.mark.parametrize("form", ["relative", "absolute", "dotdot", "symlink"])
+def test_refuses_an_output_inside_the_repository(prov, trusted, tmp_path, capsys, monkeypatch, form):
+    """A delivery (license.dat with the model_key_secret) inside the public repo is not
+    git-ignored: --out is resolved (relative, `..`, symlinks) and refused with a safe hint."""
+    model, _, _ = make_model(tmp_path / "models")
+    ledger = tmp_path / "l.csv"
+    name = "_synthetic_delivery_must_not_exist"
+    target = REPO / name
+    assert not target.exists()
+    if form == "relative":
+        monkeypatch.chdir(REPO)
+        out = Path(name)
+    elif form == "absolute":
+        out = target
+    elif form == "dotdot":
+        out = REPO / "docs" / ".." / name
+    else:
+        link = tmp_path / "repo_link"
+        try:
+            link.symlink_to(REPO, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not available")
+        out = link / name
+    assert prov.main(_args(model, out, ledger, trusted)) == 1
+    err = capsys.readouterr().err
+    assert "[output_in_repo]" in err, err
+    assert "outside" in err and "sentinel_deliveries" in err
+    assert not target.exists() and not ledger.exists()
+
+
+def test_unexpanded_tilde_out_writes_where_the_check_looked(prov, trusted, tmp_path, capsys, monkeypatch):
+    """`--out=~/...` reaches the tool unexpanded (zsh after '=', quoted, Windows shells):
+    the delivery must land in the home folder the check approved, never in <repo>/~/."""
+    model, _, _ = make_model(tmp_path / "models")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(REPO)
+    assert not (REPO / "~").exists()
+    out, ledger = Path("~") / "sentinel_deliveries" / "2031-01-02", tmp_path / "l.csv"
+    assert prov.main(_args(model, out, ledger, trusted)) == 0, capsys.readouterr().err
+    assert not (REPO / "~").exists(), "delivery written inside the repository"
+    assert (home / "sentinel_deliveries" / "2031-01-02" / f"synthetic-clinic-9_{FP[:8]}" / "license.dat").is_file()
+
+
 def test_export_failure_leaves_nothing_behind(prov, trusted, tmp_path, capsys):
     model, _, _ = make_model(tmp_path / "models")
     (model / "model.safetensors").write_bytes(os.urandom(25_000))      # corrupted after the eval/MANIFEST
@@ -340,3 +381,18 @@ def test_self_verification_catches_a_bad_bundle(prov, trusted, tmp_path, capsys,
     assert prov.main(_args(model, out, ledger, trusted)) == 2
     assert "[verify_failed]" in capsys.readouterr().err
     assert not any(out.iterdir()) and not ledger.exists()
+
+
+def test_refuses_another_spelling_of_the_repository_folder(prov, trusted, tmp_path, capsys):
+    """On a case-insensitive disk (the macOS and Windows default) `.../SENTINEL/x` is inside the
+    repository although the spelling differs: the check goes by file identity."""
+    other = Path(str(REPO).swapcase())
+    if other == REPO or not other.exists() or not os.path.samefile(other, REPO):
+        pytest.skip("case-sensitive file system: another spelling is another folder")
+    model, _, _ = make_model(tmp_path / "models")
+    ledger = tmp_path / "l.csv"
+    name = "_synthetic_delivery_must_not_exist"
+    assert not (REPO / name).exists()
+    assert prov.main(_args(model, other / name, ledger, trusted)) == 1
+    assert "[output_in_repo]" in capsys.readouterr().err
+    assert not (REPO / name).exists() and not ledger.exists()

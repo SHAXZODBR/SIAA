@@ -445,12 +445,15 @@ the one passed with `--llm-labels`.
 2. **Round 1.** Start each round with an empty parts directory: if an earlier run left
    `data/new1_review_all.jsonl.labels/` (round 2: `data/new1_disputed.jsonl.labels/`), delete it first —
    a run overwrites only the part files it needs, and the collector reads every part file it finds.
-   In Claude Code, in this repo, run the Workflow in direct mode (it only runs inside Claude
-   Code's Workflow tool, not with `node`); `file` is the absolute path, `n_lines` the number `wc -l` printed:
+   In Claude Code, run the Workflow in direct mode (it only runs inside Claude Code's Workflow tool, not
+   with `node`). `scriptPath` and `file` are absolute paths: replace `<repo>` with the absolute path of this
+   repository (what `pwd` prints in the `sentinel/` folder that holds `training/` and `data/`). The agents run
+   `awk` on `file` and write the part files next to it, so an absolute path works whichever folder the session
+   was started in; a relative one does not. `n_lines` is the number `wc -l` printed:
 
    ```
-   Workflow({ scriptPath: 'training/relabel_workflow.js',
-              args: { file: '/Users/shakhzodbtr/Desktop/Siaa_ai/sentinel/data/new1_review_all.jsonl',
+   Workflow({ scriptPath: '<repo>/training/relabel_workflow.js',
+              args: { file: '<repo>/data/new1_review_all.jsonl',
                       n_lines: <wc -l>, votes: 1 } })
    ```
    The agents write their answers to `data/new1_review_all.jsonl.labels/`. Then collect round 1:
@@ -465,8 +468,8 @@ the one passed with `--llm-labels`.
    disputed rows the collector printed), then collect again — without `--disputed`, this is the final round:
 
    ```
-   Workflow({ scriptPath: 'training/relabel_workflow.js',
-              args: { file: '/Users/shakhzodbtr/Desktop/Siaa_ai/sentinel/data/new1_disputed.jsonl',
+   Workflow({ scriptPath: '<repo>/training/relabel_workflow.js',
+              args: { file: '<repo>/data/new1_disputed.jsonl',
                       n_lines: <disputed rows>, votes: 3 } })
    ```
 

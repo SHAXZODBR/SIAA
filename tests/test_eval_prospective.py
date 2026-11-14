@@ -567,17 +567,18 @@ PRIORITY_HEADER = ["study_folder", "patient_id", "report_study_date", "priority"
 
 
 def test_parse_age_codes_and_birth_date_fallback():
+    # birth dates in this file are synthetic (invented, absent from the real tables)
     assert ep.parse_age("045Y") == 45.0
     assert ep.parse_age("010M") == pytest.approx(10 / 12)
     assert ep.parse_age("003W") == pytest.approx(3 / 52)
     assert ep.parse_age("020D") == pytest.approx(20 / 365)
     assert ep.parse_age(" 006m ") == pytest.approx(0.5)
-    assert ep.parse_age("", "20010315", "20310315") == pytest.approx(30.0, abs=0.01)
-    assert ep.parse_age("45", "20010315", "20310315") == pytest.approx(30.0, abs=0.01)   # bad code → dates
-    assert ep.parse_age("045Y", "20010315", "20310315") == 45.0                          # the code wins
+    assert ep.parse_age("", "20010317", "20310317") == pytest.approx(30.0, abs=0.01)
+    assert ep.parse_age("45", "20010317", "20310317") == pytest.approx(30.0, abs=0.01)   # bad code → dates
+    assert ep.parse_age("045Y", "20010317", "20310317") == 45.0                          # the code wins
     assert ep.parse_age("") is None and ep.parse_age("abcY") is None and ep.parse_age("Y") is None
     assert ep.parse_age("", "20310316", "20310315") is None                              # born after the study
-    assert ep.parse_age("", "2001-03-15", "20310315") is None
+    assert ep.parse_age("", "2001-03-17", "20310317") is None
     assert ep.parse_age("150Y") is None
 
 
@@ -668,7 +669,7 @@ def test_month_coded_infants_and_missing_ages(tmp_path):
                              ["F9001001", "9001001", "040Y", "", "20310101", "MR"],    # first usable row wins
                              ["F9006000", "9006000", "020D", "", "20310101", "MR"],
                              ["F9006001", "9006001", "", "", "", "MR"],                  # no age at all
-                             ["F9006002", "9006002", "", "19910101", "20310101", "MR"]])
+                             ["F9006002", "9006002", "", "19901123", "20310101", "MR"]])   # synthetic birth date
     ages, note = ep.load_index_ages(idx)
     assert note is None and set(ages) == {"F9001000", "F9001001", "F9006000", "F9006002"}
     assert ages["F9001000"] == pytest.approx(0.5) and ages["F9001001"] == pytest.approx(3 / 52)
@@ -748,11 +749,11 @@ def test_priority_block_counts_unknown_and_reasons(tmp_path):
 
 
 def _index_and_priority(tmp_path: Path) -> tuple[Path, Path]:
-    """For _batch: new studies J (abn 0.9, 45 y), K (abn 0.3, ~45.15 y from dates), C (normal 0.6, 6 months),
+    """For _batch: new studies J (abn 0.9, 45 y), K (abn 0.3, ~45.14 y from dates), C (normal 0.6, 6 months),
     D (normal 0.1, no index row)."""
     idx = tmp_path / "batch_x_index.csv"
     _csv(idx, INDEX_HEADER, [["STUDY_J", "9000010", "045Y", "", "20310105", "MR"],
-                             ["STUDY_K", "9000010", "", "19860105", "20310301", "MR"],
+                             ["STUDY_K", "9000010", "", "19860109", "20310301", "MR"],   # synthetic birth date
                              ["STUDY_C", "90000101", "006M", "", "20310110", "MR"],
                              ["STUDY_A", "9000001", "070Y", "", "20310112", "MR"]])
     pf = tmp_path / "batch_x_priority.csv"
