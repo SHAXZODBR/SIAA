@@ -90,6 +90,25 @@ mirror the archive to the second drive, then run the release from the archive co
    not confirmed · 2 rsync failed · 3 sample verification failed. `--verify-only` re-checks a sample
    without copying (monthly).
 4. Unmount and return the hospital drive only after step 3 printed `B is a verified mirror of A`.
+5. **Archive disk smaller than the delivery** (or no archive drive yet): never return the drive with
+   nothing kept — the images exist only there, and without them a study can never be re-processed
+   or used for another body part's model. Index the drive (stage `index`), then archive the most
+   valuable part in priority order onto the largest disk you have:
+
+   ```sh
+   /Users/shakhzodbtr/venv/bin/python scripts/archive_studies.py --root /Volumes/HOSPITAL/new2 \
+       --index data/new2_index.csv --dest ~/SIAA_DATA/raw/shox/new2 \
+       --rule "MR:BRAIN" --rule "CT:HEAD:cap=40" --rule "MR:*" --rule "CT:*:cap=12" --min-free-gb 120
+   ```
+   Rules are tried in order (`<modality>:<body part pattern>[:cap=N]`; the index row of a study
+   decides). Without a cap the whole study folder is copied; with `cap=N` at most N evenly spaced
+   `.dcm` files of every series folder (a thin-slice CT series has 600+ files). The files are the
+   original DICOM, verified by sha256; `ARCHIVE_STUDIES.csv` lists each study with its mode and
+   `ARCHIVE_FILES.sha256` every file. Run the same command again to resume; it stops (exit 2) before
+   the disk has less than `--min-free-gb` free, and a later run with a fuller rule copies a capped
+   study again in full. A capped study is enough to train slice classifiers but is **not** the full
+   scan — only the intake of step 2 keeps a delivery completely. Keep `--dest` outside the
+   repository and off cloud-synced folders (it holds patient data).
 
 ## 3. Time estimates (5,000 studies, Apple Silicon)
 
