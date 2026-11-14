@@ -50,7 +50,9 @@
     python scripts/label_reports.py --reports … --out … --export-for-llm data/<batch>_review.jsonl [--all]
     python scripts/label_reports.py --reports … --out … --import-llm-labels data/<batch>_llm_labels.jsonl
         (keys: patient_id + study_date + modality + section_index; see import_llm_labels
-         for the unique-only fallbacks; prints applied / ambiguous / skipped)
+         for the unique-only fallbacks; prints applied / ambiguous / skipped; a label line
+         with needs_review=yes is applied but the row stays in review —
+         scripts/collect_llm_labels.py writes such lines for split or unresolved rows)
     python scripts/label_reports.py --reports … --out … --llm ollama:gemma3:12b   (optional, local only)
 
   PHI: only the numeric hospital patient_id is ever printed or written; the
@@ -894,9 +896,21 @@ def import_llm_labels(rows: list[dict], labels: list[dict], source: str = 'impor
       3. (patient_id, study_date)                             — only when unique
       4. patient_id alone — only when the label has NO date and the patient
          has exactly one brain row.
+    An EMPTY study_date that the line carries is a key value like any other
+    (the parser emits '' for an undated report): levels 1 and 2 match it
+    exactly; level 4 is the fallback for such a line instead of level 3.
     A row already labelled by an earlier line of the same import is never
     relabelled: an identical duplicate is skipped, a conflicting one is counted
     ambiguous and the row is sent back to review (needs_review=yes).
+
+    An optional needs_review field (yes/true/1) on a label line is honoured:
+    the label is applied (and counted as applied) but the row STAYS in review
+    with label_confidence=low. scripts/collect_llm_labels.py sets it when the
+    readers split on normal-vs-abnormal or a row could not be adjudicated, so
+    the build stage (--skip-needs-review) keeps such studies out of the
+    training and gate sets. Without the field the row leaves review as before.
+    An identical duplicate line that carries needs_review=yes is still skipped
+    (not counted twice) but keeps the row in review as well.
     """
     brain = [r for r in rows if (r.get('body_part') or '').lower() == 'brain']
     idx4: dict[tuple, list[dict]] = defaultdict(list)
@@ -921,11 +935,15 @@ def import_llm_labels(rows: list[dict], labels: list[dict], source: str = 'impor
             abn = 'no'
         if label != 'normal' and abn == 'no':
             abn = 'yes'
+        review = _norm_abnormal(lab.get('needs_review', '')) == 'yes'
         pid, date, mod, sec = row_key(lab)
+        # a line that CARRIES study_date is keyed on it even when it is '' (the parser emits '' for an
+        # undated report; collector / --export-for-llm lines always carry all four fields)
+        has_date = bool(date) or 'study_date' in lab
         levels = []
-        if date and mod and sec:
+        if has_date and mod and sec:
             levels.append(idx4.get((pid, date, mod, sec), []))
-        if date and mod:
+        if has_date and mod:
             levels.append(idx3.get((pid, date, mod), []))
         if date:
             levels.append(idx2.get((pid, date), []))
@@ -946,6 +964,9 @@ def import_llm_labels(rows: list[dict], labels: list[dict], source: str = 'impor
         if prev is not None:
             if prev == (label, abn):
                 skipped += 1
+                if review:                          # an identical duplicate may still ask for review
+                    target['needs_review'] = 'yes'
+                    target['label_confidence'] = 'low'
             else:
                 ambiguous += 1
                 target['needs_review'] = 'yes'
@@ -953,9 +974,12 @@ def import_llm_labels(rows: list[dict], labels: list[dict], source: str = 'impor
             continue
         target['label'] = label
         target['abnormal'] = abn
-        target['label_confidence'] = 'high' if source == 'import' else 'medium'
+        if review:
+            target['label_confidence'] = 'low'
+        else:
+            target['label_confidence'] = 'high' if source == 'import' else 'medium'
         target['label_source'] = source
-        target['needs_review'] = 'no'
+        target['needs_review'] = 'yes' if review else 'no'
         done[id(target)] = (label, abn)
         applied += 1
     return ImportResult(applied, skipped, ambiguous)
@@ -1128,7 +1152,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--ollama-url', default='http://localhost:11434/api/generate')
     ap.add_argument('--import-llm-labels',
                     help='JSONL of {patient_id,study_date,modality,section_index,label,abnormal} '
-                         '(modality/section_index optional: unique fallback on patient_id+study_date)')
+                         '(modality/section_index optional: unique fallback on patient_id+study_date; '
+                         'an optional needs_review=yes keeps the row in review)')
     ap.add_argument('--export-for-llm',
                     help='write JSONL {patient_id,study_date,modality,section_index,conclusion} for review rows')
     ap.add_argument('--all', action='store_true', help='with --export-for-llm: export every brain row')
@@ -1212,8 +1237,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f'  imported LLM labels: {col}{imp.applied} applied, {imp.ambiguous} ambiguous, '
               f'{imp.skipped} skipped{NC}')
         if imp.ambiguous:
-            print(f'    {Y}⚠ ambiguous labels were NOT applied (key matched >1 row, or conflicting labels '
-                  f'for one row) — export again with modality/section_index and re-run the workflow{NC}')
+            print(f'    {Y}⚠ ambiguous labels were NOT applied: a line whose 4-part key (patient_id, '
+                  f'study_date, modality, section_index) is incomplete or matches no row fell back to a '
+                  f'coarser key that matches >1 row, or one row got two different labels (that row stays '
+                  f'in review). Label lines must carry the key fields exactly as --export-for-llm wrote '
+                  f'them for this --reports file{NC}')
+        n_kept = sum(1 for r in brain if r['label_source'] == 'import' and r['needs_review'] == 'yes')
+        if n_kept:
+            print(f'    {Y}{n_kept} imported label(s) stay in review (needs_review=yes on the label '
+                  f'line, or two different labels for one row){NC}')
     if args.llm:
         print(f'  ollama refinement  : {llm_applied} applied, {llm_skipped} skipped')
     if args.export_for_llm:

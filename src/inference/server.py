@@ -46,6 +46,7 @@ from contextlib import asynccontextmanager
 from loguru import logger
 
 from src.pipeline.dicom_loader import load_dicom, DicomStudy
+from src.pipeline.dicom_objects import is_image_object
 from src.pipeline.preprocessor import preprocess_study, resize_with_padding
 from src.pipeline.ct_head_selection import (
     select_ct_head_slices, load_windowed_slice, aggregate_slice_probs, largest_non_localizer,
@@ -2565,16 +2566,26 @@ def _tag(ds, name: str) -> str:
 def _read_study_headers(file_paths: list[Path]) -> Optional[dict]:
     """Header-only pass (stop_before_pixels) over the uploaded files.
 
-    Patient/study fields come from the first readable DICOM; SeriesDescription
-    and ProtocolName are collected unique across all files (upload order).
-    'best_path' is the largest image (Rows×Columns) — the single-file fallback.
+    Patient/study fields (incl. modality / body part) come from the first IMAGE
+    object in upload order (is_image_object) — a PACS export often puts an SR /
+    PR / key-object note first, whose Modality 'SR' and empty body part would
+    leave a brain MR unrouted. Only when the upload holds no image object does
+    the first readable DICOM decide. 'readable' counts every readable object.
+    SeriesDescription and ProtocolName are collected unique across all files (upload order).
+    'best_path' is the largest image (Rows×Columns) among the image objects — the
+    single-file fallback and preview; a dose-report / screenshot secondary capture
+    wins only when the upload holds no acquired image at all.
     'series_groups' groups the files by SeriesInstanceUID with each series'
     own BodyPartExamined / description (D5: mixed-body-part CT studies are
-    routed per series, see _plan_series_route).
+    routed per series, see _plan_series_route); 'is_image' marks the groups of
+    image objects (non-image objects / secondary captures get groups of their own).
     Returns None when nothing parses as DICOM."""
     hdr = None
+    hdr_from_image = False
+    readable = 0
     series, protocols = [], []
     best_path, best_px = None, -1
+    best_image_path, best_image_px = None, -1
     groups: dict[str, dict] = {}
     for order, p in enumerate(file_paths):
         try:
@@ -2584,10 +2595,12 @@ def _read_study_headers(file_paths: list[Path]) -> Optional[dict]:
         # force=True parses almost anything — require a real DICOM signal
         if not (_tag(ds, 'SOPClassUID') or _tag(ds, 'Modality')):
             continue
-        if hdr is None:
+        readable += 1
+        is_image = is_image_object(ds)
+        # First image object wins; a non-image object only stands in until one appears.
+        if not hdr_from_image and (hdr is None or is_image):
             hdr = {out: _tag(ds, tag) for tag, out in _HEADER_FIELDS}
-            hdr['readable'] = 0
-        hdr['readable'] += 1
+            hdr_from_image = is_image
         sd = _tag(ds, 'SeriesDescription')
         if sd and sd not in series:
             series.append(sd)
@@ -2600,12 +2613,15 @@ def _read_study_headers(file_paths: list[Path]) -> Optional[dict]:
             px = 0
         if px > best_px:
             best_path, best_px = p, px
-        _add_to_series_group(groups, ds, Path(p), order, px)
+        if is_image and px > best_image_px:
+            best_image_path, best_image_px = p, px
+        _add_to_series_group(groups, ds, Path(p), order, px, is_image)
     if hdr is None:
         return None
+    hdr['readable'] = readable
     hdr['series_descriptions'] = series
     hdr['protocol_names'] = protocols
-    hdr['best_path'] = best_path
+    hdr['best_path'] = best_image_path if best_image_path is not None else best_path
     hdr['series_groups'] = _finish_series_groups(groups)
     return hdr
 
@@ -2639,13 +2655,20 @@ def _series_region(body_part: str, description: str, protocol: str = '') -> tupl
     return None, ''
 
 
-def _add_to_series_group(groups: dict, ds, path: Path, order: int, px: int) -> None:
+def _add_to_series_group(groups: dict, ds, path: Path, order: int, px: int,
+                         is_image: Optional[bool] = None) -> None:
+    """Add one object to its series group. Image objects and non-image objects /
+    secondary captures (is_image_object) never share a group, even under one
+    SeriesInstanceUID: each group's 'is_image' says which kind it holds."""
+    if is_image is None:
+        is_image = is_image_object(ds)
     uid = _tag(ds, 'SeriesInstanceUID') or f'__nouid__{order}'
-    g = groups.get(uid)
+    key = uid if is_image else f'__non_image__{uid}'
+    g = groups.get(key)
     if g is None:
-        g = groups[uid] = {
+        g = groups[key] = {
             'uid': uid, 'order': order, 'description': '', 'protocol': '', 'body_part': '',
-            'paths': [], 'best_path': None, 'best_px': -1,
+            'paths': [], 'best_path': None, 'best_px': -1, 'is_image': bool(is_image),
         }
     for key, tag in (('description', 'SeriesDescription'), ('protocol', 'ProtocolName'),
                      ('body_part', 'BodyPartExamined')):
@@ -2678,7 +2701,7 @@ def _group_series(file_paths: list[Path]) -> list[dict]:
             px = int(ds.get('Rows') or 0) * int(ds.get('Columns') or 0)
         except Exception:
             px = 0
-        _add_to_series_group(groups, ds, Path(p), order, px)
+        _add_to_series_group(groups, ds, Path(p), order, px, is_image_object(ds))
     return _finish_series_groups(groups)
 
 
@@ -2697,8 +2720,13 @@ def _plan_series_route(hdr: dict, file_paths: list[Path]) -> dict:
     the route when every informed series agrees on that body part (an
     unambiguous study; e.g. a HEAD-tagged scout + an untagged axial reformat),
     and excluded in a mixed study. Only when no series carries body-part
-    information does routing fall back to the study header (first file) over
+    information does routing fall back to the study header (first image object) over
     all files. Series informed as another body part never reach head_ct.
+    Series groups holding no image object (SR / PR / KO, a secondary-capture
+    "Dose Report" tagged NECK) take no part: they are never informed nor adopted
+    and contribute no paths, so they cannot turn a head CT into NECK, make it
+    look mixed, or become its preview. Only an upload with no image series at
+    all is routed on every group, as before.
 
     Returns {'modality_key', 'paths', 'best_path', 'body_part', 'routing'}."""
     modality = hdr.get('modality') or ''
@@ -2716,6 +2744,12 @@ def _plan_series_route(hdr: dict, file_paths: list[Path]) -> dict:
     groups = hdr.get('series_groups')
     if groups is None:
         groups = _group_series(file_paths)
+    # A hand-made group without 'is_image' counts as an image series (as before).
+    image_groups = [g for g in groups if g.get('is_image', True)]
+    if image_groups and len(image_groups) < len(groups):
+        ignored = {Path(p) for g in groups if not g.get('is_image', True) for p in g['paths']}
+        groups = image_groups
+        fallback['paths'] = [p for p in file_paths if Path(p) not in ignored]
     informed = [g for g in groups if g.get('region')]
     if not informed:
         if fallback['modality_key'] in _CT_SERIES_ROUTES:

@@ -208,7 +208,7 @@ def fake_github(monkeypatch, pub):
     monkeypatch.setattr(urllib.request, 'build_opener', lambda *h: _Opener())   # fetch_model_bundle's calls
     monkeypatch.setattr(pub, '_SLEEP', lambda s: None)
     monkeypatch.setattr(pub, 'MIN_PART_MB', 0)      # tiny synthetic models: allow 4 KiB parts in GitHub mode
-    for var in ('SIAA_MODELS_TOKEN', 'GITHUB_TOKEN', 'MODEL_BUNDLE_URL', 'MODEL_BUNDLE_TOKEN',
+    for var in ('SIAA_MODELS_TOKEN', 'GITHUB_TOKEN', 'MODEL_BUNDLE_URL', 'MODEL_BUNDLE_TOKEN', 'MODEL_BUNDLE_REPO',
                 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY', 'GITHUB_ACTIONS'):
         monkeypatch.delenv(var, raising=False)
     return fake
@@ -390,6 +390,7 @@ def test_github_mode_creates_release_uploads_parts_and_prints_secret_url(tmp_pat
     manifest_url = f'https://api.github.com/repos/o/r/releases/assets/{by_name["manifest.json"]["id"]}'
     assert f'MODEL_BUNDLE_URL={manifest_url}' in cap.out
     assert 'settings/environments' in cap.out and 'MODEL_BUNDLE_TOKEN' in cap.out
+    assert 'Nothing to paste per model release' in cap.out and 'brain-triage-<identity12> in o/r' in cap.out
     assert 'token source: --token' in cap.out
     local_gh = json.loads((out / 'manifest.github.json').read_text())
     assert local_gh['manifest_asset_url'] == manifest_url and local_gh['parts'] == expected_part_urls
@@ -793,7 +794,8 @@ def test_publish_refuses_a_non_production_gate_name_even_on_a_legacy_eval(tmp_pa
 
 def test_ci_never_ships_an_unvalidated_bundle_on_a_release_tag():
     """fetch_model_bundle emits bundle_validated=0 for an --allow-unvalidated bundle: the workflow must
-    name such an artifact UNVALIDATED-DEMO and refuse it on a v* tag (review round 2)."""
+    refuse it on a v* tag (review round 2) and never upload it as a workflow artifact of the public
+    repository (2026-11-10: only model-less installers are artifacts; the draft release refuses it too)."""
     import yaml
     wf = yaml.safe_load((REPO / '.github' / 'workflows' / 'build-windows.yml').read_text(encoding='utf-8'))
     for job in ('windows', 'macos'):
@@ -804,5 +806,32 @@ def test_ci_never_ships_an_unvalidated_bundle_on_a_release_tag():
         assert "startsWith(github.ref, 'refs/tags/v')" in refuse['if']
         assert names.index(refuse['name']) < names.index('Upload installer artifact')
         assert names.index(refuse['name']) < names.index('Attach to draft GitHub Release (tag builds)')
-        art = next(s for s in steps if s.get('name') == 'Upload installer artifact')['with']['name']
-        assert "bundle_validated == '0' && 'UNVALIDATED-DEMO'" in art and "'full'" in art
+        upload = next(s for s in steps if s.get('name') == 'Upload installer artifact')
+        assert upload['if'] == "steps.bundle.outputs.have_bundle != '1'"          # a model-bearing build: never
+        assert upload['with']['name'].endswith('-NO-VALIDATED-MODEL')
+        attach = next(s for s in steps if s.get('name') == 'Attach to draft GitHub Release (tag builds)')
+        assert "steps.bundle.outputs.bundle_validated != '0'" in attach['if']
+
+
+def test_publish_and_fetch_share_the_release_tag_and_manifest_asset_names(pub, fetch):
+    """CI finds a model's release by name (fetch_model_bundle.resolve_manifest_url): the two scripts
+    must never drift apart on the tag prefix or the manifest asset name."""
+    assert fetch.TAG_PREFIX == pub.TAG_PREFIX == 'brain-triage-'
+    assert fetch.MANIFEST_ASSET == pub.MANIFEST_ASSET == 'manifest.json'
+    assert pub.default_tag('0d559766ce58') == f'{fetch.TAG_PREFIX}0d559766ce58'
+
+
+def test_printed_steps_say_nothing_is_pasted_per_release(pub, monkeypatch, capsys):
+    monkeypatch.setattr(pub, '_build_repo_hint', lambda: 'SHAXZODBR/SIAA')
+    url = 'https://api.github.com/repos/o/r/releases/assets/123'
+    pub.print_secret_steps(url, 'o', 'r', 'env SIAA_MODELS_TOKEN')
+    out = capsys.readouterr().out
+    assert f'MODEL_BUNDLE_URL={url}' in out                                    # still printed, as information
+    assert 'Nothing to paste per model release' in out and 'brain-triage-<identity12> in o/r' in out
+    assert 'MODEL_BUNDLE_TOKEN' in out and 'READ o/r' in out and 'Contents: read' in out
+    assert 'MODEL_BUNDLE_REPO' in out and 'must name o/r' in out
+    assert 'BEFORE the version tag' in out and 'bump_model_release.py' in out and 'FALLBACK_IDENTITY' in out
+    assert 'DRAFT release' in out and 'optional fallback' in out and 'needs no editing per release' in out
+    assert 'paste the URL' not in out and 'Update -> paste' not in out
+    assert 'settings/environments' in out and 'env SIAA_MODELS_TOKEN' in out
+    assert TOKEN not in out

@@ -9,8 +9,9 @@ scripts/bump_model_release.py and quoted by the intended-use / user-manual docs)
 
     identity  evaluated_on  tp  fn  tn  fp  n_studies  n_slices
 
-WHY: the installer's model comes from the hand-set MODEL_BUNDLE_URL secret, the
-numbers and dates the documents quote come from the committed bump. A re-evaluation
+WHY: CI restores the installer's model from the models-repository release the code pin
+names (packaging/fetch_model_bundle.py: brain-triage-<FALLBACK_IDENTITY>), the numbers and
+dates the documents quote come from the committed bump. A re-evaluation
 (new evaluated_at / protocol block) keeps the weights' identity, so an identity-only
 check passes while the installer would show one evaluation date in the app (from the
 bundled eval) and another in the shipped documents. Re-publish the bundle

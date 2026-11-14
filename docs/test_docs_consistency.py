@@ -461,3 +461,58 @@ def test_provisioning_refusal_codes_quoted_in_vendor_docs_exist_in_the_tool():
         for col in ("customer", "fp8", "identity", "issued", "expires", "tier", "features",
                     "key_fingerprint", "bundle_sha256"):
             assert f"`{col}`" in text and f"'{col}'" in fields, (lang, col)
+
+
+# ---------------------------------------------------------------- release runbooks: publish rules
+
+RUNBOOK_LANGS = ("en", "ru")
+# Phrases of the pre-2026-11 publish section. Each one told the operator to do something that now leaks
+# the model or is no longer needed: publish the tag's draft release (it holds the full installer, and the
+# code repository is public), paste the MODEL_BUNDLE_URL secret for every release (CI resolves the bundle
+# by the identity the bump pins), or download the full installer from the workflow artifacts (it is never
+# one). Matched case-insensitively, with runs of whitespace collapsed.
+RUNBOOK_STALE_PUBLISH = {
+    "en": ("publish the draft release** with",
+           "draft release published with numbers",
+           "copy the *manifest asset api url*",
+           "→ secret `model_bundle_url`",
+           "`model_bundle_url` secret updated",
+           "update the secret **before** tagging",
+           "re-paste the secret",
+           "restores the model from `model_bundle_url`",
+           "to the environment secret `model_bundle_url`",
+           "from the actions run artifacts"),
+    "ru": ("опубликуйте черновик релиза",
+           "черновик релиза опубликован с числами",
+           "скопируйте *api-url ассета манифеста*",
+           "→ секрет `model_bundle_url`",
+           "секрет `model_bundle_url` обновлён",
+           "обновите секрет **до** тега",
+           "вставьте секрет снова",
+           "восстанавливает модель из `model_bundle_url`",
+           "в секрет окружения `model_bundle_url`",
+           "из артефактов запуска actions"),
+}
+RUNBOOK_DO_NOT_PUBLISH = {
+    "en": ("**do not publish the draft release** while it holds the full installer",
+           "draft release not published (it holds the full installer)"),
+    "ru": ("**не публикуйте черновик релиза**, пока в нём лежит полный установщик",
+           "черновик релиза не опубликован (в нём полный установщик)"),
+}
+
+
+def runbook_publish_problems(text: str, lang: str) -> list[str]:
+    """What is wrong with a release runbook's publish rules (empty = fine)."""
+    flat = re.sub(r"\s+", " ", text).lower()
+    problems = [f"stale instruction: {p!r}" for p in RUNBOOK_STALE_PUBLISH[lang] if p in flat]
+    problems += [f"missing rule: {p!r}" for p in RUNBOOK_DO_NOT_PUBLISH[lang] if p not in flat]
+    return problems
+
+
+@pytest.mark.parametrize("lang", RUNBOOK_LANGS)
+def test_release_runbook_never_publishes_the_draft_or_pastes_the_secret(lang):
+    """The runbook must not tell the operator to publish the draft release (it holds the installer with
+    the model, in a public repository), to paste the MODEL_BUNDLE_URL secret per release, or to download
+    the full installer from the workflow artifacts — and it must keep the "do not publish" rule."""
+    text = (DOCS / f"release_runbook_{lang}.md").read_text(encoding="utf-8")
+    assert not runbook_publish_problems(text, lang), (lang, runbook_publish_problems(text, lang))

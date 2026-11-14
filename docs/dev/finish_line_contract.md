@@ -169,3 +169,41 @@ hard reasons) or `promotion_log.json` says `forced`.
   `docs/user_manual_*.md`, `docs/intended_use_*.md`, new `docs/vendor_provisioning_{en,ru}.md`,
   `docs/test_docs_consistency.py` (only if a new rule is needed), `README.md`.
 - **sales**: new `docs/sales/*`, `docs/README.md`.
+
+## Addendum 2026-11-10 — the validated model and the public CI (decisions, made)
+
+The code repository `SHAXZODBR/SIAA` is public; the proprietary model lives only in the private models
+repository (`SHAXZODBR/SIAA-models`, one release `brain-triage-<identity12>` per model, published by
+`packaging/publish_model_bundle.py`). D7 is amended by:
+
+D9. **A model-bearing installer is never a workflow artifact.** Artifacts of a public repository can be
+    downloaded by any signed-in GitHub user while retained; draft-release assets are visible to writers only.
+    In both installer jobs "Upload installer artifact" runs only when `steps.bundle.outputs.have_bundle != '1'`
+    (clinic flavour / no bundle; artifact `…-NO-VALIDATED-MODEL`, `retention-days: 1`). A model-bearing
+    installer (full or UNVALIDATED-DEMO) leaves the runner only through "Attach to draft GitHub Release (tag
+    builds)", whose condition now also requires `have_bundle == '1'` and `bundle_validated != '0'`. On a branch
+    (Run workflow, `include_validated_model = true`) such a build is a rehearsal: it builds and smoke-tests,
+    uploads nothing and says so (`::notice` + job summary).
+D10. **A release tag never produces a model-less installer.** On a `v*` tag the restore step (when it runs, i.e.
+    not the clinic flavour) calls `fetch_model_bundle.py --require`: a missing bundle fails the build. Branch
+    builds keep warn-and-continue.
+D11. **No secret is edited per model release.** `fetch_model_bundle.py` resolves the bundle by identity: with a
+    models repository configured (`--repo` / `MODEL_BUNDLE_REPO`; the workflow passes
+    `vars.MODEL_BUNDLE_REPO || 'SHAXZODBR/SIAA-models'`) it reads release `brain-triage-<identity>` (identity =
+    `--identity`, else `FALLBACK_IDENTITY` read as text from `src/inference/validated_metrics.py`) with
+    `MODEL_BUNDLE_TOKEN`, takes its `manifest.json` asset and restores it as before; the restored identity must
+    equal the requested one. Precedence: explicit `--url` > repository > `MODEL_BUNDLE_URL` (now an optional
+    fallback). No token → the "absent" case (exit 0, or 1 with `--require`); a token but a failed lookup (404,
+    401/403, no `manifest.json`) → hard failure, never a silent fallback. `TAG_PREFIX` / `MANIFEST_ASSET` are
+    shared with the publisher (tested). "Verify bundle identity matches the code" compares the restored identity
+    with the same pin the lookup used, so on the lookup path it is NOT independent (it still guards the `--url` /
+    `MODEL_BUNDLE_URL` fallback). The independent check on `v*` tags is `--require-newest` (passed next to
+    `--require`): after the pinned release is found, one GET of `/repos/<repo>/releases?per_page=100`; a
+    published `brain-triage-*` release created after the pinned one fails the build ("the code pins <id> but the
+    models repository holds a newer model release <tag>: …") — a tag pushed without the bump commit. Drafts and
+    other tags are ignored; an unreadable list fails. Deliberate rebuild of an older model: repository variable
+    `MODEL_BUNDLE_ALLOW_OLDER=1` (or `--allow-older`) turns it into a loud warning. The token goes only to the
+    bundle URL's host; parts of a bundle found by the lookup must be on `https://api.github.com`. The draft-release
+    attach step refuses (fails, uploads nothing) when the tag's release is already published (`isDraft` != true).
+    Operator duty per model release: keep `MODEL_BUNDLE_TOKEN` able to read the models repository and push the
+    bump commit pinning the identity before the tag.

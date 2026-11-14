@@ -14,7 +14,7 @@
   sequence — central_slices() is the SAME rule production inference uses
   (src/inference/brain_analysis.py::_triage_mean_probs) — and files them as
   <out>/<split>/<cls>/<patient_id>_<k>.png, plus <out>/studies.csv
-  (patient_id, study_folder, cls, split, n_slices, label, label_source).
+  (patient_id, study_folder, cls, split, n_slices, label, label_source, modality).
 
   Binary class: with --abnormal-col the class comes from that column
   (yes -> abnormal, no -> normal; empty -> fall back to label); without it,
@@ -28,10 +28,47 @@
   the previous studies.csv (written before any slice of a run is built, so an
   interrupted run stays consistent), so a patient whose study list changed
   (a study added/removed shifts '<pid>' / '<pid>_s2' numbering) gets its own
-  images back. PNGs of studies that are no longer selected (label now
-  unusable, needs_review, not brain) are REMOVED on a full run (no --limit /
-  --max-per-class; with those they are only warned about). studies.csv is
+  images back. Renames / moves / removals happen BEFORE that studies.csv is
+  rewritten, so <out>/.reconcile_pending is created before the first change
+  on disk and removed right after the rewrite: a run that finds it (the
+  earlier one died in between, so the file names no longer match
+  studies.csv) refuses with exit 1 — rebuild with --fresh. PNGs of studies
+  that are no longer selected (label now unusable, needs_review, not brain)
+  are REMOVED on a full run (no --limit / --max-per-class; with those they
+  are only warned about). studies.csv is
   rewritten with the current classes. --fresh wipes <out>.
+
+  Modality rule (--modality MR): the validated triage model is an MR model, but
+  a "brain" study may be a head CT. With a rule:
+    • row level (before any DICOM is read): a matched row whose 'modality'
+      column names ANOTHER acquisition modality (e.g. 'CT') is dropped and counted
+      ('modality CT'); an empty / non-image value ('SR', 'PR', 'OT' …: older
+      indexes say 'SR' for many MR studies) is kept and decided at build time;
+    • build time (the ground truth): the DICOM Modality of the very series the
+      slices come from (triage_input) must equal the rule, strictly. Otherwise the
+      study gets no slices, keeps its studies.csv row with n_slices 0 (so the
+      '<pid>_sN' numbering of the others never shifts) and is counted as
+      'modality CT (series)' / 'modality unknown (series)', not as failed. A study
+      already found to be another modality is not read again on later runs;
+    • reuse: existing PNGs are reused without reading DICOM only when the previous
+      studies.csv recorded modality == rule for that study. Anything else (a set
+      built by an older version or without a rule) is re-read: on a pass its files
+      are rewritten, otherwise REMOVED. Unselected files a --limit/--max-per-class
+      run would leave in place are removed too unless verified. So with
+      --modality X every PNG in <out> comes from a series whose Modality is X.
+    • studies.csv 'modality' = the Modality of the series the slices came from,
+      read from DICOM in this or an earlier run (for a study excluded at build
+      time: the Modality found, with n_slices 0; '' when not verified). It is
+      written before the loop with only already-verified values, so an
+      interrupted run never leaves a state in which unverified files are reused;
+      every CHECKPOINT_EVERY studies read from DICOM it is rewritten with what
+      has been verified so far, so a resumed run re-reads only the last few.
+      A set built without a rule by this version is therefore already verified;
+      one from an older version (no column) is re-read.
+    • when the rule leaves NO study with slices (every row dropped, or every
+      study excluded / failed) the run exits 1: an empty set must stop the
+      pipeline. Without --modality nothing is filtered; the column is still filled
+      for studies decoded in the run and carried over for reused ones.
 
   NOTE (honest): report labels are STUDY-level; we apply them to slices, which
   is weak supervision (not every slice shows the finding). Good enough to teach
@@ -41,7 +78,7 @@
     python scripts/build_training_set.py --images "<folder>" \
         --matched data/<batch>_matched.csv --out data/sets/<batch> \
         --mode binary --abnormal-col abnormal --skip-needs-review \
-        [--index data/<batch>_index.csv] [--max-per-class 0] [--limit 0] [--fresh]
+        [--index data/<batch>_index.csv] [--modality MR] [--max-per-class 0] [--limit 0] [--fresh]
 ================================================================================
 """
 from __future__ import annotations
@@ -62,28 +99,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.pipeline.brain_mri_preprocessor import (  # noqa: E402
     process_brain_study, central_band_best_slice, robust_normalize_slice,
     CLASSIFIER_SEQUENCE_PREFERENCE, triage_sequence, central_slice_indices)
+from src.pipeline.dicom_objects import NON_IMAGE_MODALITIES  # noqa: E402
 
 G, Y, B, R, NC = '\033[0;32m', '\033[1;33m', '\033[0;34m', '\033[0;31m', '\033[0m'
 # keep only findings with enough matched studies to learn (drop tiny classes
 # like hemorrhage=6, hydrocephalus=13 that would just add noise this round)
 KEEP = {'tumor', 'stroke', 'atrophy', 'ms_wml', 'cyst', 'normal'}
-STUDIES_COLUMNS = ('patient_id', 'study_folder', 'cls', 'split', 'n_slices', 'label', 'label_source')
+STUDIES_COLUMNS = ('patient_id', 'study_folder', 'cls', 'split', 'n_slices', 'label', 'label_source', 'modality')
 _PNG_RE = re.compile(r'^(?P<prefix>.+)_(?P<k>\d+)$')
 STAGING_DIR = '.relabel_staging'      # files in flight while a relabel/rename is applied
+RECONCILE_MARKER = '.reconcile_pending'   # disk changed by reconcile, studies.csv not yet rewritten
+CHECKPOINT_EVERY = 25                 # studies read from DICOM between two studies.csv checkpoints
 
 
-def central_slices(study, k=5):
-    """Up to k axial central slices of the triage series — the SAME series / slice rule
-    production uses (brain_mri_preprocessor.triage_sequence + central_slice_indices, shared
-    with brain_analysis._triage_mean_probs). [] when the study has no usable axial series
+def triage_input(study, k=5) -> tuple[list[np.ndarray], str]:
+    """(slices, modality): up to k axial central slices of the triage series — the SAME series /
+    slice rule production uses (brain_mri_preprocessor.triage_sequence + central_slice_indices,
+    shared with brain_analysis._triage_mean_probs) — and the upper-case DICOM Modality of THAT
+    series ('' when unknown). ([], '') when the study has no usable axial series
     (sagittal/coronal-only, or only degenerate e.g. colour-strip volumes)."""
     seq = triage_sequence(study)
     if seq is None:
-        return []
+        return [], ''
     vol = study.sequences[seq]
+    modality = (study.seq_meta.get(seq, {}).get('modality') or '').strip().upper()
     if vol.ndim != 3:
-        return [robust_normalize_slice(vol)]
-    return [robust_normalize_slice(vol[i]) for i in central_slice_indices(vol.shape[0], k)]
+        return [robust_normalize_slice(vol)], modality
+    return [robust_normalize_slice(vol[i]) for i in central_slice_indices(vol.shape[0], k)], modality
+
+
+def central_slices(study, k=5):
+    """The slices of triage_input (unchanged public rule; tests pin it against production)."""
+    return triage_input(study, k)[0]
 
 
 def binary_class(label: str, abnormal: str) -> Optional[str]:
@@ -109,8 +156,12 @@ def multiclass_class(label: str) -> Optional[str]:
 
 
 def select_studies(rows: list[dict], mode: str, abnormal_col: Optional[str], skip_needs_review: bool,
-                   index_folders: Optional[dict[str, str]]) -> tuple[list[dict], Counter]:
-    """Filter matched rows down to trainable brain studies. Returns (studies, drop reasons)."""
+                   index_folders: Optional[dict[str, str]],
+                   modality: Optional[str] = None) -> tuple[list[dict], Counter]:
+    """Filter matched rows down to trainable brain studies. Returns (studies, drop reasons).
+    With `modality` (e.g. 'MR') a row whose 'modality' column names another ACQUISITION modality
+    is dropped as 'modality <X>'; an empty or non-image value ('SR', 'PR', …) is kept — the
+    build-time series check decides those."""
     dropped: Counter = Counter()
     studies: list[dict] = []
     for r in rows:
@@ -132,6 +183,10 @@ def select_studies(rows: list[dict], mode: str, abnormal_col: Optional[str], ski
             cls = multiclass_class(r.get('label') or '')
         if cls is None:
             dropped['unlabelled/dropped class'] += 1; continue
+        if modality:
+            row_mod = (r.get('modality') or '').strip().upper()
+            if row_mod and row_mod != modality and row_mod not in NON_IMAGE_MODALITIES:
+                dropped[f'modality {row_mod}'] += 1; continue
         studies.append({'patient_id': (r.get('patient_id') or '').strip(), 'study_folder': r['study_folder'],
                         'cls': cls, 'label': (r.get('label') or '').strip(),
                         'label_source': (r.get('label_source') or '').strip()})
@@ -193,6 +248,39 @@ def read_prefix_map(out: Path) -> Optional[dict[str, str]]:
     return {o['study_folder']: o['prefix'] for o in old}
 
 
+def read_previous_modality(out: Path) -> dict[str, tuple[str, int]]:
+    """study_folder -> (modality, n_slices) as the PREVIOUS run recorded them in <out>/studies.csv.
+    {} when there is none or it is ambiguous; a studies.csv from before the modality column gives ''
+    for every study (nothing verified)."""
+    sc = out / 'studies.csv'
+    if not sc.is_file():
+        return {}
+    with open(sc, encoding='utf-8') as fh:
+        rows = list(csv.DictReader(fh))
+    prev: dict[str, tuple[str, int]] = {}
+    for r in rows:
+        folder = r.get('study_folder') or ''
+        if folder in prev:
+            return {}                                  # ambiguous: trust nothing
+        try:
+            n = int(r.get('n_slices') or 0)
+        except ValueError:
+            n = 0
+        prev[folder] = ((r.get('modality') or '').strip().upper(), n)
+    return prev
+
+
+def mark_reconcile(out: Path) -> None:
+    """Create <out>/RECONCILE_MARKER (durably) BEFORE files are renamed / moved / removed: until the
+    run's first studies.csv write, the disk no longer matches the folder -> prefix map of studies.csv."""
+    marker = out / RECONCILE_MARKER
+    if marker.exists():
+        return
+    with open(marker, 'w', encoding='utf-8') as fh:
+        fh.write('reconcile in progress: the PNG names no longer match studies.csv until it is rewritten\n')
+        fh.flush(); os.fsync(fh.fileno())
+
+
 def reconcile_existing(out: Path, studies: list[dict], prune: bool) -> dict:
     """Align the PNGs already under <out> with THIS run's plan (studies carry 'prefix' + 'cls').
 
@@ -201,6 +289,8 @@ def reconcile_existing(out: Path, studies: list[dict], prune: bool) -> dict:
     <split>/<new cls>/<new prefix>_<k>.png. Moves go through a staging dir so renames
     never overwrite each other. Files of prefixes no study claims are stale: removed when
     `prune` (a full run) or when their name is needed by a current study, else reported.
+    Before the first change on disk the RECONCILE_MARKER is created (mark_reconcile); the
+    caller removes it once studies.csv records this run's map.
 
     Returns {'placed': {prefix: (split, n)}, 'relabelled': [(prefix, old_cls, new_cls)],
              'renamed': int, 'stale_removed': [prefix], 'stale_kept': [prefix]}.
@@ -235,6 +325,8 @@ def reconcile_existing(out: Path, studies: list[dict], prune: bool) -> dict:
     kept = [p for p in stale if p not in remove]
 
     staging = out / STAGING_DIR
+    if moves or remove:
+        mark_reconcile(out)
     if moves:
         staging.mkdir(parents=True, exist_ok=False)
         for i, (src_fp, _) in enumerate(moves):
@@ -286,10 +378,15 @@ def main() -> None:
     ap.add_argument('--skip-needs-review', action='store_true', help='drop rows with needs_review=yes')
     ap.add_argument('--index', default=None,
                     help='index CSV from index_new_studies.py: only studies it recorded (without error) are used')
+    ap.add_argument('--modality', default=None, metavar='MOD',
+                    help='only studies whose triage series has this DICOM Modality, e.g. MR (default: no rule)')
     ap.add_argument('--max-per-class', type=int, default=0, help='cap studies per class (0 = no cap)')
     ap.add_argument('--limit', type=int, default=0, help='process at most N studies (smoke runs; 0 = all)')
     ap.add_argument('--fresh', action='store_true', help='remove --out first (otherwise resumable)')
     args = ap.parse_args()
+    want = (args.modality or '').strip().upper() or None
+    if args.modality is not None and (want is None or want in NON_IMAGE_MODALITIES):
+        ap.error(f'--modality must name an acquisition modality such as MR or CT, not {args.modality!r}')
 
     img_root = Path(args.images)
     if not img_root.is_dir():
@@ -311,7 +408,8 @@ def main() -> None:
             index_folders = {r['study_folder']: (r.get('error') or '').strip() for r in csv.DictReader(fh)}
         print(f'index: {len(index_folders)} study folders from {args.index}')
 
-    studies, dropped = select_studies(rows, args.mode, args.abnormal_col, args.skip_needs_review, index_folders)
+    studies, dropped = select_studies(rows, args.mode, args.abnormal_col, args.skip_needs_review, index_folders,
+                                      modality=want)
     if args.max_per_class > 0:
         per_cls: Counter = Counter(); capped = []
         for s in studies:
@@ -334,9 +432,40 @@ def main() -> None:
     if (out / STAGING_DIR).exists():
         print(f'{R}{out / STAGING_DIR} exists: an earlier relabel of this set was interrupted mid-move — '
               f'rebuild with --fresh{NC}'); sys.exit(1)
+    if (out / RECONCILE_MARKER).exists():
+        # files were renamed to that run's prefixes but studies.csv still maps the old ones: reusing them
+        # could hand one study's slices (another class, a CT series) to another study as verified
+        print(f'{R}{out / RECONCILE_MARKER} exists: an earlier run was interrupted while renaming files — the '
+              f'slices on disk no longer match studies.csv; rebuild with --fresh{NC}'); sys.exit(1)
     full_run = args.limit == 0 and args.max_per_class == 0
+    prev = read_previous_modality(out)                # before studies.csv is rewritten below
     rec_state = reconcile_existing(out, studies, prune=full_run)
     placed = rec_state['placed']
+    n_unverified_removed = 0
+    if want and rec_state['stale_kept']:
+        # a --limit/--max-per-class run leaves unselected studies' files in place: under a rule only
+        # files the previous studies.csv VERIFIED may stay (its prefixes are still the previous run's)
+        folder_of = {pf: f for f, pf in (read_prefix_map(out) or {}).items()}
+        on_disk = scan_existing(out)
+        for pf in list(rec_state['stale_kept']):
+            if prev.get(folder_of.get(pf, ''), ('', 0))[0] != want:
+                mark_reconcile(out)
+                for split, cls, _ in on_disk.get(pf, []):
+                    for fp in prefix_files(out, split, cls, pf):
+                        fp.unlink()
+                rec_state['stale_kept'].remove(pf); n_unverified_removed += 1
+
+    def prev_modality(s: dict) -> str:
+        return prev.get(s['study_folder'], ('', 0))[0]
+
+    def reusable(s: dict) -> bool:
+        """Files on disk that may be used without reading DICOM (under a rule: verified before)."""
+        return s['prefix'] in placed and (not want or prev_modality(s) == want)
+
+    def known_excluded(s: dict) -> bool:
+        """Under a rule: an earlier run read this study and found its series to be another modality."""
+        m, n = prev.get(s['study_folder'], ('', 0))
+        return bool(want) and s['prefix'] not in placed and n == 0 and m not in ('', want)
     # patients that already have files keep the split their files are in
     fixed_split = {s['patient_id']: placed[s['prefix']][0] for s in studies if s['prefix'] in placed}
     val_pats = patient_split([s['patient_id'] for s in studies], args.val_frac)
@@ -347,35 +476,64 @@ def main() -> None:
         split = placed[s['prefix']][0] if s['prefix'] in placed else ('val' if s['patient_id'] in val_pats else 'train')
         records.append({'patient_id': s['patient_id'], 'study_folder': s['study_folder'], 'cls': s['cls'],
                         'split': split, 'n_slices': placed[s['prefix']][1] if s['prefix'] in placed else 0,
-                        'label': s['label'], 'label_source': s['label_source']})
+                        'label': s['label'], 'label_source': s['label_source'],
+                        # only a VERIFIED modality is written ahead of the loop: an interrupted run must
+                        # never leave files the next run would reuse as verified
+                        'modality': prev_modality(s) if reusable(s) or known_excluded(s) else ''})
     # written BEFORE building: the next run maps files to studies with it, even if this one is interrupted
     write_studies(out, records)
+    (out / RECONCILE_MARKER).unlink(missing_ok=True)  # disk and studies.csv agree again
 
     counts: Counter = Counter()
-    n_reused = n_failed = n_built = 0
+    excluded: Counter = Counter()                     # build-time modality rule, per reason
+    n_reused = n_failed = n_built = n_reverified = n_unverifiable = 0
+    n_read = 0                                        # studies read from DICOM since the last checkpoint
     for i, (s, rec) in enumerate(zip(studies, records), 1):
+        if n_read >= CHECKPOINT_EVERY:
+            # a record only ever carries a VERIFIED modality and the slice count of files that are on
+            # disk, so this is a safe resume point: an interrupted run (drive unplugged, laptop asleep)
+            # re-reads at most CHECKPOINT_EVERY studies instead of everything built so far
+            write_studies(out, records); n_read = 0
         split = rec['split']
-        if s['prefix'] in placed:
+        if reusable(s):
             counts[(split, s['cls'])] += rec['n_slices']; n_reused += 1
             continue
+        if known_excluded(s):
+            excluded[f"modality {prev_modality(s)} (series)"] += 1
+            continue
+        n_read += 1
+        # under a rule, files of an unverified study (older set / built without a rule) are re-checked
+        old_files = prefix_files(out, split, s['cls'], s['prefix']) if s['prefix'] in placed else []
         study_dir = img_root / s['study_folder']
         files = [f for f in study_dir.rglob('*') if f.suffix.lower() == '.dcm'] if study_dir.is_dir() else []
         try:
             study = process_brain_study(files) if files else None
-            slices = central_slices(study) if study is not None else []
+            slices, modality = triage_input(study) if study is not None else ([], '')
         except Exception as e:  # unreadable study: leave it out, it will be retried next run
             print(f'  {Y}skip {s["study_folder"][:40]}…: {type(e).__name__}: {str(e)[:60]}{NC}')
+            slices, modality = [], ''
+        if slices and want and modality != want:
             slices = []
-        if not slices:
+            excluded[f"modality {modality or 'unknown'} (series)"] += 1
+            rec['modality'] = modality
+        elif not slices:
             n_failed += 1
+            n_unverifiable += bool(old_files)
+        for fp in old_files:                          # rewritten cleanly on a pass, removed otherwise
+            fp.unlink()
+        if not slices:
+            rec['n_slices'] = 0
             continue
         n = write_slices(slices, out / split / s['cls'], s['prefix'])
         rec['n_slices'] = n
+        rec['modality'] = modality
         counts[(split, s['cls'])] += n; n_built += 1
+        n_reverified += bool(old_files)
         if i % 50 == 0:
             print(f'  …{i}/{len(studies)}  built={n_built} reused={n_reused} failed={n_failed}', flush=True)
 
     write_studies(out, records)
+    n_excluded = sum(excluded.values())
     n_relabelled = len(rec_state['relabelled'])
 
     pats = sorted({s['patient_id'] for s in studies})
@@ -384,7 +542,22 @@ def main() -> None:
     print(f"  {B}LOCAL TRAINING SET BUILT ({args.mode}){NC}")
     print('=' * 60)
     print(f"  studies: {len(studies)}  built {n_built}  reused {n_reused}  relabelled {n_relabelled}"
-          f"  {'failed ' + str(n_failed) if n_failed else ''}")
+          f"  {'failed ' + str(n_failed) if n_failed else ''}"
+          f"{'  excluded ' + str(n_excluded) if want else ''}")
+    if want:
+        row_level = {k: v for k, v in dropped.items() if k.startswith('modality ')}
+        print(f"  {B}modality rule: --modality {want}{NC}  (only series whose DICOM Modality is {want})")
+        print(f"    rows dropped before reading DICOM: "
+              + (', '.join(f'{k}={v}' for k, v in sorted(row_level.items())) or 'none'))
+        print(f"    studies excluded at build time (kept in studies.csv, n_slices 0): "
+              + (', '.join(f'{k}={v}' for k, v in sorted(excluded.items())) or 'none'))
+        if n_reverified:
+            print(f"    {Y}re-verified {n_reverified} studies whose existing PNGs were not verified yet "
+                  f"(files rewritten){NC}")
+        if n_unverifiable:
+            print(f"    {Y}removed the PNGs of {n_unverifiable} unverified studies that could not be read{NC}")
+        if n_unverified_removed:
+            print(f"    {Y}removed the PNGs of {n_unverified_removed} unverified studies outside this selection{NC}")
     if n_relabelled:
         moved = Counter((o, n) for _, o, n in rec_state['relabelled'])
         print(f"  {Y}relabelled {n_relabelled} studies since the last build (files moved, same split): "
@@ -406,6 +579,10 @@ def main() -> None:
         tr, va = counts.get(('train', cls), 0), counts.get(('val', cls), 0)
         print(f"    {cls:14s} train {tr:>4}  val {va:>4}")
     print(f"  studies.csv: {out / 'studies.csv'}")
+    if not n_built and not n_reused and n_excluded:
+        # the rule left nothing: an empty set must stop the pipeline (as 'no trainable studies' does)
+        print(f'{R}no study produced slices: {n_failed} failed, {n_excluded} excluded by --modality {want}{NC}')
+        sys.exit(1)
     if n_failed and not n_built and not n_reused:
         print(f'{R}every study failed to produce slices{NC}'); sys.exit(1)
     print(f"\n  ✓ Ready for: python training/finetune_brain_classifier.py --data {out} \\")

@@ -315,6 +315,51 @@ def test_import_never_applies_two_labels_to_one_row():
     assert rows[0]['label_source'] == 'rules'
 
 
+def _two_rows_one_patient(date):
+    return [L.label_row(r) for r in [
+        {'patient_id': '9000401', 'modality': 'MR', 'body_part': 'brain', 'study_date': date,
+         'section_index': '1', 'conclusion': 'МРТ-признаков структурных изменений головного мозга не выявлено.'},
+        {'patient_id': '9000401', 'modality': 'CT', 'body_part': 'brain', 'study_date': date,
+         'section_index': '1', 'conclusion': 'Объемное образование левой лобной доли (глиома).'},
+    ]]
+
+
+@pytest.mark.parametrize('date', ['', '2031-07-22'])
+def test_import_exact_key_with_an_empty_study_date(date):
+    """Review 2026-11-11 #6.1: the parser can emit study_date=''. A collector line carries all four key
+    fields, so it must match its row exactly even when the date is empty — not fall back to the patient
+    id alone, where two rows make it ambiguous and the readers' split / overrule is silently lost."""
+    rows = _two_rows_one_patient(date)
+    assert [(r['label'], r['needs_review']) for r in rows] == [('normal', 'no'), ('tumor', 'no')]
+    key = {'patient_id': '9000401', 'study_date': date, 'section_index': '1'}
+    res = L.import_llm_labels(rows, [
+        {**key, 'modality': 'MR', 'label': 'tumor', 'abnormal': True, 'needs_review': 'yes'},   # readers split
+        {**key, 'modality': 'CT', 'label': 'normal', 'abnormal': False, 'needs_review': 'no'},  # overruled
+    ])
+    assert tuple(res) == (2, 0, 0)
+    assert [(r['label'], r['abnormal'], r['needs_review'], r['label_source']) for r in rows] == [
+        ('tumor', 'yes', 'yes', 'import'), ('normal', 'no', 'no', 'import')]
+
+
+def test_import_undated_line_with_modality_only_uses_the_three_part_key():
+    rows = _two_rows_one_patient('')
+    res = L.import_llm_labels(rows, [{'patient_id': '9000401', 'study_date': '', 'modality': 'CT',
+                                      'label': 'normal', 'abnormal': False}])
+    assert tuple(res) == (1, 0, 0) and rows[1]['label'] == 'normal' and rows[0]['label_source'] == 'rules'
+
+
+@pytest.mark.parametrize('line', [{'patient_id': '9000401'}, {'patient_id': '9000401', 'study_date': ''}])
+def test_import_legacy_patient_only_line_is_unchanged(line):
+    """A legacy line without modality/section_index still falls back to the patient id alone."""
+    rows = _two_rows_one_patient('')
+    before = [dict(r) for r in rows]
+    assert tuple(L.import_llm_labels(rows, [{**line, 'label': 'tumor', 'abnormal': True}])) == (0, 0, 1)
+    assert rows == before
+    one = rows[:1]
+    assert tuple(L.import_llm_labels(one, [{**line, 'label': 'tumor', 'abnormal': True}])) == (1, 0, 0)
+    assert one[0]['label'] == 'tumor' and one[0]['label_source'] == 'import'
+
+
 def test_cli_end_to_end(tmp_path: Path):
     src = tmp_path / 'reports.csv'
     cols = ['patient_id', 'modality', 'body_part', 'study_date', 'conclusion', 'description',
@@ -518,3 +563,248 @@ def test_short_tail_never_negates_a_non_vascular_finding(text):
 def test_sentence_final_net_is_a_negation(text, expected):
     """'нет' at the end of a sentence (its '.' stripped) negates (round 2, line 140)."""
     assert lab(text) == expected
+
+
+# ------------------------------------------- import: needs_review on a label line
+_KEY = {'patient_id': '9000111', 'study_date': '2031-07-21', 'modality': 'MR', 'section_index': '1'}
+
+
+def test_import_result_is_a_three_field_tuple():
+    assert L.ImportResult._fields == ('applied', 'skipped', 'ambiguous')
+    applied, skipped, ambiguous = L.import_llm_labels(_same_day_rows(), [])
+    assert (applied, skipped, ambiguous) == (0, 0, 0)
+
+
+@pytest.mark.parametrize('flag', ['yes', 'YES', ' true ', '1', True, 'да', 'y'])
+def test_import_needs_review_applies_but_keeps_row_in_review(flag):
+    rows = _same_day_rows()
+    res = L.import_llm_labels(rows, [{**_KEY, 'label': 'stroke', 'abnormal': True, 'needs_review': flag}])
+    assert tuple(res) == (1, 0, 0)
+    assert (rows[1]['label'], rows[1]['abnormal'], rows[1]['label_source']) == ('stroke', 'yes', 'import')
+    assert rows[1]['needs_review'] == 'yes' and rows[1]['label_confidence'] == 'low'
+    assert rows[0]['label_source'] == 'rules'
+
+
+@pytest.mark.parametrize('extra', [{}, {'needs_review': 'no'}, {'needs_review': False}, {'needs_review': ''},
+                                   {'needs_review': 'maybe'}, {'needs_review': None}])
+def test_import_without_needs_review_leaves_review(extra):
+    rows = _same_day_rows()
+    assert rows[1]['needs_review'] == 'yes'                       # the rules sent it to review
+    res = L.import_llm_labels(rows, [{**_KEY, 'label': 'stroke', 'abnormal': True, **extra}])
+    assert tuple(res) == (1, 0, 0)
+    assert (rows[1]['label'], rows[1]['needs_review'], rows[1]['label_confidence']) == ('stroke', 'no', 'high')
+
+
+def test_import_needs_review_with_another_source():
+    rows = _same_day_rows()
+    L.import_llm_labels(rows, [{**_KEY, 'label': 'stroke', 'abnormal': True}], source='llm')
+    assert (rows[1]['label_confidence'], rows[1]['needs_review']) == ('medium', 'no')
+    rows = _same_day_rows()
+    L.import_llm_labels(rows, [{**_KEY, 'label': 'stroke', 'abnormal': True, 'needs_review': 'yes'}], source='llm')
+    assert (rows[1]['label_confidence'], rows[1]['needs_review'], rows[1]['label_source']) == ('low', 'yes', 'llm')
+
+
+@pytest.mark.parametrize('first,second', [('yes', 'no'), ('no', 'yes'), ('yes', 'yes')])
+def test_import_needs_review_with_identical_duplicate_stays_in_review(first, second):
+    """An identical duplicate is skipped either way; a review request on either line wins."""
+    rows = _same_day_rows()
+    res = L.import_llm_labels(rows, [{**_KEY, 'label': 'stroke', 'abnormal': True, 'needs_review': first},
+                                     {**_KEY, 'label': 'stroke', 'abnormal': True, 'needs_review': second}])
+    assert tuple(res) == (1, 1, 0)
+    assert (rows[1]['label'], rows[1]['needs_review'], rows[1]['label_confidence']) == ('stroke', 'yes', 'low')
+
+
+def test_import_needs_review_with_conflicting_duplicate_and_ambiguous_key():
+    rows = _same_day_rows()
+    res = L.import_llm_labels(rows, [{**_KEY, 'label': 'stroke', 'abnormal': True, 'needs_review': 'no'},
+                                     {**_KEY, 'label': 'tumor', 'abnormal': True, 'needs_review': 'yes'}])
+    assert tuple(res) == (1, 0, 1)
+    assert (rows[1]['label'], rows[1]['needs_review'], rows[1]['label_confidence']) == ('stroke', 'yes', 'low')
+    # an ambiguous key is never applied, needs_review or not
+    rows = _same_day_rows()
+    before = [dict(r) for r in rows]
+    res = L.import_llm_labels(rows, [{'patient_id': '9000111', 'study_date': '2031-07-21', 'label': 'stroke',
+                                      'abnormal': True, 'needs_review': 'yes'}])
+    assert tuple(res) == (0, 0, 1) and rows == before
+    # an invalid label is skipped, needs_review or not
+    res = L.import_llm_labels(rows, [{**_KEY, 'label': 'bogus', 'abnormal': True, 'needs_review': 'yes'}])
+    assert tuple(res) == (0, 1, 0) and rows == before
+
+
+def _cli_import(tmp_path: Path, labels):
+    src = tmp_path / 'reports.csv'
+    cols = ['patient_id', 'modality', 'body_part', 'study_date', 'conclusion', 'section_index']
+    with open(src, 'w', newline='', encoding='utf-8') as fh:
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction='ignore')
+        w.writeheader()
+        for r in _rows():
+            w.writerow(r)
+    llm = _jsonl(tmp_path / 'llm.jsonl', labels)
+    proc = subprocess.run([PY, str(SCRIPT), '--reports', str(src), '--out', str(tmp_path / 'labels.csv'),
+                           '--import-llm-labels', str(llm)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    with open(tmp_path / 'labels.csv', newline='', encoding='utf-8') as fh:
+        return proc.stdout, list(csv.DictReader(fh))
+
+
+def test_cli_prints_how_many_imported_labels_stay_in_review(tmp_path: Path):
+    k1 = {'patient_id': '9000001', 'study_date': '2031-07-01', 'modality': 'MR', 'section_index': '0'}
+    k2 = {'patient_id': '9000002', 'study_date': '2031-07-02', 'modality': 'MR', 'section_index': '0'}
+    k3 = {'patient_id': '9000002', 'study_date': '2031-08-09', 'modality': 'CT', 'section_index': '0'}
+    out, rows = _cli_import(tmp_path, [{**k1, 'label': 'normal', 'abnormal': False, 'needs_review': 'yes'},
+                                       {**k2, 'label': 'other', 'abnormal': True, 'needs_review': 'yes'},
+                                       {**k3, 'label': 'hemorrhage', 'abnormal': True, 'needs_review': 'no'}])
+    assert '3 applied, 0 ambiguous, 0 skipped' in out
+    assert '2 imported label(s) stay in review' in out
+    assert [(r['label_source'], r['needs_review'], r['label_confidence']) for r in rows] == [
+        ('import', 'yes', 'low'), ('import', 'yes', 'low'), ('', '', ''), ('import', 'no', 'high')]
+    out, _ = _cli_import(tmp_path, [{**k1, 'label': 'normal', 'abnormal': False}])
+    assert '1 applied' in out and 'stay in review' not in out
+
+
+def test_cli_ambiguous_hint_names_the_real_cause(tmp_path: Path):
+    out, rows = _cli_import(tmp_path, [{'patient_id': '9000002', 'label': 'tumor', 'abnormal': True}])
+    assert '0 applied, 1 ambiguous, 0 skipped' in out
+    assert 'ambiguous labels were NOT applied' in out and 'incomplete or matches no row' in out
+    assert 'export again' not in out
+    assert all(r['label_source'] != 'import' for r in rows)
+
+
+# --------------------------------------- training/relabel_workflow.js direct mode
+_NODE_DIRECT = r"""
+const fs = require('fs')
+let src = fs.readFileSync(process.argv[1], 'utf8').replace('export const meta', 'const meta')
+const spec = JSON.parse(process.argv[2])
+const calls = [], logs = []
+const run = new Function('args', 'phase', 'agent', 'log', 'pipeline', 'return (async () => {' + src + '})()')
+const agent = async (prompt, opts) => {
+  const m = prompt.match(/NR>=(\d+) && NR<=(\d+) \{print NR-1 "\\t" \$0\}' '([^']+)'/)
+  const w = prompt.match(/write your labels to '([^']+)'/)
+  const a = m ? +m[1] : null, z = m ? +m[2] : null
+  calls.push({ label: opts.label, phase: opts.phase, model: opts.model === undefined ? null : opts.model,
+               schema_required: opts.schema ? opts.schema.properties.labels.items.required : null,
+               a, z, file: m ? m[3] : null, part: w ? w[1] : null })
+  const how = (spec.answers || {})[opts.label]
+  if (how === undefined || how === 'ok') {
+    const labels = []
+    for (let r = a - 1; r <= z - 1; r++) labels.push({ row: r, patient_id: String(9000300 + r), label: spec.label || 'normal' })
+    return { labels }
+  }
+  if (how === 'null') return null
+  return how                                          // a literal (possibly garbage) answer
+}
+run(spec.args, () => {}, agent, m => logs.push(String(m)), async (items, fn) => Promise.all(items.map((it, i) => fn(it, it, i))))
+  .then(r => process.stdout.write(JSON.stringify({ result: r, calls, logs })),
+        e => process.stdout.write(JSON.stringify({ error: String((e && e.message) || e), calls, logs })))
+"""
+_HAS_NODE = __import__('shutil').which('node')
+
+
+def _direct(spec):
+    proc = subprocess.run(['node', '-e', _NODE_DIRECT, str(WORKFLOW), json.dumps(spec)],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_workflow_direct_mode_rules_is_the_rules_only_file():
+    """Review 2026-11-11 #6.3: the collector needs the rules-only CSV, not the import target."""
+    js = WORKFLOW.read_text(encoding='utf-8')
+    assert '--rules data/<batch>_labels_rules.csv' in js
+    assert '--rules data/<batch>_labels.csv' not in js
+    assert '--out data/<batch>_labels_rules.csv --export-for-llm' in js
+
+
+def test_workflow_direct_mode_static():
+    js = WORKFLOW.read_text(encoding='utf-8')
+    assert 'const N_LINES = args && args.n_lines' in js
+    assert "required: ['row', 'patient_id', 'label']" in js
+    assert '/v${job.v + 1}-b${job.b + 1}.tsv' in js
+    assert "return { mode: 'direct', file, out_dir: outDir, n_in: N_LINES, votes: VOTES, batch: BATCH, " \
+           "n_out: tsv.length, missing, rows: tsv }" in js
+    # the direct branch returns before the reader agent is ever started
+    assert js.index("return { mode: 'direct'") < js.index("phase('Read')")
+    # the existing key pins still hold with the direct schema added
+    assert js.count("modality: { type: 'string' }") == 2 and js.count("section_index: { type: 'string' }") == 2
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason='node not installed')
+def test_workflow_direct_mode_batches_votes_and_parts():
+    f = '/synthetic/b_review_all.jsonl'
+    out = _direct({'args': {'file': f, 'n_lines': 7, 'batch': 3, 'votes': 2, 'model': 'opus'}})
+    assert 'error' not in out, out
+    calls = out['calls']
+    assert [c['label'] for c in calls] == ['label-v1-b1', 'label-v1-b2', 'label-v1-b3',
+                                           'label-v2-b1', 'label-v2-b2', 'label-v2-b3']
+    assert all(c['phase'] == 'Label' and c['model'] == 'opus' and c['file'] == f for c in calls)
+    assert all(c['schema_required'] == ['row', 'patient_id', 'label'] for c in calls)
+    assert [(c['a'], c['z']) for c in calls] == [(1, 3), (4, 6), (7, 7)] * 2
+    assert [c['part'] for c in calls] == [f'{f}.labels/v{v}-b{b}.tsv' for v in (1, 2) for b in (1, 2, 3)]
+    res = out['result']
+    assert {k: res[k] for k in res if k != 'rows'} == {
+        'mode': 'direct', 'file': f, 'out_dir': f'{f}.labels', 'n_in': 7, 'votes': 2, 'batch': 3,
+        'n_out': 14, 'missing': []}
+    assert res['rows'][:2] == ['1\t0\t9000300\tnormal', '1\t1\t9000301\tnormal']
+    assert res['rows'][7] == '2\t0\t9000300\tnormal' and len(res['rows']) == 14
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason='node not installed')
+def test_workflow_direct_mode_defaults_and_out_dir():
+    out = _direct({'args': {'file': 'x.jsonl', 'n_lines': 80}})
+    assert [(c['a'], c['z']) for c in out['calls']] == [(1, 75), (76, 80)]           # batch 75, 1 vote
+    assert all(c['model'] is None for c in out['calls'])                            # session model
+    assert out['result']['votes'] == 1 and out['result']['batch'] == 75 and out['result']['n_out'] == 80
+    out = _direct({'args': {'file': 'x.jsonl', 'n_lines': 2, 'batch': 0, 'votes': -1, 'model': '',
+                            'out_dir': '/synthetic/parts'}})
+    assert [c['part'] for c in out['calls']] == ['/synthetic/parts/v1-b1.tsv'] and out['calls'][0]['model'] is None
+    assert out['result']['out_dir'] == '/synthetic/parts' and out['result']['batch'] == 75
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason='node not installed')
+@pytest.mark.parametrize('n_lines', [0, -3, 2.5, '5'])
+def test_workflow_direct_mode_rejects_bad_n_lines(n_lines):
+    out = _direct({'args': {'file': 'x.jsonl', 'n_lines': n_lines}})
+    assert 'args.n_lines must be' in out['error'] and out['calls'] == []
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason='node not installed')
+def test_workflow_direct_mode_null_garbage_and_missing():
+    garbage = {'labels': [None, 7, 'x', {'row': '2'}, {'row': 2.5, 'patient_id': '9000302', 'label': 'cyst'},
+                          {'row': 0, 'patient_id': '9000300', 'label': 'tumor'},          # outside its slice
+                          {'row': 3, 'patient_id': '9000303', 'label': 'tumor'},
+                          {'row': 3, 'patient_id': '9000303', 'label': 'stroke'}]}        # duplicate: first wins
+    out = _direct({'args': {'file': 'x.jsonl', 'n_lines': 6, 'batch': 2, 'votes': 2},
+                   'answers': {'label-v1-b1': 'null', 'label-v1-b2': garbage, 'label-v1-b3': 'not an object',
+                               'label-v2-b3': {'labels': 'nope'}}})
+    assert 'error' not in out, out
+    res = out['result']
+    assert res['rows'] == ['1\t3\t9000303\ttumor', '2\t0\t9000300\tnormal', '2\t1\t9000301\tnormal',
+                           '2\t2\t9000302\tnormal', '2\t3\t9000303\tnormal']
+    assert res['n_out'] == 5
+    assert res['missing'] == [{'vote': 1, 'row': r} for r in (0, 1, 2, 4, 5)] + \
+                             [{'vote': 2, 'row': r} for r in (4, 5)]
+    assert any('7 (vote,row) pair(s) came back without a label' in l for l in out['logs'])
+    assert any('direct mode: 5/12 labels' in l for l in out['logs'])
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason='node not installed')
+def test_workflow_direct_mode_result_feeds_the_collector(tmp_path: Path):
+    """The return value is a valid --result for scripts/collect_llm_labels.py."""
+    import collect_llm_labels as C
+    export = tmp_path / 'e.jsonl'
+    _jsonl(export, [{'patient_id': str(9000300 + i), 'study_date': '2031-07-01', 'modality': 'MR',
+                     'section_index': '0', 'conclusion': 'МР-признаков патологии не выявлено.'} for i in range(3)])
+    rules = tmp_path / 'labels.csv'
+    with open(rules, 'w', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        w.writerow(['patient_id', 'study_date', 'modality', 'section_index', 'body_part', 'label'])
+        for i in range(3):
+            w.writerow([9000300 + i, '2031-07-01', 'MR', '0', 'brain', 'normal'])
+    out = _direct({'args': {'file': str(export), 'n_lines': 3, 'batch': 2}})
+    (tmp_path / 'result.json').write_text(json.dumps({'result': out['result']}), encoding='utf-8')
+    rc = C.main(['--export', str(export), '--rules', str(rules), '--result', str(tmp_path / 'result.json'),
+                 '--out', str(tmp_path / 'llm.jsonl'), '--disputed', str(tmp_path / 'd.jsonl')])
+    assert rc == 0
+    got = L.read_jsonl(tmp_path / 'llm.jsonl')
+    assert [(g['patient_id'], g['label'], g['decided_by']) for g in got] == [
+        (str(9000300 + i), 'normal', 'agree') for i in range(3)]

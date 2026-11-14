@@ -9,15 +9,17 @@ study_level_eval.json, training_metrics.json), hashes it, splits it into < 100 M
 writes a multipart manifest `{"parts": [...], "sha256": ...}` next to them. With --github it
 creates/updates a GitHub Release on the PRIVATE models repository through the REST API
 (urllib only — `gh` is not installed on the build Macs), uploads the parts + manifest, prints
-the manifest asset API URL that goes into the MODEL_BUNDLE_URL environment secret and proves
-the whole thing works by restoring it with fetch_model_bundle.py into a temp dir.
+the manifest asset API URL (information only: the installer CI finds the release
+brain-triage-<identity12> by the identity the code pins, so nothing is pasted into a secret per
+release; the URL is the optional MODEL_BUNDLE_URL fallback) and proves the whole thing works by
+restoring it with fetch_model_bundle.py into a temp dir.
 
 WHY: the validated model is never committed and is not downloadable from anywhere public.
 GitHub's upload endpoint times out on a single 330 MB asset, hence the parts; the manifest
 asset is what CI downloads first (fetch_model_bundle.py sniffs "not a zip, JSON with parts").
 Doing this by hand once per release is exactly the kind of step that gets done differently
-every time — this script makes it one command, safe to re-run, and verified before anyone
-touches the secret.
+every time — this script makes it one command, safe to re-run, and verified before any
+installer build uses it.
 
 RELEASE SAFETY (refusals exit 1 before anything is written or uploaded):
   * gate — <model>/study_level_eval.json must exist with gate.passed == true, gate.min_sens
@@ -33,9 +35,10 @@ RELEASE SAFETY (refusals exit 1 before anything is written or uploaded):
   * tag/identity — the default tag is brain-triage-<identity12>, so every model gets its own
     release. When the release for the tag already holds a manifest.json, it is downloaded
     (same auth) and its identity compared: the SAME identity with the same zip sha256 and all
-    parts present is reused untouched (the MODEL_BUNDLE_URL asset id does not change;
+    parts present is reused untouched (the manifest asset id does not change;
     --reupload forces a fresh upload); the same identity with a different zip is re-uploaded
-    (the manifest asset id changes — re-paste the secret); a DIFFERENT identity (or an
+    (the manifest asset id changes — CI resolves the release by tag and is unaffected; only a
+    hand-set MODEL_BUNDLE_URL fallback would need the new URL); a DIFFERENT identity (or an
     unreadable manifest) is refused unless --replace-existing. Only assets whose names this
     run uploads are ever deleted (part names embed the identity; manifest.json is swapped
     last, after the new parts are up).
@@ -53,7 +56,7 @@ Outputs under --out:
     <zip_name>                 brain_triage_finetuned_<identity>.zip (kept: usable as a file:// bundle)
     <zip_name>.part-00 …       the parts (< --part-mb MB each)
     manifest.json              local multipart manifest, parts as file:// URLs (fetch_model_bundle-ready)
-    manifest.github.json       (--github) the uploaded manifest + the asset URL for the secret
+    manifest.github.json       (--github) the uploaded manifest + its asset URL (the optional MODEL_BUNDLE_URL fallback)
 
 Token resolution (--github): --token, else $SIAA_MODELS_TOKEN, else $GITHUB_TOKEN, else
 `git credential fill` for github.com (the keychain entry `git push` uses). The SOURCE is
@@ -592,18 +595,24 @@ def _build_repo_hint() -> str:
 def print_secret_steps(manifest_url: str, owner: str, repo: str, token_source: str) -> None:
     build_repo = _build_repo_hint()
     print()
-    print(f'{G}MODEL_BUNDLE_URL={manifest_url}{NC}')      # one plain copy-paste line, no escape inside it
+    print(f'{G}MODEL_BUNDLE_URL={manifest_url}{NC}')      # information only (the optional fallback), one plain line
     print()
-    print(f'{B}Update the GitHub environment secret (build repo {build_repo}):{NC}')
-    print(f'  1. https://github.com/{build_repo}/settings/environments -> environment "MODEL_BUNDLE_URL"')
-    print(f'  2. Environment secrets -> MODEL_BUNDLE_URL -> Update -> paste the URL above -> Save')
-    print(f'  3. MODEL_BUNDLE_TOKEN -> a token that can READ {owner}/{repo} (fine-grained PAT, '
-          f'"Contents: read" on that repo); the build job\'s own GITHUB_TOKEN cannot read assets of '
-          f'another repository. Leave it unchanged if the existing one still works.')
-    print(f'  4. Push the version tag (git tag vX.Y.Z && git push origin vX.Y.Z) or re-run the '
-          f'installer workflow; the "Verify bundle identity matches the code" step fails the build '
-          f'unless the restored identity equals src/inference/validated_metrics.FALLBACK_IDENTITY '
-          f'(commit the bump_model_release.py changes first).')
+    print(f'{B}Nothing to paste per model release: the installer CI (build repo {build_repo}) finds the release '
+          f'{TAG_PREFIX}<identity12> in {owner}/{repo} by the identity the code pins.{NC}')
+    print(f'  1. MODEL_BUNDLE_TOKEN (https://github.com/{build_repo}/settings/environments -> environment '
+          f'"MODEL_BUNDLE_URL") must be able to READ {owner}/{repo} (fine-grained PAT, "Contents: read" on that '
+          f'repo); the build job\'s own GITHUB_TOKEN cannot read another repository. Leave it unchanged if the '
+          f'existing one still works.')
+    print(f'  2. CI reads the models repository from the repository variable MODEL_BUNDLE_REPO (unset: '
+          f'SHAXZODBR/SIAA-models); it must name {owner}/{repo}. Only the default tag {TAG_PREFIX}<identity12> '
+          f'is found: a release published under another --tag is invisible to CI.')
+    print(f'  3. Commit AND push the scripts/bump_model_release.py changes that pin this identity '
+          f'(src/inference/validated_metrics.FALLBACK_IDENTITY) BEFORE the version tag: CI resolves the release '
+          f'from the pin of the tagged commit.')
+    print(f'  4. Push the version tag (git tag vX.Y.Z && git push origin vX.Y.Z): the installers are attached to the '
+          f'tag\'s DRAFT release; "Verify bundle identity matches the code" re-checks the restored identity.')
+    print(f'  The MODEL_BUNDLE_URL line above is information only: the optional fallback, read only where no models '
+          f'repository is configured (e.g. fetch_model_bundle.py on a build PC); it needs no editing per release.')
     print(f'  (this run authenticated with: {token_source})')
 
 
@@ -777,8 +786,9 @@ def run(args: argparse.Namespace) -> int:
         print(f'{G}OK{NC} local restore via fetch_model_bundle: identity {restored}')
 
     if not github:
-        print(f'{G}DONE{NC} local bundle in {out_dir} — pass {local_manifest_path.as_uri()} as MODEL_BUNDLE_URL '
-              f'on a build PC, or re-run with --github owner/repo to publish.')
+        print(f'{G}DONE{NC} local bundle in {out_dir} — restore it on a build PC with '
+              f'packaging/fetch_model_bundle.py --url {local_manifest_path.as_uri()}, '
+              f'or re-run with --github owner/repo to publish.')
         return 0
 
     # ---- GitHub release ----------------------------------------------------------------
@@ -832,7 +842,8 @@ def run(args: argparse.Namespace) -> int:
                         why = ('--reupload' if same else 'incomplete previous upload' if not complete
                                else 'the zip changed (e.g. a re-evaluated study_level_eval.json)')
                         print(f'{Y}   release {tag} holds this identity ({identity}); re-uploading ({why}). The '
-                              f'{MANIFEST_ASSET} asset id WILL CHANGE — re-paste MODEL_BUNDLE_URL.{NC}')
+                              f'{MANIFEST_ASSET} asset id WILL CHANGE (CI resolves the release by its tag and is '
+                              f'unaffected; only a hand-set MODEL_BUNDLE_URL fallback needs the new URL).{NC}')
             print(f'{G}OK{NC} release {tag}: exists (id {rid}) {release.get("html_url", "")}')
         else:
             release, created = gh.create_release(tag, args.name or '', args.notes or ''), True

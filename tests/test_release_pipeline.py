@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "release_pipeline.py"
 DOCS = REPO / "docs"
 
-EXPECTED_ORDER = ("index", "parse", "label", "match", "build", "combine",
+EXPECTED_ORDER = ("index", "parse", "label", "match", "build", "prospective", "combine",
                   "train", "gate", "promote", "bump", "bundle")
 CONTRACT_SCRIPTS = {
     "index": "scripts/index_new_studies.py",
@@ -32,6 +32,7 @@ CONTRACT_SCRIPTS = {
     "label": "scripts/label_reports.py",
     "match": "scripts/match_images_to_reports.py",
     "build": "scripts/build_training_set.py",
+    "prospective": "scripts/eval_prospective.py",
     "combine": "scripts/combine_training_sets.py",
     "train": "training/finetune_brain_classifier.py",
     "gate": "scripts/eval_study_level.py",
@@ -171,6 +172,13 @@ class FakeRunner:
             out = repo / self._arg(argv, "--out")
             (out / "train" / "normal").mkdir(parents=True, exist_ok=True)
             (out / "studies.csv").write_text("patient_id,cls\n")
+        elif script.endswith("eval_prospective.py"):
+            # the shape eval_prospective.py writes; exit 0 = it ran (never a gate)
+            out = repo / self._arg(argv, "--out")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            group = {"n_studies": 412, "sensitivity": 0.92, "specificity": 0.27}
+            out.write_text(json.dumps({"kind": "prospective_eval", "model": self._arg(argv, "--model"),
+                                       "groups": {"all": group, "new": group}}))
         elif script.endswith("combine_training_sets.py"):
             out = repo / self._arg(argv, "--out")
             splits = (("train", "abnormal", ["10", "11"]), ("train", "normal", ["12"]),
@@ -266,7 +274,9 @@ def test_stage_commands_follow_the_contract(rp, fake_repo, tmp_path):
     assert "--write-manifest --min-sens 0.85 --min-spec 0.40 --compare-with models/brain_triage_finetuned" in joined["gate"]
     assert "--candidate models/brain_triage_candidate_brain-triage-vTEST --dest models/brain_triage_finetuned" in joined["promote"]
     assert joined["bump"].endswith("scripts/bump_model_release.py --model models/brain_triage_finetuned")
-    assert "--out data/release/brain-triage-vTEST/ --github SHAXZODBR/SIAA-models --tag brain-triage-vTEST" in joined["bundle"]
+    assert joined["bundle"].endswith("--out data/release/brain-triage-vTEST/ --github SHAXZODBR/SIAA-models")
+    # no --tag: the publisher's default brain-triage-<identity12> is the tag the installer CI looks up
+    assert "--tag" not in joined["bundle"]
     assert "--fresh" not in joined["combine"]          # first run: the release set does not exist yet
 
 
@@ -471,7 +481,8 @@ def test_run_command_tees_output_to_log(rp, tmp_path):
 
 # -------------------------------------------------------------- guard rails --
 
-def test_guard_missing_drive_blocks_train(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk, capsys):
+def test_guard_missing_drive_does_not_block_train(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk, capsys):
+    """train reads only local slices: an unmounted --root is no longer a train guard error (review 2)."""
     runner = FakeRunner(fake_repo)
     monkeypatch.setattr(rp, "run_command", runner)
     for s in ("index", "parse", "label", "match", "build", "combine"):
@@ -483,13 +494,13 @@ def test_guard_missing_drive_blocks_train(rp, fake_repo, tmp_path, monkeypatch, 
     n = len(runner.calls)
     rc = rp.main(args)
     out = capsys.readouterr().out
-    assert rc == rp.EXIT_USAGE
-    assert "drive not mounted" in out
-    assert "nothing was run" in out
-    assert len(runner.calls) == n                        # train never started
+    assert rc == 0, out
+    assert "drive not mounted" not in out
+    assert _scripts(runner.calls[n:]) == ["training/finetune_brain_classifier.py"]
     state = json.loads((fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json").read_text())
-    assert state["guards"]["pre_train"]["passed"] is False
-    assert any("drive not mounted" in e for e in state["guards"]["pre_train"]["errors"])
+    assert state["guards"]["pre_train"]["passed"] is True
+    assert not any("drive" in e for e in state["guards"]["pre_train"]["errors"] +
+                   state["guards"]["pre_train"]["warnings"])
 
 
 def test_guard_low_normals_warns_but_runs(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk, capsys):
@@ -1120,11 +1131,18 @@ def test_train_lock_fails_closed_when_the_trained_on_set_is_gone_or_rebuilt(rp, 
     monkeypatch.setattr(rp, "run_command", runner)
     assert rp.main(["run", *args]) == rp.EXIT_USAGE
     out = capsys.readouterr().out
+    # the prospective stage (before combine) already refuses: it would need that set as --seen
+    assert "guard rails before prospective failed" in out and "--train-lock" in out
+    assert rp.main(["combine", *args]) == rp.EXIT_USAGE
+    out = capsys.readouterr().out
     assert "guard rails before combine failed" in out and "--train-lock" in out
     assert "scripts/combine_training_sets.py" not in _scripts(runner.calls)
-    # an explicit --train-lock file lets the release go on
+    # an explicit --train-lock file satisfies the combine lock
     (fake_repo / "data" / "v2_trained_ids.txt").write_text("10\n11\n12\n")
-    assert rp.main(["run", *args, "--train-lock", "data/v2_trained_ids.txt", "--skip-tests"]) == 0
+    assert rp.main(["combine", *args, "--train-lock", "data/v2_trained_ids.txt"]) == 0
+    # the whole release goes on with the set restored by hand as --train-lock <dir> (also the --seen set)
+    (fake_repo / "data" / "v2_restored" / "train" / "normal").mkdir(parents=True)
+    assert rp.main(["run", *args, "--train-lock", "data/v2_restored", "--skip-tests"]) == 0
 
 
 def test_interrupted_stage_is_recorded_failed_with_a_resume_line(rp, fake_repo, tmp_path, monkeypatch, capsys):
@@ -1461,3 +1479,514 @@ def test_verdict_stop_prints_a_resume_line_that_reruns_only_the_gate(rp, fake_re
     assert _scripts(runner.calls) == ["scripts/eval_study_level.py", "scripts/eval_study_level.py"]
     st = _state(fake_repo)
     assert st["stages"]["gate"]["verdict"] == "not_promoted" and "promote" not in st["stages"]
+
+
+# ------------------------------- several report sources, MR-only rule, prospective --
+
+def _args_no_reports(tmp_path: Path, repo: Path, *extra: str) -> list[str]:
+    return ["--batch", "fakebatch", "--repo", str(repo), "--root", str(tmp_path / "drive"),
+            "--tag", "brain-triage-vTEST", *extra]
+
+
+def _second_reports(tmp_path: Path) -> Path:
+    d = tmp_path / "reports_b"
+    d.mkdir(exist_ok=True)
+    (d / "sheet_2031.xlsx").write_bytes(b"PK synthetic")
+    return d
+
+
+def _stage(rp, cfg, name: str):
+    return {s.name: s for s in rp.build_stages(cfg)}[name]
+
+
+def test_twelve_stages_and_plan_lists_prospective_between_build_and_combine(rp, fake_repo, tmp_path, capsys):
+    assert len(rp.STAGE_ORDER) == 12 and "prospective" in rp.SUBCOMMANDS
+    assert rp.STAGE_ORDER.index("prospective") == rp.STAGE_ORDER.index("build") + 1
+    assert rp.STAGE_ORDER.index("combine") == rp.STAGE_ORDER.index("prospective") + 1
+    assert rp.main(["plan", *_base_args(tmp_path, fake_repo)]) == 0
+    out = capsys.readouterr().out
+    i_build, i_pro, i_comb = (out.index(f"# --- stage {k}: {n}") for k, n in ((4, "build"), (5, "prospective"),
+                                                                              (6, "combine")))
+    assert i_build < i_pro < i_comb
+    assert "# modality rule (build): MR only (--modality MR)" in out
+    assert f"# report sources (oldest delivery first): {tmp_path / 'reports'}" in out
+    assert "eleven" not in rp.__doc__ and "eleven" not in rp.build_parser().format_help()
+    assert "twelve" in rp.__doc__
+
+
+def test_reports_one_several_and_repeated_flag(rp, fake_repo, tmp_path):
+    a, b = tmp_path / "reports", _second_reports(tmp_path)
+    one = _cfg(rp, tmp_path, fake_repo)
+    assert one.reports == [a]
+    several = rp.config_from_args(rp.build_parser().parse_args(
+        ["plan", *_args_no_reports(tmp_path, fake_repo), "--reports", str(a), str(b)]))
+    repeated = rp.config_from_args(rp.build_parser().parse_args(
+        ["plan", *_args_no_reports(tmp_path, fake_repo), "--reports", str(a), "--reports", str(b)]))
+    assert several.reports == repeated.reports == [a, b]
+    parse = _stage(rp, several, "parse").cmds[0]
+    i = parse.index("--src")
+    assert parse[i + 1:i + 3] == [str(a), str(b)] and parse[i + 3] == "--out"
+    assert several.options()["reports"] == [str(a), str(b)]
+    # no --reports at all: an empty list, and the parse stage refuses
+    none = rp.config_from_args(rp.build_parser().parse_args(["plan", *_args_no_reports(tmp_path, fake_repo)]))
+    assert none.reports == [] and none.options()["reports"] == []
+    assert rp.main(["parse", *_args_no_reports(tmp_path, fake_repo)]) == rp.EXIT_USAGE
+
+
+def test_reports_state_round_trip_and_args_line(rp, fake_repo, tmp_path, monkeypatch, capsys):
+    a, b = tmp_path / "reports", _second_reports(tmp_path)
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["parse", *_base_args(tmp_path, fake_repo), "--reports", str(b), "--modality", "any"]) == 0
+    st = _state(fake_repo)
+    assert st["options"]["reports"] == [str(a), str(b)] and st["options"]["modality"] == "any"
+    parse = [c for c in runner.calls if c[1] == "scripts/parse_hospital_reports.py"][-1]
+    assert parse[parse.index("--src") + 1:parse.index("--out")] == [str(a), str(b)]
+    # a bare --resume inherits both sources (in order) and the modality
+    cfg = rp.config_from_args(rp.build_parser().parse_args(
+        ["run", "--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vTEST", "--resume"]))
+    assert cfg.reports == [a, b] and cfg.modality == "any"
+    assert cfg.inherited["reports"] == [str(a), str(b)] and cfg.inherited["modality"] == "any"
+    # the printed resume line reproduces the same options through the parser
+    line = rp.args_line(cfg)
+    assert f"--reports {shlex.quote(str(a))} {shlex.quote(str(b))}" in line and "--modality any" in line
+    again = rp.config_from_args(rp.build_parser().parse_args(["run", *shlex.split(line)]))
+    assert again.reports == cfg.reports and again.modality == "any" and again.options() == cfg.options()
+    default = _cfg(rp, tmp_path, fake_repo)
+    again = rp.config_from_args(rp.build_parser().parse_args(["run", *shlex.split(rp.args_line(default))]))
+    assert again.options() == default.options() and again.modality == "MR"
+
+
+def test_legacy_string_reports_state_keeps_parse_and_label_done(rp, fake_repo, tmp_path, monkeypatch, capsys):
+    """The release in progress on the real machine: state.json written by the previous version stores
+    "reports": "<folder>" and parse + label are done. Both must stay done (no re-parse)."""
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["parse", *_base_args(tmp_path, fake_repo)]) == 0
+    assert rp.main(["label", *_base_args(tmp_path, fake_repo)]) == 0
+    sp = fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json"
+    st = json.loads(sp.read_text())
+    folder = str(tmp_path / "reports")
+    # exactly what the previous version wrote: ONE string, no modality, parse fingerprinted as the folder
+    st["options"]["reports"] = folder
+    st["options"].pop("modality")
+    st["stages"]["parse"]["input_sha256s"] = {folder: "dir:1"}
+    sp.write_text(json.dumps(st))
+    capsys.readouterr()
+
+    cfg = rp.config_from_args(rp.build_parser().parse_args(
+        ["run", "--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vTEST", "--resume"]))
+    assert cfg.reports == [Path(folder)] and cfg.options()["reports"] == [folder]
+    assert cfg.modality == "MR" and "modality" not in cfg.inherited
+    # one source: the parse fingerprint is the one the old string form produced
+    assert rp.input_fingerprints(cfg, _stage(rp, cfg, "parse"), st) == {folder: "dir:1"}
+    for name in ("parse", "label"):
+        assert rp.stage_is_done(cfg, _stage(rp, cfg, name), st) == (True, ""), name
+
+    n = len(runner.calls)
+    assert rp.main(["run", "--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vTEST",
+                    "--resume", "--only", "parse"]) == 0
+    assert "stage parse already done — skipped" in capsys.readouterr().out and len(runner.calls) == n
+    assert rp.main(["status", "--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vTEST"]) == 0
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert "parse    done" in out and "label    done" in out and "prospective pending" in out
+
+
+def test_parse_fingerprint_follows_sources_and_their_order(rp, fake_repo, tmp_path):
+    a, b = tmp_path / "reports", _second_reports(tmp_path)
+
+    def fp(*sources):
+        args = [x for s in sources for x in ("--reports", str(s))]
+        cfg = rp.config_from_args(rp.build_parser().parse_args(["plan", *_args_no_reports(tmp_path, fake_repo),
+                                                                *args]))
+        return rp.input_fingerprints(cfg, _stage(rp, cfg, "parse"), {})
+
+    assert fp(a) == {str(a): "dir:1"}                               # one source: no order marker
+    assert rp.inputs_changed(fp(a), fp(a, b))                       # a source added
+    assert rp.inputs_changed(fp(a, b), fp(b, a))                    # order swapped
+    assert not rp.inputs_changed(fp(a, b), fp(a, b))
+    assert fp(a, b)["opt:report_order"] == f"opt:{a} | {b}"
+
+
+def test_modality_default_any_inherited_and_legacy(rp, fake_repo, tmp_path, monkeypatch):
+    build = _stage(rp, _cfg(rp, tmp_path, fake_repo), "build").cmds[0]
+    assert build[build.index("--modality") + 1] == "MR"
+    assert "opt:modality" in _stage(rp, _cfg(rp, tmp_path, fake_repo), "build").inputs
+    assert "--modality" not in _stage(rp, _cfg(rp, tmp_path, fake_repo, "--modality", "any"), "build").cmds[0]
+    ct = _stage(rp, _cfg(rp, tmp_path, fake_repo, "--modality", "CT"), "build").cmds[0]
+    assert ct[ct.index("--modality") + 1] == "CT"
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["index", *_base_args(tmp_path, fake_repo), "--modality", "any"]) == 0
+    sub = rp.config_from_args(rp.build_parser().parse_args(["build", *_base_args(tmp_path, fake_repo)]))
+    assert sub.modality == "any"                                    # inherited by a stage subcommand
+    plain = rp.config_from_args(rp.build_parser().parse_args(["run", *_base_args(tmp_path, fake_repo)]))
+    assert plain.modality == "MR"                                   # a plain run does not inherit
+    sp = fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json"
+    st = json.loads(sp.read_text())
+    st["options"].pop("modality")                                   # a state.json from before the option
+    sp.write_text(json.dumps(st))
+    assert rp.config_from_args(rp.build_parser().parse_args(["build", *_base_args(tmp_path, fake_repo)])).modality == "MR"
+
+
+def test_changing_modality_reruns_build_and_what_follows_but_not_match(rp, fake_repo, tmp_path, monkeypatch,
+                                                                     plenty_of_disk, capsys):
+    class ModalityRunner(FakeRunner):
+        """build writes a studies.csv that depends on the modality rule (as the real one does)."""
+        def __call__(self, argv, log_path, cwd, dry_run=False):
+            rc = super().__call__(argv, log_path, cwd, dry_run)
+            if not dry_run and argv[1] == "scripts/build_training_set.py":
+                rule = argv[argv.index("--modality") + 1] if "--modality" in argv else "any"
+                (self.repo / self._arg(argv, "--out") / "studies.csv").write_text(f"patient_id,cls\n# {rule}\n")
+            return rc
+
+    runner = ModalityRunner(fake_repo, fail_on="combine_training_sets.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    capsys.readouterr()
+    st = _state(fake_repo)
+    assert st["stages"]["build"]["input_sha256s"]["opt:modality"] == "opt:MR"
+    cfg = rp.config_from_args(rp.build_parser().parse_args(["run", *_base_args(tmp_path, fake_repo), "--resume",
+                                                            "--modality", "any"]))
+    assert rp.stage_is_done(cfg, _stage(rp, cfg, "match"), st) == (True, "")
+    done, why = rp.stage_is_done(cfg, _stage(rp, cfg, "build"), st)
+    assert not done and "inputs changed" in why
+
+    n = len(runner.calls)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--modality", "any", "--skip-tests"]) == 0
+    out = capsys.readouterr().out
+    assert "stage match already done — skipped" in out
+    assert "stage build re-run: inputs changed" in out and "stage prospective re-run: inputs changed" in out
+    new = _scripts(runner.calls[n:])
+    assert "scripts/match_images_to_reports.py" not in new
+    for script in ("scripts/build_training_set.py", "scripts/eval_prospective.py",
+                   "scripts/combine_training_sets.py", "training/finetune_brain_classifier.py"):
+        assert script in new, script
+    build = [c for c in runner.calls[n:] if c[1] == "scripts/build_training_set.py"][0]
+    assert "--modality" not in build and _state(fake_repo)["options"]["modality"] == "any"
+
+
+def test_prospective_command_line(rp, fake_repo, tmp_path):
+    (fake_repo / "data" / "sets" / "older").mkdir(parents=True)
+    (fake_repo / "data" / "sets" / "older" / "studies.csv").write_text("patient_id,cls\n")
+    cfg = _cfg(rp, tmp_path, fake_repo, "--device", "cpu")
+    s = _stage(rp, cfg, "prospective")
+    assert len(s.cmds) == 1
+    assert s.cmds[0] == [cfg.python, "scripts/eval_prospective.py", "--model", "models/brain_triage_finetuned",
+                         "--set", "data/sets/fakebatch", "--seen", "data/local_finetune_bin",
+                         "--seen", "data/sets/older", "--holdout", "data/holdout_patients_v1.txt",
+                         "--matched", "data/fakebatch_matched.csv",
+                         "--out", "data/release/brain-triage-vTEST/prospective_eval.json", "--device", "cpu"]
+    assert s.inputs == ["data/sets/fakebatch/studies.csv", "data/fakebatch_matched.csv",
+                        "data/holdout_patients_v1.txt", "ls:data/local_finetune_bin",
+                        "data/sets/older/studies.csv", "models/brain_triage_finetuned/MANIFEST.json"]
+    assert s.outputs == ["data/release/brain-triage-vTEST/prospective_eval.json"]
+    # its only guard rail checks the trained-on release set (none for this legacy-trained model)
+    assert rp.GUARDS["prospective"](cfg, {}) == ([], []) and "prospective" not in rp.NEEDS_ROOT
+
+
+def test_prospective_scores_the_shipped_model_whatever_base_model_training_starts_from(rp, fake_repo, tmp_path):
+    """--base-model is where TRAINING starts (the public ViT in the retrain-from-scratch fallback).
+    The prospective stage must still score the model that is shipped today — the release dir the
+    gate compares with and promote replaces."""
+    cfg = _cfg(rp, tmp_path, fake_repo, "--base-model", "google/vit-base-patch16-224")
+    assert cfg.base_model == "google/vit-base-patch16-224"
+    s = _stage(rp, cfg, "prospective")
+    cmd = s.cmds[0]
+    assert cmd[cmd.index("--model") + 1] == rp.BASE_MODEL == "models/brain_triage_finetuned"
+    assert "google/vit-base-patch16-224" not in cmd
+    assert "opt:base_model" not in s.inputs and f"{rp.BASE_MODEL}/MANIFEST.json" in s.inputs
+    gate = _stage(rp, cfg, "gate")
+    assert all(c[c.index("--compare-with") + 1] == cmd[cmd.index("--model") + 1] for c in gate.cmds), \
+        "prospective and the gate's --compare-with must look at the same (shipped) model"
+
+
+def test_prospective_good_check(rp, tmp_path):
+    p = tmp_path / "prospective_eval.json"
+    assert "missing" in rp.prospective_problem(p)
+    p.write_text("{not json")
+    assert "not valid JSON" in rp.prospective_problem(p)
+    p.write_text(json.dumps({"kind": "study_level_eval", "groups": {}}))
+    assert "kind" in rp.prospective_problem(p)
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": []}))
+    assert "groups" in rp.prospective_problem(p)
+    p.write_text(json.dumps({"kind": "prospective_eval", "groups": {"all": {"n_studies": 3}}}))
+    assert rp.prospective_problem(p) is None
+    assert rp.prospective_headline(p) is None                       # no 'new' group → no headline
+    p.write_text(json.dumps({"kind": "prospective_eval",
+                             "groups": {"new": {"n_studies": 7, "sensitivity": 0.5, "specificity": None}}}))
+    assert rp.prospective_headline(p) == ("prospective, never-seen patients: n 7 studies · "
+                                          "sensitivity 0.500 · specificity —")
+
+
+def test_prospective_runs_prints_headline_and_a_bad_json_fails_the_stage(rp, fake_repo, tmp_path, monkeypatch,
+                                                                         plenty_of_disk, capsys):
+    class BadKind(FakeRunner):
+        rc = 0
+
+        def __call__(self, argv, log_path, cwd, dry_run=False):
+            if argv[1] == "scripts/eval_prospective.py" and not dry_run and self.rc is not None:
+                self.calls.append(list(argv))
+                out = self.repo / self._arg(argv, "--out")
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps({"kind": "something_else", "groups": {}}))
+                return self.rc
+            return super().__call__(argv, log_path, cwd, dry_run)
+
+    runner = BadKind(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    out = capsys.readouterr().out
+    assert "stage prospective finished but its output is not usable" in out and "something_else" not in out
+    assert _state(fake_repo)["stages"]["prospective"]["status"] == "failed"
+    assert "scripts/combine_training_sets.py" not in _scripts(runner.calls)
+    # exit 2 (unusable inputs) is a failed stage, never a gate verdict
+    runner.rc = 2
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume"]) == rp.EXIT_STAGE_FAILED
+    out = capsys.readouterr().out
+    assert "stage prospective FAILED (exit 2)" in out and "resume with:" in out
+    assert "stopped before promote" not in out and "verdict" not in _state(fake_repo)["stages"]["prospective"]
+    # the real script: the resume runs the stage again and prints the headline from the 'new' group
+    runner.rc = None
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--skip-tests"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "prospective, never-seen patients: n 412 studies · sensitivity 0.920 · specificity 0.270" in out
+    st = _state(fake_repo)
+    assert st["stages"]["prospective"]["status"] == "done"
+    # it scored the model shipped BEFORE this release (promote ran after it)
+    assert json.loads((fake_repo / "data" / "release" / "brain-triage-vTEST" / "prospective_eval.json")
+                      .read_text())["model"] == "models/brain_triage_finetuned"
+    assert _scripts(runner.calls).index("scripts/eval_prospective.py") < \
+        _scripts(runner.calls).index("scripts/promote_model.py")
+
+
+@pytest.mark.parametrize("stage", ["prospective", "combine"])
+def test_prospective_never_reruns_after_promote_exactly_like_combine(rp, fake_repo, tmp_path, monkeypatch,
+                                                                    plenty_of_disk, capsys, stage):
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--skip-tests"]) == 0
+    capsys.readouterr()
+    assert stage in rp.NO_RERUN_AFTER_PROMOTE and stage in rp.FROZEN_AFTER_PROMOTE
+    report = fake_repo / "data" / "release" / "brain-triage-vTEST" / "prospective_eval.json"
+    before = report.read_text()
+    # the stage subcommand (= --only) is refused under the promoted tag
+    n = len(runner.calls)
+    assert rp.main([stage, *_base_args(tmp_path, fake_repo)]) == rp.EXIT_USAGE
+    out = capsys.readouterr().out
+    assert "already promoted" in out and f"{stage} cannot run again" in out and len(runner.calls) == n
+    # a rebuilt set after promote: --resume, --from <stage> --resume, --only <stage> --resume all skip it
+    (fake_repo / "data" / "sets" / "fakebatch" / "studies.csv").write_text("patient_id,cls\n9000001,normal\n")
+    for extra in (["--resume"], ["--from", stage, "--resume"], ["--only", stage, "--resume"]):
+        rc = rp.main(["run", *_base_args(tmp_path, fake_repo), *extra, "--skip-tests"])
+        out = capsys.readouterr().out
+        assert rc == 0, (extra, out)
+        assert f"stage {stage} already done — skipped" in out, extra
+    assert "scripts/eval_prospective.py" not in _scripts(runner.calls[n:])
+    assert "scripts/combine_training_sets.py" not in _scripts(runner.calls[n:])
+    assert report.read_text() == before
+    assert rp.main(["status", *_base_args(tmp_path, fake_repo)]) == 0
+    assert re.search(rf"\b{stage}\s+\S*done", re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out))
+
+
+def test_prospective_and_match_run_without_the_drive_build_stops(rp, fake_repo, tmp_path, monkeypatch,
+                                                                 plenty_of_disk, capsys):
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["index", *_base_args(tmp_path, fake_repo)]) == 0
+    (tmp_path / "drive").rename(tmp_path / "drive_unplugged")
+    capsys.readouterr()
+    n = len(runner.calls)
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume"])
+    out = capsys.readouterr().out
+    assert rc == rp.EXIT_USAGE
+    assert f"drive not mounted: {tmp_path / 'drive'} (needed by stage build)" in out and "resume" in out
+    assert _scripts(runner.calls[n:]) == ["scripts/parse_hospital_reports.py", "scripts/label_reports.py",
+                                          "scripts/label_reports.py", "scripts/match_images_to_reports.py"]
+    st = _state(fake_repo)
+    assert st["stages"]["match"]["status"] == "done" and "build" not in st["stages"]
+    # build alone without the drive is refused up front, nothing runs
+    n = len(runner.calls)
+    assert rp.main(["build", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_USAGE
+    assert "drive not mounted" in capsys.readouterr().out and len(runner.calls) == n
+    # a fresh run whose first stage is index is refused up front too (no state written for it)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)[:-1], "brain-triage-vNEW"]) == rp.EXIT_USAGE
+    assert "needed by stage index" in capsys.readouterr().out
+    assert not (fake_repo / "data" / "release" / "brain-triage-vNEW").exists()
+    # match and prospective run with the drive gone (match gets --images only with a configured root)
+    (tmp_path / "drive_unplugged").rename(tmp_path / "drive")
+    assert rp.main(["build", *_base_args(tmp_path, fake_repo)]) == 0
+    (tmp_path / "drive").rename(tmp_path / "drive_unplugged")
+    assert rp.main(["prospective", *_base_args(tmp_path, fake_repo)]) == 0
+    assert "scripts/eval_prospective.py" in _scripts(runner.calls)
+    match = [c for c in runner.calls if c[1] == "scripts/match_images_to_reports.py"][-1]
+    assert match[match.index("--images") + 1] == str(tmp_path / "drive")
+
+
+def test_match_without_root_has_no_images_flag(rp, fake_repo, tmp_path, monkeypatch, capsys):
+    args = ["--batch", "fakebatch", "--repo", str(fake_repo), "--tag", "brain-triage-vNOROOT"]
+    cfg = rp.config_from_args(rp.build_parser().parse_args(["plan", *args]))
+    match = _stage(rp, cfg, "match").cmds[0]
+    assert "--images" not in match and match[2:4] == ["--index", "data/fakebatch_index.csv"]
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["match", *args]) == 0
+    assert rp.main(["build", *args]) == rp.EXIT_USAGE
+    assert "--root is required for stages ['build']" in capsys.readouterr().out
+    assert rp.main(["run", *args]) == rp.EXIT_USAGE
+    assert "--root is required for stages ['build', 'index']" in capsys.readouterr().out
+
+
+# ------------------------------------------- review 2026-11-11 regressions ----
+
+V3 = "brain-triage-v3"
+V2_SET = "data/train_release_brain-triage-v2"
+
+
+def _v3_args(tmp_path: Path, repo: Path, *extra: str) -> list[str]:
+    return [a if a != "brain-triage-vTEST" else V3 for a in _base_args(tmp_path, repo)] + list(extra)
+
+
+def test_rerelease_of_the_same_batch_passes_the_trained_on_release_set_as_seen(rp, fake_repo, tmp_path,
+                                                                               monkeypatch, plenty_of_disk, capsys):
+    """Review 4 (blocker): after a pipeline release the shipped model was trained on a combined release
+    set. Re-evaluating a batch that set contains (new reports for the same batch, or a hand-given
+    --extra-sets) must count those patients as seen, never as 'new'."""
+    _trained_on_v2(fake_repo)
+    for extra in ((), ("--extra-sets", "data/local_finetune_bin"),
+                  ("--train-lock", "data/v2_trained_ids.txt")):
+        (fake_repo / "data" / "v2_trained_ids.txt").write_text("10\n11\n")
+        cfg = rp.config_from_args(rp.build_parser().parse_args(["plan", *_v3_args(tmp_path, fake_repo, *extra)]))
+        s = _stage(rp, cfg, "prospective")
+        cmd = s.cmds[0]
+        seen = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--seen"]
+        assert seen == ["data/local_finetune_bin", V2_SET], (extra, cmd)
+        assert f"{V2_SET}/dataset_manifest.json" in s.inputs, extra
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_v3_args(tmp_path, fake_repo), "--skip-tests"]) == 0, capsys.readouterr().out
+    pro = [c for c in runner.calls if c[1] == "scripts/eval_prospective.py"][0]
+    assert pro[pro.index("--seen", pro.index("--seen") + 1) + 1] == V2_SET
+    st = json.loads((fake_repo / "data" / "release" / V3 / "state.json").read_text())
+    assert f"{V2_SET}/dataset_manifest.json" in st["stages"]["prospective"]["input_sha256s"]
+
+
+def test_missing_trained_on_set_fails_the_prospective_stage_before_it_runs(rp, fake_repo, tmp_path, monkeypatch,
+                                                                         plenty_of_disk, capsys):
+    prev = _trained_on_v2(fake_repo)
+    (prev / "dataset_manifest.json").unlink()
+    runner = FakeRunner(fake_repo)
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_v3_args(tmp_path, fake_repo)]) == rp.EXIT_USAGE
+    out = capsys.readouterr().out
+    assert "guard rails before prospective failed" in out and "nothing was run" in out
+    assert V2_SET in out and "--train-lock" in out and "Restore" in out
+    assert "scripts/eval_prospective.py" not in _scripts(runner.calls)
+    st = json.loads((fake_repo / "data" / "release" / V3 / "state.json").read_text())
+    assert st["guards"]["pre_prospective"]["passed"] is False
+    # an ids file does not name the patients' set for --seen: still refused
+    (fake_repo / "data" / "v2_trained_ids.txt").write_text("10\n11\n")
+    assert rp.main(["run", *_v3_args(tmp_path, fake_repo, "--train-lock", "data/v2_trained_ids.txt"),
+                    "--resume"]) == rp.EXIT_USAGE
+    assert "guard rails before prospective failed" in capsys.readouterr().out
+    # the restored set given by hand as --train-lock <dir> lets the release go on and is the --seen set
+    restored = fake_repo / "data" / "v2_restored"
+    (restored / "train" / "normal").mkdir(parents=True)
+    assert rp.main(["run", *_v3_args(tmp_path, fake_repo, "--train-lock", "data/v2_restored"),
+                    "--resume", "--skip-tests"]) == 0, capsys.readouterr().out
+    pro = [c for c in runner.calls if c[1] == "scripts/eval_prospective.py"][-1]
+    assert [pro[i + 1] for i, x in enumerate(pro) if x == "--seen"] == ["data/local_finetune_bin", "data/v2_restored"]
+
+
+def test_legacy_trained_model_keeps_the_exact_prospective_command(rp, fake_repo, tmp_path):
+    """The shipped model trained on data/local_finetune_bin only (no release set): the command and the
+    inputs stay byte for byte what the release in progress recorded — even with a --train-lock dir."""
+    lock = fake_repo / "data" / "some_set"
+    (lock / "train" / "normal").mkdir(parents=True)
+    for extra in ((), ("--train-lock", "data/some_set")):
+        cfg = _cfg(rp, tmp_path, fake_repo, "--device", "cpu", *extra)
+        s = _stage(rp, cfg, "prospective")
+        assert s.cmds[0] == [cfg.python, "scripts/eval_prospective.py", "--model", "models/brain_triage_finetuned",
+                             "--set", "data/sets/fakebatch", "--seen", "data/local_finetune_bin",
+                             "--holdout", "data/holdout_patients_v1.txt", "--matched", "data/fakebatch_matched.csv",
+                             "--out", "data/release/brain-triage-vTEST/prospective_eval.json", "--device", "cpu"]
+        assert s.inputs == ["data/sets/fakebatch/studies.csv", "data/fakebatch_matched.csv",
+                            "data/holdout_patients_v1.txt", "ls:data/local_finetune_bin",
+                            "models/brain_triage_finetuned/MANIFEST.json"]
+        assert rp.guard_pre_prospective(cfg, {}) == ([], [])
+
+
+def test_legacy_promoted_state_without_prospective_finishes_bump_and_bundle(rp, fake_repo, tmp_path, monkeypatch,
+                                                                          plenty_of_disk, capsys):
+    """Review 2: a release promoted by the previous version has no 'prospective' record. --resume must
+    finish bump/bundle; status shows the stage as skipped; an explicit prospective is still refused."""
+    runner = FakeRunner(fake_repo, fail_on="publish_model_bundle.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    sp = fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json"
+    st = json.loads(sp.read_text())
+    st["stages"].pop("prospective")
+    sp.write_text(json.dumps(st))
+    capsys.readouterr()
+    n = len(runner.calls)
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "cannot run again" not in out
+    assert "stage prospective skipped (promoted before this stage existed)" in out
+    assert "packaging/publish_model_bundle.py" in _scripts(runner.calls[n:])
+    assert "scripts/eval_prospective.py" not in _scripts(runner.calls[n:])
+    assert _state(fake_repo)["stages"]["bundle"]["status"] == "done"
+    assert "prospective" not in _state(fake_repo)["stages"]
+    assert rp.main(["status", *_base_args(tmp_path, fake_repo)]) == 0
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert re.search(r"prospective\s+skipped \(promoted before this stage existed\)", out), out
+    # an explicit prospective run after promote stays refused
+    n = len(runner.calls)
+    assert rp.main(["prospective", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_USAGE
+    out = capsys.readouterr().out
+    assert "already promoted" in out and "prospective cannot run again" in out and len(runner.calls) == n
+
+
+def test_legacy_build_record_without_modality_reruns_build_under_mr(rp, fake_repo, tmp_path, monkeypatch,
+                                                                    plenty_of_disk, capsys):
+    """Review 2: a build recorded by the previous version (no MR-only rule = 'any') is re-run under the
+    MR rule; a build recorded by the current version (opt:modality stored) stays done."""
+    runner = FakeRunner(fake_repo, fail_on="combine_training_sets.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    capsys.readouterr()
+    cfg = rp.config_from_args(rp.build_parser().parse_args(["run", *_base_args(tmp_path, fake_repo), "--resume"]))
+    st = _state(fake_repo)
+    assert rp.stage_is_done(cfg, _stage(rp, cfg, "build"), st) == (True, "")        # current record
+    sp = fake_repo / "data" / "release" / "brain-triage-vTEST" / "state.json"
+    st["stages"]["build"]["input_sha256s"].pop("opt:modality")                      # the previous version's
+    st["options"].pop("modality")
+    sp.write_text(json.dumps(st))
+    done, why = rp.stage_is_done(cfg, _stage(rp, cfg, "build"), st)
+    assert not done and "inputs changed" in why
+    assert not rp.inputs_changed({"opt:epochs": None}, {"opt:epochs": "opt:12"})    # other options: tolerant
+    n = len(runner.calls)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--skip-tests"]) == 0
+    out = capsys.readouterr().out
+    assert "stage match already done — skipped" in out and "stage build re-run: inputs changed" in out
+    build = [c for c in runner.calls[n:] if c[1] == "scripts/build_training_set.py"]
+    assert len(build) == 1 and build[0][build[0].index("--modality") + 1] == "MR"
+    assert _state(fake_repo)["stages"]["build"]["input_sha256s"]["opt:modality"] == "opt:MR"
+
+
+def test_resume_without_the_drive_passes_the_train_guard(rp, fake_repo, tmp_path, monkeypatch, plenty_of_disk,
+                                                         capsys):
+    """Review 2: train reads only local slices — an unplugged drive after build must not stop it."""
+    runner = FakeRunner(fake_repo, fail_on="eval_prospective.py")
+    monkeypatch.setattr(rp, "run_command", runner)
+    assert rp.main(["run", *_base_args(tmp_path, fake_repo)]) == rp.EXIT_STAGE_FAILED
+    (tmp_path / "drive").rename(tmp_path / "drive_unplugged")
+    capsys.readouterr()
+    rc = rp.main(["run", *_base_args(tmp_path, fake_repo), "--resume", "--skip-tests"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "drive not mounted" not in out and "guard rails before train passed" in out
+    assert "training/finetune_brain_classifier.py" in _scripts(runner.calls)
+    assert "drive mounted" not in " ".join(rp.GUARD_TEXT["train"])

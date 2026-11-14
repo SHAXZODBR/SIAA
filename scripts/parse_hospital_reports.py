@@ -8,7 +8,8 @@
   WHAT
     Reads hospital radiology reports and writes a CSV keyed by the numeric
     PatientID so the rows auto-join to the DICOM studies (same PatientID in the
-    headers) in stage 3.  Accepted inputs (a folder, or a single file):
+    headers) in stage 3.  Accepted inputs (one or more sources, each a folder —
+    non-recursive — or a single file):
       * PDF  — Shox International Hospital layout, named <patientID>_<Name>.pdf.
                ONE PDF may hold SEVERAL studies.  Each study section is a lone
                modality line ("МРТ" / "МСКТ") followed by a header such as
@@ -40,7 +41,18 @@
     patient_id, modality (MR|CT|?), body_part (brain|spine|chest|…|other),
     study_date (YYYY-MM-DD or ''), label (''; stage 2 fills it), conclusion,
     description (protocol text), source_file (basename, name part -> sha256[:16]),
-    section_index (1-based within the source file), section_header
+    section_index (1-based within the source file; see SEVERAL SOURCES), section_header
+
+  SEVERAL SOURCES (overlapping deliveries, one folder per date range): list them
+    OLDEST FIRST — the order is part of the contract.  A patient seen in two periods
+    has one cumulative PDF in each, so after parsing, rows are reconciled across
+    files (reconcile_files): a section already kept from an earlier file (same patient,
+    date, modality, body part, section header and conclusion) is dropped, counted copy
+    for copy so a same-looking new section survives, undated sections are never dropped,
+    and a new section whose (patient_id, study_date, modality, section_index) key is
+    taken by an earlier file is renumbered to the next free index.  Why: labels are
+    attached by that key, so it must name ONE section, and appending a newer delivery
+    must never change the rows (or keys) of the older ones.
 
   PHI: patient NAMES never reach the output — the file name's name part is
   replaced by a hash, signature lines are stripped, only the numeric ID is kept.
@@ -57,7 +69,11 @@
   Usage:
     python scripts/parse_hospital_reports.py --src "<folder-or-file>" \
         --out data/<batch>_reports.csv [--limit N] [--workers 4]
-  Exit codes: 0 ok · 1 no input / no rows parsed.
+    python scripts/parse_hospital_reports.py --src "<oldest delivery>" "<newer delivery>" … \
+        --out data/<batch>_reports.csv          # several sources, OLDEST FIRST
+  --limit N = the first N files of all sources together, in that order.
+  Exit codes: 0 ok · 1 no input (with several sources: ANY source missing or
+  without report files) / no rows parsed.
 ================================================================================
 """
 from __future__ import annotations
@@ -733,15 +749,78 @@ def parse_sheet_rows(rows: list[list[str]], source_file: str, sheet_name: str = 
     return out
 
 
+def _dedupe_key(r: dict) -> tuple:
+    """Identity of a study section's CONTENT (the exact-repeat key of xlsx / csv rows)."""
+    return (r['patient_id'], r['study_date'], r['modality'], r['body_part'], r['conclusion'])
+
+
+def _repeat_key(r: dict) -> tuple:
+    """Cross-file repeat key: a cumulative re-delivery repeats a section verbatim, header
+    included, while two sections of one visit can share everything but the header (brain MRI
+    and MR angiography, same day, same stock conclusion)."""
+    return (r['patient_id'], r['study_date'], r['modality'], r['body_part'],
+            r['section_header'], r['conclusion'])
+
+
 def _dedupe(rows: list[dict]) -> list[dict]:
     seen, out = set(), []
     for r in rows:
-        key = (r['patient_id'], r['study_date'], r['modality'], r['body_part'], r['conclusion'])
+        key = _dedupe_key(r)
         if key in seen:
             continue
         seen.add(key)
         out.append(r)
     return out
+
+
+def reconcile_files(per_file: list[list[dict]]) -> tuple[list[dict], Counter]:
+    """One table out of the rows of SEVERAL files (overlapping cumulative deliveries), in the
+    processing order (oldest delivery first).  A "file" is a position in that order — never
+    source_file, which hashes the NAME and so is alike for one patient's files in two deliveries.
+      a. a row whose _repeat_key equals that of a row kept from an EARLIER file is dropped
+         (the earlier row wins and keeps its section_index) — by COUNT: a file drops at most as
+         many rows with one key as the earlier files kept, so a same-looking new section
+         survives.  A row with no study_date is never dropped (two undated visits with the
+         same stock text cannot be told apart; a duplicate is safer than a lost report);
+      b. a remaining row whose (patient_id, study_date, modality, section_index) is taken by a
+         row kept from an earlier file gets the largest index used for that
+         (patient_id, study_date, modality) — earlier files and this file — plus 1.
+    Repeats / collisions inside ONE file stay as parse_file left them; rows without a
+    patient_id take no part.  Rows of earlier files are never changed, so appending a newer
+    delivery keeps every key (and every label made on it) of the older ones.
+    Returns (rows, Counter(repeats_dropped=…, renumbered=…))."""
+    seen: Counter = Counter()           # _repeat_key -> rows kept from earlier files
+    taken: set[tuple] = set()           # four-part keys of rows kept from earlier files
+    top: dict[tuple, int] = {}          # (patient_id, study_date, modality) -> largest index kept
+    out: list[dict] = []
+    counts: Counter = Counter(repeats_dropped=0, renumbered=0)
+    for frows in per_file:
+        keep, left = [], Counter(seen)  # earlier copies this file may still consume
+        for r in frows:
+            k = _repeat_key(r)
+            if r['patient_id'] and r['study_date'] and left[k] > 0:
+                left[k] -= 1
+                counts['repeats_dropped'] += 1
+                continue
+            keep.append(r)
+        # new numbers start above every index of this file too, so a renumbered row cannot
+        # land on a sibling section of the same file
+        for r in keep:
+            if r['patient_id']:
+                t = (r['patient_id'], r['study_date'], r['modality'])
+                top[t] = max(top.get(t, 0), int(r['section_index']))
+        for r in keep:
+            t = (r['patient_id'], r['study_date'], r['modality'])
+            if r['patient_id'] and t + (int(r['section_index']),) in taken:
+                top[t] += 1
+                r['section_index'] = top[t]
+                counts['renumbered'] += 1
+        for r in keep:
+            if r['patient_id']:
+                seen[_repeat_key(r)] += 1
+                taken.add((r['patient_id'], r['study_date'], r['modality'], int(r['section_index'])))
+        out.extend(keep)
+    return out, counts
 
 
 # --------------------------------------------------------------- per file
@@ -814,23 +893,37 @@ def collect_inputs(src: Path) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description='Parse hospital radiology reports (PDF folder / xlsx / csv / docx) '
                                              'into one CSV row per study section.')
-    ap.add_argument('--src', required=True, help='folder of reports or a single report file')
+    ap.add_argument('--src', required=True, nargs='+',
+                    help='one or more folders of reports / single report files, OLDEST delivery first')
     ap.add_argument('--out', default='data/hospital_reports_labels.csv')
     ap.add_argument('--limit', type=int, default=0, help='parse only the first N files (0 = all)')
     ap.add_argument('--workers', type=int, default=4, help='parallel pdftotext processes')
     args = ap.parse_args(argv)
 
-    src = Path(args.src)
-    if not src.exists():
-        print(f'{R}✗ --src not found: {display_path(src)}{NC}')
-        return 1
-    files = collect_inputs(src)
+    srcs = [Path(s) for s in args.src]
+    per_source: list[list[Path]] = []
+    for k, src in enumerate(srcs, start=1):
+        # several sources: a skipped delivery would silently lose reports -> any gap is fatal
+        where = f' (source {k} of {len(srcs)})' if len(srcs) > 1 else ''
+        if not src.exists():
+            print(f'{R}✗ --src not found{where}: {display_path(src)}{NC}')
+            return 1
+        found = collect_inputs(src)
+        if not found:
+            print(f'{R}✗ no {"/".join(SUPPORTED_SUFFIXES)} files under {display_path(src)}{where}{NC}')
+            return 1
+        per_source.append(found)
+    files = [p for found in per_source for p in found]
     if args.limit:
         files = files[:args.limit]
-    if not files:
-        print(f'{R}✗ no {"/".join(SUPPORTED_SUFFIXES)} files under {display_path(src)}{NC}')
-        return 1
-    print(f'Parsing {len(files)} report file(s) from {display_path(src)} …')
+    files_per_source, rest = [], len(files)
+    for found in per_source:
+        files_per_source.append(min(len(found), rest))
+        rest -= files_per_source[-1]
+    if len(srcs) == 1:
+        print(f'Parsing {len(files)} report file(s) from {display_path(srcs[0])} …')
+    else:
+        print(f'Parsing {len(files)} report file(s) from {len(srcs)} sources (oldest first) …')
 
     stats: Counter = Counter()
     results: list[tuple[list[dict], str]] = []
@@ -840,7 +933,7 @@ def main(argv: list[str] | None = None) -> int:
             if i % 500 == 0:
                 print(f'  …{i}/{len(files)}')
 
-    rows: list[dict] = []
+    per_file: list[list[dict]] = []
     unreadable: list[tuple[str, str]] = []
     sections_hist: Counter = Counter()
     for f, (frows, err) in zip(files, results):
@@ -849,7 +942,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if f.suffix.lower() in ('.pdf', '.docx'):
             sections_hist[len(frows)] += 1
-        rows.extend(frows)
+        per_file.append(frows)
+    # one patient's cumulative history arrives once per delivery: one key = one section
+    rows, recon = reconcile_files(per_file)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -876,6 +971,12 @@ def main(argv: list[str] | None = None) -> int:
     brain = bp_counter.get('brain', 0)
     share = (100.0 * brain / len(rows)) if rows else 0.0
     print(f'\n  {G}{B}BRAIN sections (our focus): {brain}  ({share:.1f}% of rows){NC}')
+    if len(srcs) > 1 or recon['repeats_dropped'] or recon['renumbered']:
+        # counts only: file names carry patient names, conclusions are clinical text
+        print(f'\n  {B}Sources (oldest first):{NC} files per source '
+              + ' + '.join(str(n) for n in files_per_source))
+        print(f'    {recon["repeats_dropped"]} rows dropped as repeats across files · '
+              f'{recon["renumbered"]} rows renumbered (section_index taken by an earlier file)')
     if sections_hist:
         print(f'\n  {B}Sections per PDF/DOCX:{NC}')
         for n, c in sorted(sections_hist.items()):

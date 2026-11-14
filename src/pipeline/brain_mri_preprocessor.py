@@ -34,6 +34,8 @@ from typing import Optional
 import numpy as np
 from loguru import logger
 
+from src.pipeline.dicom_objects import modality_of
+
 try:
     import pydicom
     _HAS_PYDICOM = True
@@ -168,6 +170,7 @@ class BrainSeries:
     study_uid: str = ''
     body_part: str = ''          # DICOM BodyPartExamined (BRAIN / LSPINE / KNEE…)
     orientation: str = ''        # 'axial' / 'sagittal' / 'coronal' / '' (from ImageOrientationPatient)
+    modality: str = ''           # upper-case DICOM Modality of the series' first file ('MR' / 'CT' / '' …)
 
 
 def group_dicom_files_into_series(dicom_paths: list[Path]) -> list[BrainSeries]:
@@ -202,6 +205,7 @@ def group_dicom_files_into_series(dicom_paths: list[Path]) -> list[BrainSeries]:
                 study_uid=getattr(ds, 'StudyInstanceUID', '') or '',
                 body_part=body_part,
                 orientation=orient,
+                modality=modality_of(ds),
             )
         by_series[suid].files.append(p)
 
@@ -489,7 +493,7 @@ class BrainStudy:
     study_uid: str = ''
     sequences: dict[str, np.ndarray] = field(default_factory=dict)  # 'T1' -> (D, H, W)
     target_shape: tuple = (128, 128, 128)
-    seq_meta: dict = field(default_factory=dict)   # seq_key -> {body_part, orientation, description}
+    seq_meta: dict = field(default_factory=dict)   # seq_key -> {body_part, orientation, description, spacing, modality}
 
     @property
     def num_sequences(self) -> int:
@@ -641,6 +645,7 @@ def process_brain_study(dicom_paths: list[Path],
             'orientation': series.orientation,
             'description': series.series_description,
             'spacing': series.pixel_spacing,
+            'modality': series.modality,
         }
 
     return study

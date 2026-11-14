@@ -244,7 +244,8 @@ def test_build_set_real_study_writes_pngs_and_studies_csv(tmp_path: Path):
     assert pngs and all(p.stem.startswith(f"{pid}_") for p in pngs), [p.name for p in pngs]
     assert 1 <= len(pngs) <= 5
     rows = _read_csv(out / "studies.csv")
-    assert list(rows[0].keys()) == ["patient_id", "study_folder", "cls", "split", "n_slices", "label", "label_source"]
+    assert list(rows[0].keys()) == ["patient_id", "study_folder", "cls", "split", "n_slices", "label", "label_source",
+                                    "modality"]
     assert rows[0]["patient_id"] == pid and rows[0]["cls"] == "abnormal" and int(rows[0]["n_slices"]) == len(pngs)
     assert rows[0]["label"] == "tumor" and rows[0]["label_source"] == "import" and rows[0]["split"] in ("train", "val")
     assert "built 1" in r.stdout
@@ -290,6 +291,7 @@ class _FakeStudies:
 def _build_in_process(b, monkeypatch, fake: _FakeStudies, argv: list[str], capsys) -> str:
     monkeypatch.setattr(b, "process_brain_study", fake.process)
     monkeypatch.setattr(b, "central_slices", fake.slices)
+    monkeypatch.setattr(b, "triage_input", lambda study, k=5: (fake.slices(study, k), ""))  # main() reads both
     monkeypatch.setattr(b.sys, "argv", ["build_training_set.py", *argv])
     b.main()
     return capsys.readouterr().out

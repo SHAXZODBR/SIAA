@@ -773,3 +773,351 @@ def test_scrubber_keeps_clinical_prose(mod):
               "у пациента выявлено очаговое поражение", "больной жалуется на головную боль"):
         assert mod.scrub_phi(s) == s, s
     assert mod.scrub_phi("Пациент Тестов Т.Т., 2031 г.р. очаг") == "очаг"
+
+
+# ------------------------------------------------- several sources (deliveries)
+# A patient seen in two periods has one cumulative PDF per delivery folder.  The
+# sources are given OLDEST FIRST; reconcile_files drops sections already kept from
+# an earlier file and renumbers a new section whose four-part key an earlier file
+# already took.  pdf_text is monkeypatched with a per-PATH registry, so the same
+# file name in two folders can carry different text.
+
+# (lone modality line, section title, date, conclusion)
+BRAIN_A = ("МРТ", "МРТ головного мозга", "2031-03-01", "Очаговых изменений не выявлено.")
+SPINE_A = ("МРТ", "МРТ пояснично-крестцового отдела позвоночника", "2031-03-01", "Протрузия диска L4-L5.")
+NECK_A = ("МРТ", "МРТ шейного отдела позвоночника", "2031-03-01", "Остеохондроз C5-C6.")
+CHEST_C = ("МСКТ", "МСКТ грудной клетки", "2031-05-10", "Без патологии.")
+BRAIN_D = ("МРТ", "МРТ головного мозга", "2031-06-02", "Киста шишковидной железы.")
+
+
+def _report(*sections) -> str:
+    out = [f"        Ф.И.О.     {FAKE_PATIENT}          Результаты МРТ / МСКТ", ""]
+    for word, title, day, concl in sections:
+        out += [f"                {word}", f"        {title} ({day})", "",
+                "ПРОТОКОЛ ИССЛЕДОВАНИЯ", f"Описание: {title}.", "",
+                f"ЗАКЛЮЧЕНИЕ: {concl}", "", f"Врач: ____ {FAKE_DOCTOR}", ""]
+    return "\n".join(out)
+
+
+@pytest.fixture
+def pdfs(monkeypatch, mod):
+    """write(path, *sections): a fake PDF whose pdf_text is the synthetic report of `sections`."""
+    registry: dict[str, str] = {}
+    monkeypatch.setattr(mod, "pdf_text", lambda path: registry[str(path)])
+
+    def write(path: Path, *sections) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"%PDF-1.4 fake")
+        registry[str(path)] = _report(*sections)
+        return path
+    return write
+
+
+def _pdf_name(pid: int) -> str:
+    return f"{pid}_{FAKE_PATIENT}.pdf"
+
+
+def _run(mod, tmp_path, srcs, *extra, name="out.csv"):
+    out = tmp_path / name
+    rc = mod.main(["--src", *[str(s) for s in srcs], "--out", str(out), *extra])
+    rows = []
+    if rc == 0:
+        with open(out, encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    return rc, rows, out
+
+
+def _content(r) -> tuple:
+    return (r["patient_id"], r["study_date"], r["modality"], r["body_part"], r["conclusion"])
+
+
+def _key(r) -> tuple:
+    return (r["patient_id"], r["study_date"], r["modality"], r["section_index"])
+
+
+def test_cumulative_second_delivery_keeps_only_new_sections(tmp_path, mod, pdfs, capsys):
+    a, b = tmp_path / "2031-01_2031-03", tmp_path / "2031-03_2031-06"
+    pdfs(a / _pdf_name(9000401), BRAIN_A, SPINE_A)
+    pdfs(b / _pdf_name(9000401), BRAIN_A, SPINE_A, CHEST_C, BRAIN_D)   # same file name, cumulative
+    rc, rows, _ = _run(mod, tmp_path, [a, b])
+    assert rc == 0
+    assert [(r["body_part"], r["study_date"], r["section_index"]) for r in rows] == [
+        ("brain", "2031-03-01", "1"), ("spine", "2031-03-01", "2"),
+        ("chest", "2031-05-10", "3"), ("brain", "2031-06-02", "4")]
+    out = capsys.readouterr().out
+    assert "files per source 1 + 1" in out
+    assert "2 rows dropped as repeats across files" in out and "0 rows renumbered" in out
+    assert "PARSED 4 STUDY SECTIONS from 2 files" in out
+    # counts only: neither a file name (it carries the patient name) nor a conclusion
+    for tok in (FAKE_PATIENT, "Тестов", _pdf_name(9000401), BRAIN_A[3], CHEST_C[3]):
+        assert tok not in out, tok
+    _no_names(rows)
+
+
+def test_same_section_with_another_index_keeps_the_first_index(tmp_path, mod, pdfs):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000402), BRAIN_A)
+    pdfs(b / _pdf_name(9000402), CHEST_C, BRAIN_A)       # BRAIN_A is section 2 here
+    rc, rows, _ = _run(mod, tmp_path, [a, b])
+    assert rc == 0
+    assert [(r["body_part"], r["section_index"]) for r in rows] == [("brain", "1"), ("chest", "1")]
+
+
+def test_colliding_keys_are_renumbered_past_the_largest(tmp_path, mod, pdfs, capsys):
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    pdfs(a / _pdf_name(9000403), BRAIN_A)
+    pdfs(b / _pdf_name(9000403), SPINE_A)                # same (pid, date, MR, 1), other section
+    pdfs(c / _pdf_name(9000403), NECK_A)                 # and again
+    rc, rows, _ = _run(mod, tmp_path, [a, b, c])
+    assert rc == 0
+    assert [(r["body_part"], r["conclusion"], r["section_index"]) for r in rows] == [
+        ("brain", BRAIN_A[3], "1"), ("spine", SPINE_A[3], "2"), ("spine", NECK_A[3], "3")]
+    out = capsys.readouterr().out
+    assert "files per source 1 + 1 + 1" in out
+    assert "0 rows dropped as repeats across files" in out and "2 rows renumbered" in out
+
+
+def test_renumbering_never_lands_on_a_sibling_section_of_the_same_file(tmp_path, mod, pdfs):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000404), BRAIN_A)
+    pdfs(b / _pdf_name(9000404), SPINE_A, NECK_A)        # 1 collides; 2 is already used by NECK_A
+    rc, rows, _ = _run(mod, tmp_path, [a, b])
+    assert rc == 0
+    assert [(r["conclusion"], r["section_index"]) for r in rows] == [
+        (BRAIN_A[3], "1"), (SPINE_A[3], "3"), (NECK_A[3], "2")]
+    assert len({_key(r) for r in rows}) == len(rows)
+
+
+def test_source_order_changes_numbering_not_content(tmp_path, mod, pdfs):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000405), BRAIN_A, CHEST_C)
+    pdfs(b / _pdf_name(9000405), SPINE_A, CHEST_C, BRAIN_D)
+    _, ab, _ = _run(mod, tmp_path, [a, b], name="ab.csv")
+    _, ba, _ = _run(mod, tmp_path, [b, a], name="ba.csv")
+    assert [(r["conclusion"], r["section_index"]) for r in ab] == [
+        (BRAIN_A[3], "1"), (CHEST_C[3], "2"), (SPINE_A[3], "2"), (BRAIN_D[3], "3")]
+    assert [(r["conclusion"], r["section_index"]) for r in ba] == [
+        (SPINE_A[3], "1"), (CHEST_C[3], "2"), (BRAIN_D[3], "3"), (BRAIN_A[3], "2")]
+    assert {_content(r) for r in ab} == {_content(r) for r in ba}
+    assert len(ab) == len(ba) == 4
+
+
+def test_appending_a_delivery_never_changes_the_older_rows(tmp_path, mod, pdfs):
+    """(i) --src A and --src A B agree on every row from A; (ii) no key is shared across files."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000406), BRAIN_A, SPINE_A)
+    pdfs(a / _pdf_name(9000407), CHEST_C)
+    pdfs(b / _pdf_name(9000406), NECK_A, BRAIN_A, SPINE_A, BRAIN_D)
+    pdfs(b / _pdf_name(9000407), BRAIN_D, CHEST_C)
+    pdfs(b / _pdf_name(9000408), BRAIN_A)
+    _, only_a, _ = _run(mod, tmp_path, [a], name="a.csv")
+    _, both, _ = _run(mod, tmp_path, [a, b], name="ab.csv")
+    assert only_a and both[:len(only_a)] == only_a
+    assert [_content(r) for r in both[len(only_a):]] == [
+        ("9000406", "2031-03-01", "MR", "spine", NECK_A[3]),
+        ("9000406", "2031-06-02", "MR", "brain", BRAIN_D[3]),
+        ("9000407", "2031-06-02", "MR", "brain", BRAIN_D[3]),
+        ("9000408", "2031-03-01", "MR", "brain", BRAIN_A[3])]
+    assert [r["section_index"] for r in both[len(only_a):]] == ["3", "4", "1", "1"]
+    assert len({_key(r) for r in both}) == len(both)
+
+
+def _single_source_fixture(folder: Path, pdfs) -> None:
+    """One delivery, every patient in ONE file (PDFs, a DOCX, a request-sheet CSV)."""
+    pdfs(folder / _pdf_name(9000411), BRAIN_A, SPINE_A, BRAIN_A)    # repeat inside one PDF
+    pdfs(folder / _pdf_name(9000412), CHEST_C)
+    build_docx(folder / f"9000413_{FAKE_PATIENT}.docx", _report(BRAIN_D, BRAIN_D).split("\n"))
+    with open(folder / "request.csv", "w", encoding="utf-8-sig", newline="") as fh:
+        csv.writer(fh).writerows(SHEET_ROWS)
+
+
+# --src <folder> over _single_source_fixture, as written by the implementation BEFORE
+# reconciliation existed (generated once from it; must stay byte-identical)
+SINGLE_SOURCE_CSV = "\r\n".join([
+    "patient_id,modality,body_part,study_date,label,conclusion,description,source_file,section_index,section_header",
+    "9000411,MR,brain,2031-03-01,,Очаговых изменений не выявлено.,ПРОТОКОЛ ИССЛЕДОВАНИЯ Описание: МРТ головного мозга.,9000411_8032918e5c50cf30.pdf,1,МРТ головного мозга",
+    "9000411,MR,spine,2031-03-01,,Протрузия диска L4-L5.,ПРОТОКОЛ ИССЛЕДОВАНИЯ Описание: МРТ пояснично-крестцового отдела позвоночника.,9000411_8032918e5c50cf30.pdf,2,МРТ пояснично-крестцового отдела позвоночника",
+    "9000411,MR,brain,2031-03-01,,Очаговых изменений не выявлено.,ПРОТОКОЛ ИССЛЕДОВАНИЯ Описание: МРТ головного мозга.,9000411_8032918e5c50cf30.pdf,3,МРТ головного мозга",
+    "9000412,CT,chest,2031-05-10,,Без патологии.,ПРОТОКОЛ ИССЛЕДОВАНИЯ Описание: МСКТ грудной клетки.,9000412_8032918e5c50cf30.pdf,1,МСКТ грудной клетки",
+    "9000413,MR,brain,2031-06-02,,Киста шишковидной железы.,ПРОТОКОЛ ИССЛЕДОВАНИЯ Описание: МРТ головного мозга.,9000413_8032918e5c50cf30.docx,1,МРТ головного мозга",
+    "9000413,MR,brain,2031-06-02,,Киста шишковидной железы.,ПРОТОКОЛ ИССЛЕДОВАНИЯ Описание: МРТ головного мозга.,9000413_8032918e5c50cf30.docx,2,МРТ головного мозга",
+    "9000101,MR,brain,2031-07-06,,МРТ-признаки церебральной микроангиопатии.,HEAD HEAD,1f58b9145b24d108.csv,1,BRAIN",
+    "9000103,CT,chest,2031-06-29,,МСКТ - признаки очаговых изменений не выявлено.,CHEST,1f58b9145b24d108.csv,3,CHEST",
+]) + "\r\n"
+
+
+def test_single_source_output_is_byte_identical_to_before(tmp_path, mod, pdfs, capsys):
+    """(iii) one source, every patient in one file: nothing is dropped or renumbered."""
+    folder = tmp_path / "delivery"
+    _single_source_fixture(folder, pdfs)
+    for workers in ("1", "4"):
+        rc, _, out = _run(mod, tmp_path, [folder], "--workers", workers, name=f"w{workers}.csv")
+        assert rc == 0
+        assert out.read_bytes() == SINGLE_SOURCE_CSV.encode("utf-8"), workers
+    assert "Sources (oldest first)" not in capsys.readouterr().out
+
+
+def test_repeats_inside_one_pdf_or_docx_survive_with_several_sources(tmp_path, mod, pdfs):
+    a, b = tmp_path / "a", tmp_path / "b"
+    _single_source_fixture(a, pdfs)
+    pdfs(b / _pdf_name(9000414), CHEST_C)
+    _, rows, _ = _run(mod, tmp_path, [a, b])
+    assert [r["section_index"] for r in rows if r["patient_id"] == "9000411"] == ["1", "2", "3"]
+    assert [r["section_index"] for r in rows if r["patient_id"] == "9000413"] == ["1", "2"]
+    assert [r["conclusion"] for r in rows if r["patient_id"] == "9000413"] == [BRAIN_D[3]] * 2
+
+
+def test_several_sources_output_does_not_depend_on_workers(tmp_path, mod, pdfs):
+    a, b = tmp_path / "a", tmp_path / "b"
+    _single_source_fixture(a, pdfs)
+    pdfs(b / _pdf_name(9000411), NECK_A, BRAIN_A, CHEST_C)
+    pdfs(b / _pdf_name(9000412), CHEST_C, SPINE_A)
+    _, _, w1 = _run(mod, tmp_path, [a, b], "--workers", "1", name="w1.csv")
+    _, _, w8 = _run(mod, tmp_path, [a, b], "--workers", "8", name="w8.csv")
+    assert w1.read_bytes() == w8.read_bytes()
+
+
+def test_same_file_name_in_two_sources_is_two_files(tmp_path, mod, pdfs, capsys):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000415), BRAIN_A, BRAIN_A)       # an in-file repeat stays...
+    pdfs(b / _pdf_name(9000415), BRAIN_A, SPINE_A)       # ...a repeat across files goes
+    rc, rows, _ = _run(mod, tmp_path, [a, b])
+    assert rc == 0
+    assert [(r["conclusion"], r["section_index"]) for r in rows] == [
+        (BRAIN_A[3], "1"), (BRAIN_A[3], "2"), (SPINE_A[3], "3")]   # 2 is taken by the first file
+    assert rows[0]["source_file"] == rows[2]["source_file"]    # the hash alone cannot tell them apart
+    out = capsys.readouterr().out
+    assert "PARSED 3 STUDY SECTIONS from 2 files" in out
+    assert "1 rows dropped as repeats across files" in out and "1 rows renumbered" in out
+
+
+def test_limit_counts_files_across_sources(tmp_path, mod, pdfs, capsys):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000421), BRAIN_A)
+    pdfs(a / _pdf_name(9000422), BRAIN_A)
+    pdfs(b / _pdf_name(9000423), BRAIN_A)
+    pdfs(b / _pdf_name(9000424), BRAIN_A)
+    rc, rows, _ = _run(mod, tmp_path, [a, b], "--limit", "3")
+    assert rc == 0
+    assert [r["patient_id"] for r in rows] == ["9000421", "9000422", "9000423"]
+    assert "files per source 2 + 1" in capsys.readouterr().out
+    rc, rows, _ = _run(mod, tmp_path, [a, b], "--limit", "1")
+    assert rc == 0 and [r["patient_id"] for r in rows] == ["9000421"]
+
+
+def test_any_missing_or_empty_source_fails_when_several_are_given(tmp_path, mod, pdfs, capsys):
+    a, empty = tmp_path / "a", tmp_path / "empty"
+    pdfs(a / _pdf_name(9000431), BRAIN_A)
+    empty.mkdir()
+    (empty / "notes.txt").write_text("ignored")
+    for srcs in ([a, tmp_path / "nope"], [tmp_path / "nope", a], [a, empty], [empty, a]):
+        rc, _, out = _run(mod, tmp_path, srcs)
+        assert rc == 1, srcs
+        assert not out.exists()
+    text = capsys.readouterr().out
+    assert "--src not found (source 2 of 2)" in text and "(source 1 of 2)" in text
+    assert FAKE_PATIENT not in text
+    # one source keeps today's behaviour
+    assert _run(mod, tmp_path, [tmp_path / "nope"])[0] == 1
+    assert _run(mod, tmp_path, [empty])[0] == 1
+    assert _run(mod, tmp_path, [a])[0] == 0
+
+
+def test_a_single_file_source_and_a_folder_source(tmp_path, mod, pdfs):
+    sheet = tmp_path / "requests.csv"
+    with open(sheet, "w", encoding="utf-8-sig", newline="") as fh:
+        csv.writer(fh).writerows(SHEET_ROWS)
+    folder = tmp_path / "pdfs"
+    # the sheet's brain row again (same date / modality / body part / conclusion, but the
+    # sheet's header is "BRAIN", so it is not a verbatim repeat) + a new section
+    pdfs(folder / _pdf_name(9000101),
+         ("МРТ", "МРТ головного мозга", "2031-07-06", "МРТ-признаки церебральной микроангиопатии."),
+         ("МРТ", "МРТ шейного отдела позвоночника", "2031-07-06", "Остеохондроз."))
+    lone_pdf = pdfs(tmp_path / "single" / _pdf_name(9000103), CHEST_C)
+    rc, rows, _ = _run(mod, tmp_path, [sheet, folder, lone_pdf])
+    assert rc == 0
+    assert [(r["patient_id"], r["body_part"], r["section_index"]) for r in rows] == [
+        ("9000101", "brain", "1"), ("9000103", "chest", "3"),       # from the sheet (csv keeps row numbers)
+        ("9000101", "brain", "3"),                                 # other header: kept, 1 taken -> 3
+        ("9000101", "spine", "2"),                                 # PDF section 2, key free
+        ("9000103", "chest", "1")]                                 # other date: key free
+
+
+def test_reconcile_files_ignores_rows_without_patient_id(mod):
+    def row(pid, idx, concl):
+        return {"patient_id": pid, "modality": "MR", "body_part": "brain", "study_date": "2031-03-01",
+                "label": "", "conclusion": concl, "description": "", "source_file": "x.pdf",
+                "section_index": idx, "section_header": ""}
+    rows, counts = mod.reconcile_files([[row("", 1, "Норма."), row("9000441", 1, "Норма.")],
+                                        [row("", 1, "Норма."), row("", 1, "Киста."),
+                                         row("9000441", 1, "Киста.")]])
+    assert [(r["patient_id"], r["section_index"], r["conclusion"]) for r in rows] == [
+        ("", 1, "Норма."), ("9000441", 1, "Норма."),
+        ("", 1, "Норма."), ("", 1, "Киста."), ("9000441", 2, "Киста.")]
+    assert (counts["repeats_dropped"], counts["renumbered"]) == (0, 1)
+
+
+# A second section of the same visit can share date, modality, body part and the stock
+# conclusion with the first (e.g. brain MRI + MR angiography); the headers differ.  A
+# cumulative re-delivery repeats each section verbatim, header included, so the cross-file
+# repeat key carries the header, and repeats are dropped by COUNT, not by membership.
+ANGIO_A = ("МРТ", "МР-ангиография сосудов головного мозга", "2031-03-01", BRAIN_A[3])
+
+
+def test_new_same_day_section_with_the_same_conclusion_is_kept(tmp_path, mod, pdfs, capsys):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000451), BRAIN_A)
+    pdfs(b / _pdf_name(9000451), BRAIN_A, ANGIO_A)
+    _, b_alone, _ = _run(mod, tmp_path, [b], name="b.csv")
+    rc, rows, _ = _run(mod, tmp_path, [a, b])
+    assert rc == 0
+    assert [(r["section_header"], r["body_part"], r["section_index"]) for r in rows] == [
+        ("МРТ головного мозга", "brain", "1"),
+        ("МР-ангиография сосудов головного мозга", "brain", "2")]
+    assert [r["section_header"] for r in rows] == [r["section_header"] for r in b_alone]
+    out = capsys.readouterr().out
+    assert "1 rows dropped as repeats across files" in out and "0 rows renumbered" in out
+
+
+def test_cross_file_repeats_are_dropped_by_count_not_membership(tmp_path, mod, pdfs, capsys):
+    a, b = tmp_path / "a", tmp_path / "b"
+    pdfs(a / _pdf_name(9000452), BRAIN_A)
+    pdfs(b / _pdf_name(9000452), BRAIN_A, BRAIN_A)      # identical header: only the count tells
+    rc, rows, _ = _run(mod, tmp_path, [a, b])
+    assert rc == 0
+    assert [(r["conclusion"], r["section_index"]) for r in rows] == [
+        (BRAIN_A[3], "1"), (BRAIN_A[3], "2")]           # the first of B is the repeat
+    assert len({_key(r) for r in rows}) == len(rows)
+    out = capsys.readouterr().out
+    assert "1 rows dropped as repeats across files" in out and "0 rows renumbered" in out
+
+
+def test_three_cumulative_deliveries_drop_every_repeat_once(tmp_path, mod, pdfs, capsys):
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    pdfs(a / _pdf_name(9000453), BRAIN_A)
+    pdfs(b / _pdf_name(9000453), BRAIN_A, ANGIO_A)
+    pdfs(c / _pdf_name(9000453), BRAIN_A, ANGIO_A, BRAIN_D)
+    _, ab, _ = _run(mod, tmp_path, [a, b], name="ab.csv")
+    rc, rows, _ = _run(mod, tmp_path, [a, b, c])
+    assert rc == 0
+    assert rows[:len(ab)] == ab
+    assert [(r["section_header"], r["study_date"], r["section_index"]) for r in rows] == [
+        ("МРТ головного мозга", "2031-03-01", "1"),
+        ("МР-ангиография сосудов головного мозга", "2031-03-01", "2"),
+        ("МРТ головного мозга", "2031-06-02", "3")]
+    out = capsys.readouterr().out
+    assert "3 rows dropped as repeats across files" in out and "0 rows renumbered" in out
+
+
+def test_undated_rows_are_never_dropped_across_files(mod):
+    def row(idx, date=""):
+        return {"patient_id": "9000454", "modality": "MR", "body_part": "brain", "study_date": date,
+                "label": "", "conclusion": "Патологии не выявлено.", "description": "",
+                "source_file": "x.docx", "section_index": idx, "section_header": "МРТ"}
+    rows, counts = mod.reconcile_files([[row(1)], [row(1)], [row(1, "2031-03-01")],
+                                        [row(1, "2031-03-01")]])
+    assert [(r["study_date"], r["section_index"]) for r in rows] == [
+        ("", 1), ("", 2), ("2031-03-01", 1)]            # two undated visits, distinct keys
+    assert (counts["repeats_dropped"], counts["renumbered"]) == (1, 1)
+    keys = [(r["patient_id"], r["study_date"], r["modality"], r["section_index"]) for r in rows]
+    assert len(set(keys)) == len(keys)

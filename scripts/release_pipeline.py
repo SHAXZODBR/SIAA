@@ -8,8 +8,8 @@
     studies + radiology reports) through every stage of
     docs/dev/release_pipeline_contract.md:
 
-        index → parse → label → match → build → combine → train → gate
-              → promote → bump → bundle
+        index → parse → label → match → build → prospective → combine → train
+              → gate → promote → bump → bundle
 
     Each stage is an existing repo script with a fixed CLI; this file only
     builds the commands, runs them one after another with a tee'd log, keeps a
@@ -21,11 +21,13 @@
     A retrain must be boring and repeatable: the same commands, the same
     locked held-out patients, the same gate floors, the same documentation
     bump. Everything intermediate lives under data/release/<tag>/ so a failed
-    run can be resumed with one flag instead of re-typing eleven commands.
+    run can be resumed with one flag instead of re-typing twelve commands.
 
   USAGE (from sentinel/; PY=/Users/shakhzodbtr/venv/bin/python):
     $PY scripts/release_pipeline.py plan   --batch new1 --root /Volumes/Transcend/new1 --reports ~/Desktop/reports_new1
     $PY scripts/release_pipeline.py run    --batch new1 --root /Volumes/Transcend/new1 --reports ~/Desktop/reports_new1
+    $PY scripts/release_pipeline.py run    --batch new1 --root /Volumes/Transcend/new1 \
+                                           --reports ~/Desktop/reports_A ~/Desktop/reports_B   # oldest delivery first
     $PY scripts/release_pipeline.py run    --batch new1 --resume        # continue: tag from data/release/LATEST,
                                                                         # options from state.json
     $PY scripts/release_pipeline.py gate   --batch new1 --tag brain-triage-v2              # one stage only
@@ -49,16 +51,33 @@
     their candidate paths then resolve to the release dir and they stay done. More
     generally a stage whose outputs are gone counts as done when a LATER stage is done
     (its outputs were consumed), unless --from/--only names it. After promote,
-    combine/train/gate/promote never run again under the same tag (the gate would compare
-    the new candidate with itself; combine would rewrite the val set the promoted model's
-    eval is pinned to) — start a new tag. A --resume after promote treats every stage up to
+    prospective/combine/train/gate/promote never run again under the same tag (the gate would
+    compare the new candidate with itself; combine would rewrite the val set the promoted
+    model's eval is pinned to; prospective would score the NEW model, now in the release dir, on
+    its own training data) — start a new tag. A --resume after promote treats every stage up to
     promote as FROZEN (done, even when an upstream input changed since — a Finder .DS_Store,
     a rebuilt set): only bump and bundle are left to finish the release.
     train also fingerprints its --base-model and --epochs, so `--from train --resume` with a
     new --base-model (the retrain-from-the-public-ViT fallback) really retrains.
+    build fingerprints --modality (default MR: the MR-only rule; 'any' disables it).
+    A build recorded before the MR-only rule (no opt:modality) counts as '--modality any' and is
+    re-run under the current rule on --resume. A stage that a promoted release has NO record of
+    (prospective, after a promote by an older version) is 'skipped (promoted before this stage
+    existed)'. --reports takes several sources, OLDEST delivery first: parse gets them in that order and
+    a changed order re-runs parse. Only index and build read the drive (--root; no guard rail checks
+    it either); match passes --images only when a root is configured.
     The current model's training set (data/train_release_<prev>) is locked to train in the
     next combine; if that set is gone or was rebuilt, combine refuses to run without an
     explicit --train-lock (it never silently drops the lock).
+
+  PROSPECTIVE (stage 5)
+    eval_prospective.py scores the model shipped BEFORE this release (the release dir
+    models/brain_triage_finetuned — always that one, whatever --base-model the training starts
+    from) on the new batch's set, reporting the patients it has never seen (--seen = the extra
+    sets + the release set the shipped model was trained on, when it is a pipeline release)
+    separately: data/release/<tag>/prospective_eval.json. Informational, never a gate:
+    exit 0 = it ran. Its guard rail refuses to run when that trained-on set is gone or rebuilt
+    (restore it, or pass --train-lock <release set dir>).
 
   CANDIDATES (--candidates warm,fresh; default warm — decision D6 of docs/dev/finish_line_contract.md)
     warm   starts from --base-model (default the current release models/brain_triage_finetuned)
@@ -103,14 +122,19 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 REPO_DEFAULT = Path(__file__).resolve().parent.parent
 
-STAGE_ORDER = ('index', 'parse', 'label', 'match', 'build', 'combine',
+STAGE_ORDER = ('index', 'parse', 'label', 'match', 'build', 'prospective', 'combine',
                'train', 'gate', 'promote', 'bump', 'bundle')
 SUBCOMMANDS = ('plan', 'run', 'all', 'status') + STAGE_ORDER
 CANDIDATE_STAGES = ('train', 'gate', 'promote')      # never re-run after promote under one tag
 # combine writes the release set the promoted model's eval is pinned to: never rewritten after
-# promote either. Every stage up to promote is frozen (done) on a --resume after promote.
-NO_RERUN_AFTER_PROMOTE = ('combine',) + CANDIDATE_STAGES
-FROZEN_AFTER_PROMOTE = ('index', 'parse', 'label', 'match', 'build', 'combine') + CANDIDATE_STAGES
+# promote either. prospective scores the model in the release dir (BASE_MODEL), which after promote
+# IS the new model (trained on this batch). Every stage up to promote is frozen (done) on a --resume
+# after promote.
+NO_RERUN_AFTER_PROMOTE = ('prospective', 'combine') + CANDIDATE_STAGES
+FROZEN_AFTER_PROMOTE = ('index', 'parse', 'label', 'match', 'build', 'prospective',
+                        'combine') + CANDIDATE_STAGES
+NEEDS_ROOT = ('index', 'build')                      # stages that read the drive (match: --images optional)
+PROSPECTIVE_KIND = 'prospective_eval'
 
 EXIT_USAGE = 1
 EXIT_STAGE_FAILED = 2
@@ -133,23 +157,30 @@ HF_WEIGHT_FILES = ('model.safetensors', 'pytorch_model.bin')
 HF_REQUIRED_FILES = ('config.json', 'preprocessor_config.json')
 CANDIDATE_KINDS = ('warm', 'fresh')                  # preference order: a balanced-accuracy tie → warm
 DEFAULT_CANDIDATES = ['warm']
+DEFAULT_MODALITY = 'MR'                              # build --modality MR (MR-only rule); 'any' = no rule
+MODALITY_ANY = 'any'
 BALANCED_TIE_EPS = 1e-9
 DEFAULT_HOLDOUT = 'data/holdout_patients_v1.txt'
 LATEST_FILE = 'data/release/LATEST'
 VENV_PYTHON = '/Users/shakhzodbtr/venv/bin/python'
 
 DONE_STATUSES = ('done', 'archived')
+# stage_is_done's reason for a frozen stage with NO record after promote (status / run print it)
+NOT_APPLICABLE_AFTER_PROMOTE = 'promoted before this stage existed'
+# an option input missing from a recorded stage means its LEGACY behaviour, not "no change", when
+# that differs from the new default: the build before the MR-only rule exported every modality
+LEGACY_OPTION_VALUES = {'opt:modality': f'opt:{MODALITY_ANY}'}
 
 # Every option that shapes the stage commands. state.json keeps the effective values; a
 # --resume / --from / --only / <stage> invocation reuses them for flags not given on the CLI,
 # and the printed resume line re-emits ALL of them.
 OPTION_DEFAULTS: dict[str, object] = {
-    'root': None, 'reports': None, 'extra_sets': None, 'holdout': DEFAULT_HOLDOUT,
+    'root': None, 'reports': [], 'extra_sets': None, 'holdout': DEFAULT_HOLDOUT,
     'train_lock': None, 'epochs': 12, 'device': 'mps', 'python': sys.executable,
     'base_model': BASE_MODEL, 'skip_benchmark': False, 'skip_tests': False, 'label_llm': None,
     'llm_labels': None, 'github': GITHUB_MODELS_REPO, 'local_bundle': False,
     'min_normals': MIN_NORMALS_DEFAULT, 'min_disk_gb': MIN_DISK_GB_DEFAULT,
-    'candidates': DEFAULT_CANDIDATES,
+    'candidates': DEFAULT_CANDIDATES, 'modality': DEFAULT_MODALITY,
 }
 
 
@@ -161,7 +192,7 @@ class Config:
     batch: str
     tag: str
     root: Optional[Path] = None
-    reports: Optional[Path] = None
+    reports: list[Path] = field(default_factory=list)     # report sources, oldest delivery first
     extra_sets: list[str] = field(default_factory=list)
     holdout: str = DEFAULT_HOLDOUT
     train_lock: Optional[str] = None
@@ -177,6 +208,7 @@ class Config:
     min_normals: int = MIN_NORMALS_DEFAULT
     min_disk_gb: float = MIN_DISK_GB_DEFAULT
     candidates: list[str] = field(default_factory=lambda: list(DEFAULT_CANDIDATES))
+    modality: str = DEFAULT_MODALITY
     chosen: Optional[str] = None                      # candidate the gate chose (multi-candidate runs)
     dry_run: bool = False
     resume: bool = False
@@ -200,6 +232,16 @@ class Config:
     def candidate(self) -> str: return f'models/brain_triage_candidate_{self.tag}'
     @property
     def release_dir(self) -> str: return f'data/release/{self.tag}'
+    @property
+    def prospective_json(self) -> str: return f'{self.release_dir}/prospective_eval.json'
+    @property
+    def report_sources(self) -> list[str]:
+        """--reports as they appear in the parse command (oldest delivery first)."""
+        return [self.rel(p) for p in self.reports]
+    @property
+    def report_order(self) -> str:
+        """The parse stage's 'opt:report_order' fingerprint: the sources in order (a swap re-runs parse)."""
+        return ' | '.join(self.report_sources)
     @property
     def multi(self) -> bool:
         """True unless the candidate set is the default (warm only): the single-candidate pipeline
@@ -238,14 +280,14 @@ class Config:
         """The effective options, JSON-serialisable — stored in state.json."""
         return {
             'root': str(self.root) if self.root else None,
-            'reports': str(self.reports) if self.reports else None,
+            'reports': [str(p) for p in self.reports],
             'extra_sets': list(self.extra_sets), 'holdout': self.holdout, 'train_lock': self.train_lock,
             'epochs': self.epochs, 'device': self.device, 'python': self.python,
             'base_model': self.base_model, 'skip_benchmark': self.skip_benchmark,
             'skip_tests': self.skip_tests, 'label_llm': self.label_llm, 'llm_labels': self.llm_labels,
             'github': self.github or GITHUB_MODELS_REPO, 'local_bundle': self.github is None,
             'min_normals': self.min_normals, 'min_disk_gb': self.min_disk_gb,
-            'candidates': list(self.candidates),
+            'candidates': list(self.candidates), 'modality': self.modality,
         }
 
 
@@ -390,6 +432,29 @@ def train_lock_problem(repo: Path, release_set: str) -> Optional[str]:
                 f'the model was trained on. Restore the original set, or pass --train-lock <ids.txt> '
                 f'listing the patients it was trained on')
     return None
+
+
+def prospective_seen_release(cfg: Config) -> tuple[Optional[str], Optional[str]]:
+    """(release set the shipped model was trained on — passed to the prospective stage as an extra
+    --seen; problem). Both None for a shipped model trained on the legacy set only (the command is
+    then exactly the historical one) and after promote under this tag (it then names this tag's
+    own set). --train-lock wins when it is a directory; else _trained_on_set(). When that set cannot
+    be used (train_lock_problem: gone or rebuilt) the problem says so — the stage's guard refuses to
+    run with an incomplete --seen list, which would count trained-on patients as 'new'."""
+    found = _trained_on_set(cfg.repo)
+    if found is None or found[0] == cfg.release_set:
+        return None, None
+    if cfg.train_lock and cfg.train_lock != cfg.release_set and (cfg.repo / cfg.train_lock).is_dir():
+        return cfg.train_lock, None
+    rel, abs_dir = found
+    if train_lock_problem(cfg.repo, cfg.release_set) is None:
+        return rel, None
+    why = (f'{rel}/dataset_manifest.json is missing' if not (abs_dir / 'dataset_manifest.json').is_file()
+           else f'{rel} was rebuilt after the model was evaluated on it')
+    return None, (f'the shipped model {BASE_MODEL} was trained on {rel} ({BASE_MODEL}/training_metrics.json) but '
+                  f'{why}: its patients cannot be passed to the prospective stage as --seen, so the "new" group '
+                  f'would count patients the model was trained on. Restore {rel}, or pass --train-lock '
+                  f'<release set dir> naming the set it was trained on')
 
 
 def parse_candidates(value: str) -> list[str]:
@@ -623,6 +688,32 @@ def promote_verdict(repo: Path, ev: dict, holdout: str = DEFAULT_HOLDOUT) -> tup
     return eval_verdict(ev, manifest or None, repo / holdout)
 
 
+def prospective_problem(p: Path) -> Optional[str]:
+    """Why eval_prospective.py's JSON is not usable (None = good): it must exist, parse, have
+    kind 'prospective_eval' and a 'groups' object."""
+    if not p.is_file():
+        return f'{p.name} missing'
+    try:
+        d = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return f'{p.name} is not valid JSON'
+    if not isinstance(d, dict) or d.get('kind') != PROSPECTIVE_KIND:
+        return f'{p.name}: kind is not "{PROSPECTIVE_KIND}"'
+    if not isinstance(d.get('groups'), dict):
+        return f'{p.name}: no "groups" object'
+    return None
+
+
+def prospective_headline(p: Path) -> Optional[str]:
+    """One line from the 'new' group (patients no earlier set contains), or None."""
+    groups = _read_json(p).get('groups')
+    new = groups.get('new') if isinstance(groups, dict) else None
+    if not isinstance(new, dict):
+        return None
+    return (f'prospective, never-seen patients: n {new.get("n_studies", "—")} studies · '
+            f'sensitivity {_fmt(new.get("sensitivity"))} · specificity {_fmt(new.get("specificity"))}')
+
+
 def read_eval(model_dir: Path) -> dict:
     p = model_dir / 'study_level_eval.json'
     if not p.is_file():
@@ -638,8 +729,44 @@ def read_eval(model_dir: Path) -> dict:
 def build_stages(cfg: Config) -> list[Stage]:
     py = cfg.python
     root = cfg.rel(cfg.root) if cfg.root else '<drive-root>'
-    reports = cfg.rel(cfg.reports) if cfg.reports else '<reports-folder-or-file>'
+    # every report source, oldest delivery first (parse_hospital_reports.py --src order matters).
+    # One source keeps its historical input spec (its path) so an older state.json stays 'done';
+    # with several, opt:report_order also records their ORDER.
+    reports = cfg.report_sources or ['<reports-folder-or-file>']
+    parse_inputs = list(reports) + (['opt:report_order'] if len(cfg.reports) > 1 else [])
     manifest = f'{cfg.release_set}/dataset_manifest.json'
+
+    match_cmd = [py, 'scripts/match_images_to_reports.py']
+    if cfg.root:                                       # --images is optional when --index is given
+        match_cmd += ['--images', root]
+    match_cmd += ['--index', cfg.index_csv, '--labels', cfg.labels_csv, '--out', cfg.matched_csv]
+
+    build_cmd = [py, 'scripts/build_training_set.py', '--images', root, '--matched', cfg.matched_csv,
+                 '--out', cfg.set_dir, '--mode', 'binary', '--abnormal-col', 'abnormal', '--skip-needs-review']
+    if cfg.modality != MODALITY_ANY:
+        build_cmd += ['--modality', cfg.modality]
+
+    # prospective: the model shipped TODAY on the new batch — the release dir BASE_MODEL (what the gate
+    # compares with and promote replaces), NOT --base-model: that is only where training starts and is
+    # the public ViT in the retrain-from-scratch fallback. The extra sets are what the shipped model
+    # (or its predecessors) may have seen, so the 'new' group counts only never-seen patients. After a
+    # pipeline release the shipped model was trained on a combined release set, which may hold this very
+    # batch (new reports for it): that set is a --seen set too (none for a legacy-trained model).
+    seen_release, _problem = prospective_seen_release(cfg)
+    seen_release = seen_release if seen_release not in cfg.extra_sets else None
+    prospective_cmd = [py, 'scripts/eval_prospective.py', '--model', BASE_MODEL, '--set', cfg.set_dir]
+    for s in cfg.extra_sets + ([seen_release] if seen_release else []):
+        prospective_cmd += ['--seen', s]
+    prospective_cmd += ['--holdout', cfg.holdout, '--matched', cfg.matched_csv,
+                        '--out', cfg.prospective_json, '--device', cfg.device]
+    seen_release_input = []
+    if seen_release:
+        seen_release_input = [f'{seen_release}/dataset_manifest.json'
+                              if (cfg.repo / seen_release / 'dataset_manifest.json').is_file()
+                              else set_input(cfg.repo, seen_release)]
+    prospective_inputs = [f'{cfg.set_dir}/studies.csv', cfg.matched_csv, cfg.holdout,
+                          *(set_input(cfg.repo, s) for s in cfg.extra_sets), *seen_release_input,
+                          f'{BASE_MODEL}/MANIFEST.json']
 
     label_cmds = [[py, 'scripts/label_reports.py', '--reports', cfg.reports_csv, '--out', cfg.labels_csv]]
     label_inputs = [cfg.reports_csv]
@@ -673,7 +800,9 @@ def build_stages(cfg: Config) -> list[Stage]:
     bundle_cmd = [py, 'packaging/publish_model_bundle.py', '--model', BASE_MODEL,
                   '--out', cfg.release_dir + '/']
     if cfg.github:
-        bundle_cmd += ['--github', cfg.github, '--tag', cfg.tag]
+        # no --tag: the publisher's default tag brain-triage-<identity12> is what the installer CI
+        # looks up by the identity the code pins (packaging/fetch_model_bundle.py --repo)
+        bundle_cmd += ['--github', cfg.github]
 
     # train / gate: one command per candidate (the default warm-only run has exactly one, at the
     # historical candidate path). promote: the candidate the gate chose (cfg.promote_candidate).
@@ -698,23 +827,25 @@ def build_stages(cfg: Config) -> list[Stage]:
               inputs=[root], outputs=[cfg.index_csv],
               good='n studies ≈ number of study folders, error column mostly empty, MR/CT split printed'),
         Stage('parse', 'Parse the hospital reports (PDF folder / xlsx / csv / docx)',
-              [[py, 'scripts/parse_hospital_reports.py', '--src', reports, '--out', cfg.reports_csv]],
-              inputs=[reports], outputs=[cfg.reports_csv],
+              [[py, 'scripts/parse_hospital_reports.py', '--src', *reports, '--out', cfg.reports_csv]],
+              inputs=parse_inputs, outputs=[cfg.reports_csv],
               good='one row per study SECTION, modality from the section header, no patient names'),
         Stage('label', 'Rule-based labels (+ imported LLM labels) + benchmark against the 894-patient reference',
               label_cmds, inputs=label_inputs,
               outputs=[cfg.labels_csv],
               good='agreement on abnormal ≥ 0.90; needs_review share small (< 15%)'),
         Stage('match', 'Join images ↔ reports (patient id + date > modality > only report)',
-              [[py, 'scripts/match_images_to_reports.py', '--images', root, '--index', cfg.index_csv,
-                '--labels', cfg.labels_csv, '--out', cfg.matched_csv]],
+              [match_cmd],
               inputs=[cfg.index_csv, cfg.labels_csv], outputs=[cfg.matched_csv],
               good='most brain studies matched; match_quality mostly "id+date"'),
         Stage('build', 'Export central slices to data/sets/<batch> (binary, resumable)',
-              [[py, 'scripts/build_training_set.py', '--images', root, '--matched', cfg.matched_csv,
-                '--out', cfg.set_dir, '--mode', 'binary', '--abnormal-col', 'abnormal', '--skip-needs-review']],
-              inputs=[cfg.matched_csv], outputs=[cfg.set_dir, f'{cfg.set_dir}/studies.csv'],
+              [build_cmd],
+              inputs=[cfg.matched_csv, 'opt:modality'], outputs=[cfg.set_dir, f'{cfg.set_dir}/studies.csv'],
               good='≈ 5 slices per study, studies.csv row count = matched brain studies minus needs_review'),
+        Stage('prospective', 'Score the model shipped today on the new batch (never-seen patients reported apart)',
+              [prospective_cmd], inputs=prospective_inputs, outputs=[cfg.prospective_json],
+              good=f'{cfg.prospective_json} with kind "{PROSPECTIVE_KIND}"; the "new" group = patients no '
+                   'earlier set contains (informational, not a gate)'),
         Stage('combine', 'Merge all sets, patient-level split (train / val / tune), locked holdout → val',
               [combine_cmd], inputs=combine_inputs,
               outputs=[cfg.release_set, manifest],
@@ -861,7 +992,7 @@ def args_line(cfg: Config) -> str:
     if o['root']:
         parts += ['--root', o['root']]
     if o['reports']:
-        parts += ['--reports', o['reports']]
+        parts += ['--reports', *o['reports']]                 # every source, oldest delivery first
     parts += ['--extra-sets', *o['extra_sets']]
     parts += ['--holdout', o['holdout']]
     if o['train_lock']:
@@ -875,7 +1006,8 @@ def args_line(cfg: Config) -> str:
     parts += ['--skip-benchmark' if o['skip_benchmark'] else '--no-skip-benchmark',
               '--skip-tests' if o['skip_tests'] else '--no-skip-tests']
     parts += ['--local-bundle'] if o['local_bundle'] else ['--github', o['github']]
-    parts += ['--min-normals', str(o['min_normals']), '--min-disk-gb', f'{o["min_disk_gb"]:g}']
+    parts += ['--min-normals', str(o['min_normals']), '--min-disk-gb', f'{o["min_disk_gb"]:g}',
+              '--modality', o['modality']]
     if cfg.multi:
         parts += ['--candidates', ','.join(o['candidates'])]
     return shlex.join(parts)
@@ -888,16 +1020,13 @@ def _resume_hint(cfg: Config) -> str:
 # ------------------------------------------------------------------ guards ----
 
 def guard_pre_train(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
-    """Guard rails that must hold before the (hours-long) train stage."""
+    """Guard rails that must hold before the (hours-long) train stage. The drive is not one of them:
+    train reads only the local release set (slices + symlinks to data/sets)."""
     errors: list[str] = []
     warnings: list[str] = []
     repo = cfg.repo
 
-    # 1. drive mounted
-    if cfg.root is None:
-        warnings.append('no --root given — drive mount not checked')
-    elif not cfg.root.is_dir():
-        errors.append(f'drive not mounted: {cfg.root}')
+    # 1. (no drive check: only index and build read the drive — NEEDS_ROOT)
 
     # 2. label benchmark
     bench = state.get('guards', {}).get('label_benchmark')
@@ -950,6 +1079,13 @@ def guard_pre_train(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
         errors.append(f'only {gb:.1f} GB free (need ≥ {cfg.min_disk_gb:.0f} GB for slices + checkpoints)')
 
     return errors, warnings
+
+
+def guard_pre_prospective(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
+    """The set the shipped model was trained on must be a --seen set, or 'new' is not never-seen
+    (fail closed: never score with an incomplete --seen list)."""
+    _seen, problem = prospective_seen_release(cfg)
+    return ([problem] if problem else []), []
 
 
 def guard_pre_combine(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
@@ -1009,17 +1145,20 @@ def guard_pre_bundle(cfg: Config, state: dict) -> tuple[list[str], list[str]]:
 
 
 GUARDS: dict[str, Callable[[Config, dict], tuple[list[str], list[str]]]] = {
+    'prospective': guard_pre_prospective,
     'combine': guard_pre_combine,
     'train': guard_pre_train,
     'bundle': guard_pre_bundle,
 }
 GUARD_TEXT = {
+    'prospective': ['the release set the shipped model was trained on (if any) is present and unchanged, '
+                    'so it is passed as --seen, or --train-lock names it as a directory'],
     'combine': ['the set the current model was trained on is present and unchanged (its patients are '
                 'locked to train), or --train-lock is given'],
     'train': ['label benchmark passed (or --skip-benchmark)',
               f'matched brain studies + normal count (warn < {MIN_NORMALS_DEFAULT} normals)',
               'dataset_manifest.json present, no train/val/tune patient overlap, holdout ⊂ val, tune/ present',
-              f'≥ {MIN_DISK_GB_DEFAULT:.0f} GB free disk', 'drive mounted'],
+              f'≥ {MIN_DISK_GB_DEFAULT:.0f} GB free disk'],
     'bundle': ['gate.passed true and promotion.promote true in the promoted model',
                'promote_model.eval_verdict: release floors, production protocol, release val set, eval pinned '
                'to these weights',
@@ -1095,6 +1234,10 @@ def stage_is_done(cfg: Config, stage: Stage, state: dict,
     --from/--only names this stage. Changed inputs always force a re-run."""
     stages = state.get('stages', {})
     rec = stages.get(stage.name)
+    if rec is None and stage.name in FROZEN_AFTER_PROMOTE and archived_candidate(state):
+        # promoted by a version that did not have this stage (prospective): not applicable — the
+        # release can only be finished (bump, bundle), never re-run up to promote under this tag
+        return True, NOT_APPLICABLE_AFTER_PROMOTE
     if not rec or rec.get('status') not in DONE_STATUSES:
         return False, ''
     if stage.name in FROZEN_AFTER_PROMOTE and archived_candidate(state):
@@ -1109,6 +1252,10 @@ def stage_is_done(cfg: Config, stage: Stage, state: dict,
         consumed = rec.get('status') == 'archived' or later_done
         if stage.name in explicit or not consumed:
             return False, f'outputs missing: {missing}'
+    if stage.name == 'prospective' and (cfg.repo / cfg.prospective_json).is_file():
+        problem = prospective_problem(cfg.repo / cfg.prospective_json)
+        if problem:
+            return False, f'outputs invalid: {problem}'
     recorded = rec.get('input_sha256s')
     if recorded and inputs_changed(recorded, input_fingerprints(cfg, stage, state)):
         return False, 'inputs changed since the last run'
@@ -1118,11 +1265,15 @@ def stage_is_done(cfg: Config, stage: Stage, state: dict,
 def inputs_changed(recorded: dict, current: dict) -> bool:
     """A directory input (the drive, the reports folder: 'dir:<n>') that is now absent is
     'cannot tell', not 'changed' — unplugging the drive after build must not re-run index.
-    An option input ('opt:…') that a state written before it existed did not record is not a change."""
+    An option input ('opt:…') that a state written before it existed did not record is not a change —
+    unless the old behaviour differs from the new default (LEGACY_OPTION_VALUES: a build recorded
+    before the MR-only rule ran with modality 'any' and is re-run under the current rule)."""
     for k in set(recorded) | set(current):
         r, c = recorded.get(k), current.get(k)
         if isinstance(r, str) and r.startswith('dir:') and c == 'missing':
             continue
+        if k.startswith('opt:') and r is None and k in LEGACY_OPTION_VALUES and k in current:
+            r = LEGACY_OPTION_VALUES[k]
         if k.startswith('opt:') and r is None:
             continue
         if r != c:
@@ -1440,12 +1591,23 @@ def run_stage(cfg: Config, stage: Stage, state: dict) -> int:
             print(f'{R}✗ stage {stage.name} finished but expected outputs are missing: {missing}{NC}')
             print(f'  log     : {cfg.rel(log)}')
             return 1
+        problem = prospective_problem(cfg.repo / cfg.prospective_json) if stage.name == 'prospective' else None
+        if problem:
+            rec.update(status='failed', finished=now_iso(), returncode=0, error=problem)
+            save_state(cfg.state_path, state)
+            print(f'{R}✗ stage {stage.name} finished but its output is not usable: {problem}{NC}')
+            print(f'  log     : {cfg.rel(log)}')
+            return 1
     rec.update(status='done', finished=now_iso(), returncode=0)
     if stage.name == 'promote' and not cfg.dry_run:
         _archive_candidate(cfg, state, rec)
     if not cfg.dry_run:
         save_state(cfg.state_path, state)
     print(f'{G}✓ stage {stage.name} done{NC}' + (f'  — good: {stage.good}' if stage.good else ''))
+    if stage.name == 'prospective' and not cfg.dry_run:
+        headline = prospective_headline(cfg.repo / cfg.prospective_json)
+        if headline:
+            print(f'  {headline}')
     return 0
 
 
@@ -1462,9 +1624,10 @@ def manual_steps(cfg: Config) -> list[str]:
     ver = app_version(cfg.repo)
     nxt = next_minor_version(ver)
     return [
-        'Copy the manifest asset API URL printed by the bundle stage into the GitHub environment '
-        'secret MODEL_BUNDLE_URL (repo Settings → Environments → MODEL_BUNDLE_URL); keep '
-        'MODEL_BUNDLE_TOKEN valid.',
+        'Nothing to paste: the installer CI finds the release brain-triage-<identity12> in the models '
+        f'repository ({cfg.github or GITHUB_MODELS_REPO}; repository variable MODEL_BUNDLE_REPO) by the identity '
+        'the committed bump pins. Keep the MODEL_BUNDLE_TOKEN secret (repo Settings → Environments → '
+        'MODEL_BUNDLE_URL) able to read that repository; the MODEL_BUNDLE_URL secret is only a fallback.',
         'Review the bump: git status && git diff — then git add ONLY the files the bump stage listed '
         f'(never data/ or models/) && git commit -m "release: {cfg.tag} — bump validated numbers"',
         f'EVERY release bumps "version" in desktop-app/package.json (currently {ver}; a model-only release '
@@ -1475,13 +1638,16 @@ def manual_steps(cfg: Config) -> list[str]:
         f'docs/test_docs_consistency.py::test_app_version_quoted_in_docs_matches_the_code fails otherwise; '
         f'commit it, then '
         f'git tag v{nxt} && git push origin main && git push origin v{nxt}   '
-        '(pushing the tag starts the "Build installers" CI workflow; its "Verify bundle identity matches '
-        'the code" step fails unless the committed bump and the MODEL_BUNDLE_URL secret name the same model)',
-        'Download the installer artifact from the Actions run (or the draft GitHub release).',
+        '(push the bump commit BEFORE the tag: pushing the tag starts the "Build installers" CI workflow, '
+        'which restores the model release that commit pins, fails when it is missing, and re-checks it in '
+        '"Verify bundle identity matches the code")',
+        "Download the installers from the tag's DRAFT GitHub release (an installer that contains the model "
+        'is never a workflow artifact of the public repository).',
         'Run docs/windows_laptop_test_en.md (RU: docs/windows_laptop_test_ru.md) on a Windows laptop, '
         'Wi-Fi off; tick every box.',
-        'Publish the draft release (installer + release notes with the new sensitivity / specificity '
-        'and the model identity).',
+        'Do NOT publish the draft release while it holds the full installer: on the public code '
+        'repository that would make the model downloadable by anyone. Hand the installer to the clinic '
+        'directly, with the new sensitivity / specificity and the model identity in the hand-over notes.',
         f'Keep {cfg.release_dir}/ (state.json = stage + guard verdicts, logs/guards.log = guard evidence, '
         'logs/, bundle parts) until the hospital confirms the install.',
     ]
@@ -1504,6 +1670,10 @@ def cmd_plan(cfg: Config, stages: list[Stage]) -> int:
     lock_problem = None if cfg.train_lock else train_lock_problem(cfg.repo, cfg.release_set)
     print(f'# train-locked patients (the current model was trained on them): '
           f'{cfg.train_lock or ("!! NONE — " + lock_problem if lock_problem else "(legacy train/ only)")}')
+    print(f'# report sources (oldest delivery first): {" ".join(cfg.report_sources) or "(none)"}')
+    print('# modality rule (build): ' + (f'none (--modality {MODALITY_ANY})' if cfg.modality == MODALITY_ANY
+                                         else f'{cfg.modality} only (--modality {cfg.modality})'))
+    print(f'# prospective: scores the model shipped today ({BASE_MODEL}) before this release replaces it')
     if cfg.multi:
         print('# candidates: ' + '; '.join(
             f'{c} from {cfg.candidate_base(c)}{" (--base-model-fresh)" if c == "fresh" else ""} → '
@@ -1519,10 +1689,11 @@ def cmd_plan(cfg: Config, stages: list[Stage]) -> int:
             print(f'#     guard: {t}')
         for c in s.cmds:
             print(shlex.join(c))
-    print('\n# --- manual: set MODEL_BUNDLE_URL secret, commit the bump, bump desktop-app/package.json version '
+    print('\n# --- manual: commit + push the bump (no secret to edit: CI finds the model by the pinned identity; '
+          'MODEL_BUNDLE_TOKEN must read the models repo), bump desktop-app/package.json version '
           '(every release) + server APP_VERSION + the version lines of the 12 hospital docs, '
-          'git tag v<new app version>, git push tag, download installer, '
-          'run docs/windows_laptop_test_*.md, publish the release')
+          'git tag v<new app version>, git push tag, download the installer from the DRAFT release, '
+          'run docs/windows_laptop_test_*.md, never publish the draft release (public repository)')
     return 0
 
 
@@ -1534,6 +1705,9 @@ def cmd_status(cfg: Config, stages: list[Stage]) -> int:
     col = {'done': G, 'archived': G, 'failed': R, 'running': Y}
     for s in stages:
         rec = state.get('stages', {}).get(s.name)
+        if rec is None and s.name in FROZEN_AFTER_PROMOTE and archived_candidate(state):
+            print(f'  {s.name:<8} skipped ({NOT_APPLICABLE_AFTER_PROMOTE})')
+            continue
         if rec is None:
             print(f'  {s.name:<8} {"pending":<8}')
             continue
@@ -1585,7 +1759,8 @@ def cmd_run(cfg: Config, stages: list[Stage], selected: list[Stage],
         if cfg.resume:
             done, why = stage_is_done(cfg, s, state, explicit)
             if done:
-                print(f'{G}↷ stage {s.name} already done — skipped{NC}')
+                print(f'{G}↷ stage {s.name} skipped ({why}){NC}' if why else
+                      f'{G}↷ stage {s.name} already done — skipped{NC}')
                 continue
             if why:
                 print(f'{Y}↻ stage {s.name} re-run: {why}{NC}')
@@ -1597,6 +1772,11 @@ def cmd_run(cfg: Config, stages: list[Stage], selected: list[Stage],
             print(f'  finish this release with: {_resume_hint(cfg)}')
             print(f'  or start a new release:   {shlex.quote(cfg.python)} scripts/release_pipeline.py run '
                   f'--batch {cfg.batch} --tag {next_new_tag(cfg.repo)} …')
+            return EXIT_USAGE
+        if s.name in NEEDS_ROOT and not cfg.dry_run and cfg.root is not None and not cfg.root.is_dir():
+            # the stages before it that need no drive (parse, label, match) have run: stop cleanly here
+            print(f'{R}✗ drive not mounted: {cfg.root} (needed by stage {s.name}){NC}')
+            print(f'  plug in the drive, then: {_resume_hint(cfg)}')
             return EXIT_USAGE
         if not run_guards(cfg, s.name, state):
             if not cfg.dry_run:
@@ -1648,8 +1828,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('command', choices=SUBCOMMANDS,
                     help='plan (print copy-pasteable shell) | run/all | status | <stage> (run that stage only)')
     ap.add_argument('--batch', required=True, help='batch name, e.g. new1 → data/new1_*.csv, data/sets/new1')
-    ap.add_argument('--root', default=None, help='drive root with the study folders (index/match/build read it)')
-    ap.add_argument('--reports', default=None, help='folder of report PDFs, or one .xlsx/.csv/.docx (parse stage)')
+    ap.add_argument('--root', default=None,
+                    help='drive root with the study folders (index/build read it; match gets --images when given)')
+    ap.add_argument('--reports', nargs='+', action='extend', default=None, metavar='SRC',
+                    help='report sources for the parse stage, OLDEST delivery first: folders of report PDFs '
+                         'and/or .xlsx/.csv/.docx files (repeating the flag appends; the order is part of '
+                         'the parse fingerprint)')
     ap.add_argument('--tag', help='release tag (default: data/release/LATEST while that release is unfinished, '
                                   'else the next unused brain-triage-v<N>)')
     ap.add_argument('--extra-sets', nargs='*', default=None,
@@ -1666,6 +1850,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help='models to train + gate (default warm). warm starts from --base-model; fresh from '
                          f'{PUBLIC_VIT_BASE} (else {PUBLIC_VIT_HUB_ID} from the HF cache) with a new head. '
                          'promote takes the best that passed the gate by balanced accuracy (tie → warm)')
+    ap.add_argument('--modality', default=None,
+                    help=f'build only studies of this modality (default {DEFAULT_MODALITY}: the MR-only rule; '
+                         f'"{MODALITY_ANY}" disables the rule)')
     ap.add_argument('--from', dest='from_', choices=STAGE_ORDER, help='start at this stage')
     ap.add_argument('--only', choices=STAGE_ORDER, help='run this stage only')
     ap.add_argument('--resume', action='store_true', help='skip stages recorded as done in state.json')
@@ -1712,19 +1899,24 @@ def config_from_args(a: argparse.Namespace) -> Config:
             if v != default:
                 inherited[k] = v
         o[k] = default if v is None else v
+    # a state.json written before --reports took several sources stores ONE string
+    reports = [o['reports']] if isinstance(o['reports'], str) else list(o['reports'] or [])
+    if 'reports' in inherited:
+        inherited['reports'] = reports
     llm_labels = o['llm_labels']
     if llm_labels:
         llm_labels = Config(repo=repo, batch=a.batch, tag=tag).rel(Path(llm_labels).expanduser())
     return Config(
         repo=repo, batch=a.batch, tag=tag,
         root=Path(o['root']).expanduser() if o['root'] else None,
-        reports=Path(o['reports']).expanduser() if o['reports'] else None,
+        reports=[Path(r).expanduser() for r in reports],
         extra_sets=list(o['extra_sets']), holdout=o['holdout'], train_lock=o['train_lock'],
         epochs=int(o['epochs']), device=o['device'], python=o['python'], base_model=o['base_model'],
         skip_benchmark=bool(o['skip_benchmark']), skip_tests=bool(o['skip_tests']),
         github=None if o['local_bundle'] else o['github'], label_llm=o['label_llm'], llm_labels=llm_labels,
         min_normals=int(o['min_normals']), min_disk_gb=float(o['min_disk_gb']),
         candidates=[c for c in CANDIDATE_KINDS if c in (o['candidates'] or DEFAULT_CANDIDATES)],
+        modality=str(o['modality']),
         dry_run=a.dry_run, resume=a.resume, tag_source=source, inherited=inherited,
     )
 
@@ -1754,22 +1946,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     selected = select_stages(stages, only, a.from_)
     explicit = frozenset(x for x in (only, a.from_) if x)
 
-    needs_root = {'index', 'match', 'build'}
+    needs_root = set(NEEDS_ROOT)
     needs_reports = {'parse'}
     wanted = {s.name for s in selected}
     if wanted & needs_root and cfg.root is None:
         print(f'{R}✗ --root is required for stages {sorted(wanted & needs_root)}{NC}')
         return EXIT_USAGE
-    if wanted & needs_reports and cfg.reports is None:
+    if wanted & needs_reports and not cfg.reports:
         print(f'{R}✗ --reports is required for the parse stage{NC}')
         return EXIT_USAGE
     if not cfg.dry_run and wanted & needs_root and not cfg.root.is_dir():
-        # a stage that --resume will skip does not need the drive
+        # a stage that --resume will skip does not need the drive. Refuse up front only when the
+        # first stage to run needs it; otherwise the stages before it run and cmd_run stops at it.
         state = load_state(cfg.state_path) if cfg.resume else {}
-        todo = {s.name for s in selected if s.name in needs_root and
-                not (cfg.resume and stage_is_done(cfg, s, state, explicit)[0])}
-        if todo:
-            print(f'{R}✗ drive not mounted: {cfg.root}{NC}')
+        first = next((s for s in selected if not (cfg.resume and stage_is_done(cfg, s, state, explicit)[0])), None)
+        if first is not None and first.name in needs_root:
+            print(f'{R}✗ drive not mounted: {cfg.root} (needed by stage {first.name}){NC}')
             return EXIT_USAGE
 
     return cmd_run(cfg, stages, selected, explicit)

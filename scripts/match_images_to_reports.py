@@ -27,9 +27,9 @@
   PHI: keeps only patient_id (the join key) + study folder; never names.
 
   Usage:
-    python scripts/match_images_to_reports.py \
-        --images "<image folder>" --index data/<batch>_index.csv \
+    python scripts/match_images_to_reports.py --index data/<batch>_index.csv \
         --labels data/<batch>_labels.csv --out data/<batch>_matched.csv
+    (without an index: --images "<image folder>" instead of --index)
 ================================================================================
 """
 from __future__ import annotations
@@ -160,13 +160,16 @@ def make_row(folder: str, pid: str, modality: str, bp: str, study_date: str, bra
 
 def main() -> None:
     ap = argparse.ArgumentParser(description='Join DICOM image studies to labelled report rows by patient_id.')
-    ap.add_argument('--images', required=True, help='root folder with one sub-folder per study')
+    ap.add_argument('--images', default=None,
+                    help='root folder with one sub-folder per study (required without --index; unused with it)')
     ap.add_argument('--labels', default='data/hospital_reports_labels.csv',
                     help='labelled report rows (label_reports.py output; old hospital_reports_labels.csv also works)')
     ap.add_argument('--out', default='data/matched_dataset.csv')
     ap.add_argument('--index', default=None,
                     help='study index CSV from scripts/index_new_studies.py — skips the DICOM walk (fast path)')
     args = ap.parse_args()
+    if not args.index and not args.images:
+        ap.error('--images is required when no --index is given (the study folders are walked for headers)')
 
     labels_path = Path(args.labels)
     if not labels_path.is_file():
@@ -177,7 +180,6 @@ def main() -> None:
     if n_reports == 0:
         print(f'{R}no report rows with a patient_id in {labels_path}{NC}'); sys.exit(1)
 
-    img_root = Path(args.images)
     study_iter: Optional[list[tuple]] = None
     study_dirs: list[Path] = []
     if args.index:
@@ -188,6 +190,7 @@ def main() -> None:
                        r.get('body_part') or '', '', r.get('study_description') or '', r.get('study_date') or '')
                       for r in idx_rows]
     else:
+        img_root = Path(args.images)
         if not img_root.is_dir():
             print(f'{R}image root not found: {img_root}{NC}'); sys.exit(1)
         study_dirs = sorted(d for d in img_root.iterdir() if d.is_dir())

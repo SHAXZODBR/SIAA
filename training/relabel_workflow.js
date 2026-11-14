@@ -30,6 +30,29 @@
 //       python scripts/label_reports.py --reports data/<batch>_reports.csv \
 //         --out data/<batch>_labels.csv --import-llm-labels data/<batch>_llm_labels.jsonl
 //
+//  DIRECT MODE (large exports — a full second read of every brain row):
+//    Workflow({ scriptPath: 'training/relabel_workflow.js',
+//               args: { file: '/abs/path/data/<batch>_review_all.jsonl', n_lines: <wc -l>,
+//                       batch: 100, votes: 1, model: 'opus' } })
+//    With args.n_lines there is NO reader agent: every labelling agent prints its
+//    own line range with awk (row number first, so nobody counts lines), writes
+//    `<file>.labels/v<vote>-b<batch>.tsv` (`<row>\t<patient_id>\t<label>`) and
+//    returns the same entries. votes: 3 = three independent reads of every row
+//    (adjudication of disputed rows). The script cannot see the file, so it does
+//    NOT verify anything in this mode:
+//      python scripts/collect_llm_labels.py --export <file> --parts <file>.labels \
+//        --rules data/<batch>_labels_rules.csv --out <llm_labels.jsonl> --disputed <disputed.jsonl>
+//    --rules is the RULES-ONLY labels file, written once per batch by
+//      python scripts/label_reports.py --reports data/<batch>_reports.csv \
+//        --out data/<batch>_labels_rules.csv --export-for-llm <file> --all
+//    never data/<batch>_labels.csv (--import-llm-labels and release_pipeline.py
+//    overwrite that one; the collector refuses a file holding imported labels).
+//    Delete <file>.labels/ before each run: part files of an earlier run stay.
+//    checks every line against the export (row ↔ patient_id), takes the 4-part
+//    key from the EXPORT (never from an agent) and writes the import-ready JSONL.
+//    args.batch (default 75) and args.model (default: the session model) also
+//    apply to the reader mode above.
+//
 //  PHI: the JSONL carries only patient_id / study_date / modality / section_index /
 //       conclusion — no names.
 //       Agents must never print anything else from data/.
@@ -40,8 +63,8 @@ export const meta = {
   name: 'relabel-brain-reports',
   description: 'LLM-label brain report conclusions (9 findings + abnormal) from an --export-for-llm JSONL',
   phases: [
-    { title: 'Read', detail: 'load the JSONL exported by label_reports.py' },
-    { title: 'Label', detail: 'batches of 75 conclusions, one agent each' },
+    { title: 'Read', detail: 'load the JSONL exported by label_reports.py (skipped with args.n_lines)' },
+    { title: 'Label', detail: 'batches of conclusions (default 75), one agent per batch and vote' },
   ],
 }
 
@@ -60,7 +83,11 @@ const RUBRIC =
   'the brain itself is normal.'
 
 const LABELS = ['normal', 'tumor', 'stroke', 'atrophy', 'hemorrhage', 'ms_wml', 'hydrocephalus', 'cyst', 'other']
-const BATCH = 75
+const intArg = (v, dflt) => (Number.isInteger(v) && v > 0 ? v : dflt)
+const BATCH = intArg(args && args.batch, 75)
+// args.model: e.g. 'opus'. Omitted → every agent inherits the session model.
+const MODEL = args && typeof args.model === 'string' && args.model ? args.model : null
+const withModel = opts => (MODEL ? { ...opts, model: MODEL } : opts)
 
 const READ_SCHEMA = {
   type: 'object',
@@ -113,6 +140,96 @@ const LABEL_SCHEMA = {
 const file = args && args.file
 if (!file) throw new Error('args.file is required: the JSONL written by label_reports.py --export-for-llm')
 
+const NEGATION_RULES =
+  'Negations matter: a keyword inside "не выявлено / без патологии / ' +
+  'не изменены / отсутствуют" is NOT a finding; hedges ("нельзя исключить", "не исключается", "под вопросом", ' +
+  '"(?)") are NOT negations — keep the hedged finding.'
+
+// ------------------------------------------------------- Direct mode (n_lines)
+// Every agent reads its own line range; nothing is verified here (no filesystem
+// access) — scripts/collect_llm_labels.py checks every returned row against the
+// export and builds the import file with the export's own key fields.
+const DIRECT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['labels'],
+  properties: {
+    labels: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['row', 'patient_id', 'label'],
+        properties: {
+          row: { type: 'integer' },
+          patient_id: { type: 'string' },
+          label: { type: 'string', enum: LABELS },
+        },
+      },
+    },
+  },
+}
+// One extra sentence per vote so three reads of one batch are not three copies.
+const VOTE_HINTS = [
+  '',
+  ' Work in two steps for every report: first decide whether the BRAIN ITSELF is normal, then choose the finding.',
+  ' Read every conclusion to its last sentence before deciding: the most significant brain finding is often not the first one named.',
+]
+const N_LINES = args && args.n_lines
+if (N_LINES !== undefined && N_LINES !== null) {
+  if (!Number.isInteger(N_LINES) || N_LINES < 1) throw new Error('args.n_lines must be the line count of args.file (wc -l)')
+  const VOTES = intArg(args.votes, 1)
+  const outDir = (typeof args.out_dir === 'string' && args.out_dir) || `${file}.labels`
+  phase('Label')
+  const jobs = []
+  for (let v = 0; v < VOTES; v++) {
+    for (let a = 1, b = 0; a <= N_LINES; a += BATCH, b++) jobs.push({ v, b, a, z: Math.min(N_LINES, a + BATCH - 1) })
+  }
+  log(`direct mode: ${N_LINES} line(s), batches of up to ${BATCH}, ${VOTES} vote(s) → ${jobs.length} agent(s); parts → ${outDir}`)
+
+  const labelRange = job => agent(
+    RUBRIC + (VOTE_HINTS[job.v % VOTE_HINTS.length] || '') +
+    '\n\nYou label ONE slice of a JSONL export of report conclusions (hospital data: numeric ids only, no names). ' +
+    'The file path is absolute, or relative to the repo root /Users/shakhzodbtr/Desktop/Siaa_ai/sentinel. ' +
+    'Print your slice with exactly this command:\n\n' +
+    `  awk 'NR>=${job.a} && NR<=${job.z} {print NR-1 "\\t" $0}' '${file}'\n\n` +
+    `Every output line is "<row><TAB><json>" (keys patient_id, study_date, modality, section_index, conclusion). ` +
+    `Your slice is rows ${job.a - 1}..${job.z - 1} — ${job.z - job.a + 1} line(s). If the output is cut off, print the ` +
+    'rest in smaller NR ranges with the same awk pattern; never label a line you did not see.\n\n' +
+    'Label EVERY row on its own (the same patient may appear more than once, e.g. CT and MR on one day). ' +
+    'label must be one of ' + LABELS.join(' | ') + '. ' + NEGATION_RULES +
+    ' If a conclusion is empty or says nothing at all about the head, OMIT that row.\n\n' +
+    `Then write your labels to '${outDir}/v${job.v + 1}-b${job.b + 1}.tsv' (mkdir -p the directory first; a heredoc ` +
+    'with a quoted delimiter is fine): one line per row, "<row><TAB><patient_id><TAB><label>", real TAB characters, ' +
+    'no header, row and patient_id copied verbatim from the printed line. Finally return the same entries in the ' +
+    'structured result. Do not print or echo the conclusions anywhere else, and do not write any other file.',
+    withModel({ label: `label-v${job.v + 1}-b${job.b + 1}`, phase: 'Label', schema: DIRECT_SCHEMA }),
+  )
+
+  const directResults = await pipeline(jobs, job => labelRange(job))
+  const got = new Set()
+  const tsv = []
+  const missing = []
+  jobs.forEach((job, i) => {
+    const r = directResults[i]
+    const list = (r && Array.isArray(r.labels)) ? r.labels : []
+    for (const l of list) {
+      if (!l || !Number.isInteger(l.row) || l.row < job.a - 1 || l.row > job.z - 1) continue   // garbage / outside its own slice
+      const k = `${job.v}:${l.row}`
+      if (got.has(k)) continue
+      got.add(k)
+      tsv.push(`${job.v + 1}\t${l.row}\t${String(l.patient_id)}\t${l.label}`)
+    }
+    for (let row = job.a - 1; row <= job.z - 1; row++) if (!got.has(`${job.v}:${row}`)) missing.push({ vote: job.v + 1, row })
+  })
+  if (missing.length) log(`${missing.length} (vote,row) pair(s) came back without a label — re-run, or they stay with the rule labels`)
+  log(`direct mode: ${tsv.length}/${N_LINES * VOTES} labels`)
+  // `rows` = "<vote>\t<row>\t<patient_id>\t<label>": collect_llm_labels.py --result
+  // cross-checks the part files of out_dir with it, and uses it instead of them when
+  // the run left no part file at all.
+  return { mode: 'direct', file, out_dir: outDir, n_in: N_LINES, votes: VOTES, batch: BATCH, n_out: tsv.length, missing, rows: tsv }
+}
+
 // ---------------------------------------------------------------- Phase: Read
 phase('Read')
 const readResult = await agent(
@@ -123,7 +240,7 @@ const readResult = await agent(
   `modality or section_index — and conclusion verbatim). Do not summarise, skip or de-duplicate ` +
   `anything, and do not print the file contents anywhere except in your structured result ` +
   `(it is hospital data — numeric ids only, no names).`,
-  { label: 'read-jsonl', phase: 'Read', schema: READ_SCHEMA },
+  withModel({ label: 'read-jsonl', phase: 'Read', schema: READ_SCHEMA }),
 )
 const rows = (readResult && readResult.rows) || []
 log(`read ${rows.length} conclusions from ${file}`)
@@ -150,12 +267,10 @@ const labelBatch = (batch, idx) => agent(
   'and patient_id, study_date, modality and section_index are copied verbatim (all strings, "" stays ""). ' +
   'The same patient may appear more than once (e.g. CT and MR on one day) — label each row on its own. ' +
   'label must be one of ' + LABELS.join(' | ') + '; abnormal is a boolean and is ' +
-  'false ONLY when label is normal. Negations matter: a keyword inside "не выявлено / без патологии / ' +
-  'не изменены / отсутствуют" is NOT a finding; hedges ("нельзя исключить", "не исключается", "под вопросом", ' +
-  '"(?)") are NOT negations — keep the hedged finding. Do not print or echo the reports anywhere except in the ' +
+  'false ONLY when label is normal. ' + NEGATION_RULES + ' Do not print or echo the reports anywhere except in the ' +
   'structured result.\n\nREPORTS (JSON lines):\n' +
   batch.map((r, k) => JSON.stringify({ row: idx * BATCH + k, ...norm(r), conclusion: r.conclusion })).join('\n'),
-  { label: `label-batch-${idx + 1}`, phase: 'Label', schema: LABEL_SCHEMA },
+  withModel({ label: `label-batch-${idx + 1}`, phase: 'Label', schema: LABEL_SCHEMA }),
 )
 
 const results = await pipeline(batches, (batch, _item, idx) => labelBatch(batch, idx))

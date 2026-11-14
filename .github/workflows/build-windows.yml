@@ -6,33 +6,58 @@
 #             without the validated model and the artifact is named ...-NO-VALIDATED-MODEL; the model
 #             then reaches each clinic as a bundle encrypted for that PC (packaging/provision_clinic.py,
 #             docs/vendor_provisioning_en.md). Tag pushes always restore the model (full flavour);
-#             only the full flavour is attached to a tag's draft release (a clinic-flavour run
-#             dispatched on a tag ref keeps its installer as a workflow artifact only).
+#             only a model-bearing installer is attached to a tag's draft release (a clinic-flavour
+#             run dispatched on a tag ref keeps its installer as a workflow artifact only).
 #   gate      job `tests` (ubuntu, CPU torch) runs `pytest -q -m "not slow"`, the docs drift guard and
 #             the desktop tests (type-check + `npm test`); both installer jobs `needs: tests`, so a red
 #             suite never produces an installer.
-#   output    artifact  sentinel-windows-x64-{full|UNVALIDATED-DEMO|NO-VALIDATED-MODEL}   <- desktop-app/release/*.exe
-#             artifact  sentinel-macos-arm64-{full|UNVALIDATED-DEMO|NO-VALIDATED-MODEL}   <- desktop-app/release/*.dmg
-#             (UNVALIDATED-DEMO = a bundle published with --allow-unvalidated; a v* tag build refuses it)
-#             artifacts expire after 1 day (retention-days: 1 — the repository is public; download
-#             the installer right after the run). Tag builds also attach the files to a DRAFT GitHub
-#             Release for the tag (never published automatically).
+#   output    The repository is PUBLIC: any signed-in GitHub user can download a workflow artifact while
+#             it is retained, whereas draft-release assets are visible only to people with write access.
+#             So the installer leaves the runner by exactly one route, decided by have_bundle (the
+#             restore step's output):
+#             - NO model inside (clinic flavour, or a branch build without a bundle): workflow artifact
+#                 sentinel-windows-x64-NO-VALIDATED-MODEL   <- desktop-app/release/*.exe
+#                 sentinel-macos-arm64-NO-VALIDATED-MODEL   <- desktop-app/release/*.dmg
+#               expiring after 1 day (retention-days: 1; download it right after the run);
+#             - model inside (full, or UNVALIDATED-DEMO = a bundle published with --allow-unvalidated):
+#               NEVER a workflow artifact. On a v* tag it is attached to the tag's DRAFT GitHub Release
+#               (never published automatically; a tag build refuses UNVALIDATED-DEMO bundles before
+#               that; a release that is already PUBLISHED is never uploaded to: the step fails instead). On a branch (Run workflow with include_validated_model = true) the build is a
+#               rehearsal: it builds and smoke-tests, uploads nothing and says so (::notice + job
+#               summary) — push a v* tag to receive the installer in the tag's draft release.
+#   tag gate  On a v* tag the restore runs with --require: a missing bundle (no token, no release)
+#             fails the build — a release tag never produces a model-less "full" installer. Branch
+#             builds warn and continue without the model. With it --require-newest: the build fails when
+#             the models repository holds a brain-triage-* release created after the pinned one (tag
+#             pushed without the bump commit); override for a deliberate older rebuild:
+#             repository variable MODEL_BUNDLE_ALLOW_OLDER=1 (warning instead).
 #
 # Installer jobs: checkout -> Python 3.11 venv with CPU-only PyTorch -> PyInstaller freeze
 # (packaging/build_backend.{ps1,sh}) -> public models (scripts/download_all_models.py) ->
-# validated model from the MODEL_BUNDLE_URL secret (packaging/fetch_model_bundle.py) ->
+# validated model from the private models repository (packaging/fetch_model_bundle.py: release
+# brain-triage-<identity12> of MODEL_BUNDLE_REPO, identity = the code pin) ->
 # bundle identity == the identity the code pins (src/inference/validated_metrics.py FALLBACK_IDENTITY,
 # rewritten by scripts/bump_model_release.py) -> bundled release record (evaluated_on, counts) == the code
 # pin (packaging/check_bundle_release.py) -> /health smoke of the frozen exe (packaging/smoke_backend.{ps1,sh}) -> npm ci + type-check ->
-# electron-builder -> upload.
+# electron-builder -> artifact (no model) | draft release (model, v* tag) | nothing (model, branch).
 #
-# Secrets (Settings -> Secrets and variables -> Actions); every one is optional:
-#   MODEL_BUNDLE_URL      zip of models/brain_triage_finetuned (validated triage model — never in
-#                         git, not downloadable). ABSENT -> the installer is built WITHOUT it, the
-#                         artifact is named ...-NO-VALIDATED-MODEL and every install reports
-#                         /health status 'degraded'. Layout + verification: packaging/fetch_model_bundle.py
-#   MODEL_BUNDLE_TOKEN    bearer token for that URL (private GitHub Release asset via its API URL;
-#                         an asset of THIS repo needs none — the job's GITHUB_TOKEN is used)
+# Repository variable (Settings -> Secrets and variables -> Actions -> Variables), optional:
+#   MODEL_BUNDLE_REPO     OWNER/NAME of the private models repository that packaging/publish_model_bundle.py
+#                         publishes to (unset -> SHAXZODBR/SIAA-models). The restore step looks up the
+#                         release brain-triage-<identity12> there, <identity12> being the identity the
+#                         checked-out commit pins — nothing is edited per model release.
+#   MODEL_BUNDLE_ALLOW_OLDER  1 = a tag build of an OLDER model than the newest in the models repository
+#                         only warns (deliberate rebuild); unset/anything else = it fails (--require-newest).
+#
+# Secrets (Settings -> Secrets and variables -> Actions; environment MODEL_BUNDLE_URL); every one is optional:
+#   MODEL_BUNDLE_TOKEN    the one secret that matters for the model: a token that can READ the models
+#                         repository (fine-grained PAT, "Contents: read"). ABSENT -> branch builds are
+#                         built WITHOUT models/brain_triage_finetuned (artifact ...-NO-VALIDATED-MODEL,
+#                         /health 'degraded' on every install); a v* tag build fails.
+#                         Layout + verification: packaging/fetch_model_bundle.py
+#   MODEL_BUNDLE_URL      optional fallback, no longer edited per model release: a bundle URL read
+#                         only when no models repository is configured (this workflow always
+#                         configures one, so CI resolves by identity)
 #   WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD   Authenticode certificate (.pfx as base64 or URL) + password,
 #                         read by electron-builder. ABSENT -> unsigned installer: Windows SmartScreen
 #                         shows "Windows protected your PC" on first run (More info -> Run anyway).
@@ -49,7 +74,7 @@ on:
   workflow_dispatch:
     inputs:
       include_validated_model:
-        description: 'Include the validated triage model (MODEL_BUNDLE_URL). Untick for the clinic flavour (...-NO-VALIDATED-MODEL): the model is delivered per clinic, encrypted for that PC.'
+        description: 'Include the validated triage model (from the private models repository). On a branch such an installer is NOT uploaded (rehearsal; push a v* tag for the draft release). Untick for the clinic flavour (artifact ...-NO-VALIDATED-MODEL): the model is delivered per clinic, encrypted for that PC.'
         type: boolean
         required: false
         default: true
@@ -207,19 +232,31 @@ jobs:
           Write-Host '::notice title=Clinic flavour::include_validated_model=false - the installer is built WITHOUT the validated triage model (artifact ...-NO-VALIDATED-MODEL). Deliver the model per clinic with packaging/provision_clinic.py (docs/vendor_provisioning_en.md).'
           '## Clinic flavour: validated model deliberately excluded (include_validated_model=false)' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
-      - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
+      # Release brain-triage-<code-pinned identity> of MODEL_BUNDLE_REPO (MODEL_BUNDLE_URL: fallback only).
+      # On a v* tag --require: a missing bundle fails the build instead of shipping a model-less installer;
+      # and --require-newest: the build fails when the models repository holds a model release created
+      # after the pinned one (a tag pushed without the bump commit). Deliberate rebuild of an older model:
+      # repository variable MODEL_BUNDLE_ALLOW_OLDER=1 (a loud warning instead).
+      - name: Restore validated triage model (models repository release, MODEL_BUNDLE_TOKEN)
         id: bundle
         if: github.event_name != 'workflow_dispatch' || inputs.include_validated_model
         env:
+          MODEL_BUNDLE_REPO: ${{ vars.MODEL_BUNDLE_REPO || 'SHAXZODBR/SIAA-models' }}
           MODEL_BUNDLE_URL: ${{ secrets.MODEL_BUNDLE_URL }}
           MODEL_BUNDLE_TOKEN: ${{ secrets.MODEL_BUNDLE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
+          MODEL_BUNDLE_ALLOW_OLDER: ${{ vars.MODEL_BUNDLE_ALLOW_OLDER }}
+          BUNDLE_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
         run: |
-          & $env:PYTHON packaging\fetch_model_bundle.py --dest models
+          $fetchArgs = @('--dest', 'models')
+          if ($env:BUNDLE_REQUIRED -eq '1') { $fetchArgs += @('--require', '--require-newest') }
+          & $env:PYTHON packaging\fetch_model_bundle.py @fetchArgs
           if ($LASTEXITCODE -ne 0) { throw "fetch_model_bundle.py failed ($LASTEXITCODE)" }
 
-      # The installer's model comes from the MODEL_BUNDLE_URL secret (set by hand); the numbers and
-      # identity the docs/app quote come from the committed bump. They must be the same release.
+      # The installer's model is the release the code pin names (or the MODEL_BUNDLE_URL fallback); the
+      # numbers and identity the docs/app quote come from the committed bump. NOT independent on the
+      # lookup path (fetch already resolved the release from this same pin): it guards the --url /
+      # MODEL_BUNDLE_URL fallback. The independent check on tags is --require-newest above.
       - name: Verify bundle identity matches the code
         if: steps.bundle.outputs.have_bundle == '1'
         env:
@@ -228,10 +265,10 @@ jobs:
           $pinned = (& $env:PYTHON -c "import src.inference.validated_metrics as m; print(m.FALLBACK_IDENTITY)") | Select-Object -Last 1
           if ($LASTEXITCODE -ne 0) { throw "could not read FALLBACK_IDENTITY from src/inference/validated_metrics.py" }
           $pinned = "$pinned".Trim()
-          Write-Host "bundle identity (MODEL_BUNDLE_URL):                        $env:BUNDLE_IDENTITY"
+          Write-Host "bundle identity (restored):                                $env:BUNDLE_IDENTITY"
           Write-Host "code-pinned identity (validated_metrics.FALLBACK_IDENTITY): $pinned"
           if ($pinned -ne "$env:BUNDLE_IDENTITY".Trim()) {
-            Write-Host "::error title=Bundle identity mismatch::MODEL_BUNDLE_URL restored identity $env:BUNDLE_IDENTITY but the code pins $pinned. Point the MODEL_BUNDLE_URL secret at this release's manifest asset (packaging/publish_model_bundle.py prints it) or commit the scripts/bump_model_release.py changes."
+            Write-Host "::error title=Bundle identity mismatch::the restored bundle has identity $env:BUNDLE_IDENTITY but the code pins $pinned. Publish this model with packaging/publish_model_bundle.py (release brain-triage-$pinned) or commit the scripts/bump_model_release.py changes."
             throw "bundle identity $env:BUNDLE_IDENTITY != code-pinned identity $pinned"
           }
 
@@ -244,11 +281,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "bundle release record != code pin (check_bundle_release.py exit $LASTEXITCODE)" }
 
       # A bundle published with --allow-unvalidated ("validated": false) is for demo builds only:
-      # a release tag must never ship it (its artifact is named ...-UNVALIDATED-DEMO below).
+      # a release tag must never ship it (on a branch such a build is a rehearsal and uploads nothing).
       - name: Refuse an unvalidated model bundle on a release tag
         if: startsWith(github.ref, 'refs/tags/v') && steps.bundle.outputs.bundle_validated == '0'
         run: |
-          Write-Host "::error title=Unvalidated model bundle::MODEL_BUNDLE_URL points at a bundle published with --allow-unvalidated (validated: false). A release tag needs a model that passed the gate (scripts/release_pipeline.py)."
+          Write-Host "::error title=Unvalidated model bundle::the restored bundle was published with --allow-unvalidated (validated: false). A release tag needs a model that passed the gate (scripts/release_pipeline.py)."
           throw "unvalidated model bundle on release tag $env:GITHUB_REF_NAME"
 
       - name: Smoke-test frozen backend (/health)
@@ -299,20 +336,32 @@ jobs:
           $lines += ''
           $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
+      # Public repository: a workflow artifact is downloadable by any signed-in GitHub user, so only an
+      # installer WITHOUT the validated model is ever uploaded as one (clinic flavour / no bundle).
       - name: Upload installer artifact
+        if: steps.bundle.outputs.have_bundle != '1'
         uses: actions/upload-artifact@v4
         with:
-          name: sentinel-windows-x64-${{ steps.bundle.outputs.have_bundle == '1' && (steps.bundle.outputs.bundle_validated == '0' && 'UNVALIDATED-DEMO' || 'full') || 'NO-VALIDATED-MODEL' }}
+          name: sentinel-windows-x64-NO-VALIDATED-MODEL
           path: desktop-app/release/*.exe
           if-no-files-found: error
           retention-days: 1        # public repo: installers must not stay downloadable
           compression-level: 0     # the NSIS payload is already LZMA-compressed
 
-      # Full flavour only: a clinic-flavour run dispatched ON a tag ref (github.ref = refs/tags/v…)
-      # produces installers with the SAME file names — attaching them would --clobber the full
-      # installer in the tag's draft release.
+      # A model-bearing installer outside a v* tag (Run workflow on a branch) is a build rehearsal.
+      - name: Model-bearing installer not uploaded (branch build)
+        if: steps.bundle.outputs.have_bundle == '1' && !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          Write-Host '::notice title=Installer not uploaded::installer contains the validated model and is not uploaded from a branch build of a public repository; push a v* tag to receive it in the tag''s draft release'
+          '- Not uploaded: installer contains the validated model and is not uploaded from a branch build of a public repository; push a v* tag to receive it in the tag''s draft release' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      # The only route a model-bearing installer takes off the runner (draft release assets are visible
+      # to people with write access only). Model-bearing only: a clinic-flavour run dispatched ON a tag
+      # ref (github.ref = refs/tags/v…) produces installers with the SAME file names — attaching them
+      # would --clobber the full installer in the tag's draft release. An UNVALIDATED-DEMO bundle never
+      # gets here on a tag (refused above; bundle_validated != '0' is a second guard).
       - name: Attach to draft GitHub Release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.include_validated_model)
+        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.include_validated_model) && steps.bundle.outputs.have_bundle == '1' && steps.bundle.outputs.bundle_validated != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -322,6 +371,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             # the macOS job may create it first — ignore a duplicate-create error, the upload decides
             gh release create $tag --draft --title "Sentinel Medical AI $tag" --notes "Installers built by GitHub Actions run $env:GITHUB_RUN_ID" *> $null
+          }
+          # Re-run of the tag's workflow (or a dispatch on the tag ref) after the release was published:
+          # uploading would make the model-bearing installer a PUBLIC asset. Only ever into a draft.
+          $isDraft = "$(gh release view $tag --json isDraft -q .isDraft 2>$null)".Trim()
+          if ($LASTEXITCODE -ne 0 -or $isDraft -cne 'true') {
+            Write-Host "::error title=Release already published::release $tag is published (isDraft=$isDraft), not a draft: nothing was uploaded. A model-bearing installer may only go into a DRAFT release; build it under a new v* tag."
+            throw "release $tag is not a draft (isDraft=$isDraft): nothing was uploaded"
           }
           foreach ($f in Get-ChildItem desktop-app/release -Filter *.exe) {
             gh release upload $tag $f.FullName --clobber
@@ -389,17 +445,31 @@ jobs:
           echo '::notice title=Clinic flavour::include_validated_model=false - the installer is built WITHOUT the validated triage model (artifact ...-NO-VALIDATED-MODEL). Deliver the model per clinic with packaging/provision_clinic.py (docs/vendor_provisioning_en.md).'
           echo '## Clinic flavour: validated model deliberately excluded (include_validated_model=false)' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Restore validated triage model (MODEL_BUNDLE_URL secret)
+      # Release brain-triage-<code-pinned identity> of MODEL_BUNDLE_REPO (MODEL_BUNDLE_URL: fallback only).
+      # On a v* tag --require: a missing bundle fails the build instead of shipping a model-less installer;
+      # and --require-newest: the build fails when the models repository holds a model release created
+      # after the pinned one (a tag pushed without the bump commit). Deliberate rebuild of an older model:
+      # repository variable MODEL_BUNDLE_ALLOW_OLDER=1 (a loud warning instead).
+      - name: Restore validated triage model (models repository release, MODEL_BUNDLE_TOKEN)
         id: bundle
         if: github.event_name != 'workflow_dispatch' || inputs.include_validated_model
         env:
+          MODEL_BUNDLE_REPO: ${{ vars.MODEL_BUNDLE_REPO || 'SHAXZODBR/SIAA-models' }}
           MODEL_BUNDLE_URL: ${{ secrets.MODEL_BUNDLE_URL }}
           MODEL_BUNDLE_TOKEN: ${{ secrets.MODEL_BUNDLE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: '"$PYTHON" packaging/fetch_model_bundle.py --dest models'
+          MODEL_BUNDLE_ALLOW_OLDER: ${{ vars.MODEL_BUNDLE_ALLOW_OLDER }}
+          BUNDLE_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          fetch_args=(--dest models)
+          if [ "$BUNDLE_REQUIRED" = "1" ]; then fetch_args+=(--require --require-newest); fi
+          "$PYTHON" packaging/fetch_model_bundle.py "${fetch_args[@]}"
 
-      # The installer's model comes from the MODEL_BUNDLE_URL secret (set by hand); the numbers and
-      # identity the docs/app quote come from the committed bump. They must be the same release.
+      # The installer's model is the release the code pin names (or the MODEL_BUNDLE_URL fallback); the
+      # numbers and identity the docs/app quote come from the committed bump. NOT independent on the
+      # lookup path (fetch already resolved the release from this same pin): it guards the --url /
+      # MODEL_BUNDLE_URL fallback. The independent check on tags is --require-newest above.
       - name: Verify bundle identity matches the code
         if: steps.bundle.outputs.have_bundle == '1'
         env:
@@ -407,10 +477,10 @@ jobs:
         run: |
           set -euo pipefail
           pinned="$("$PYTHON" -c "import src.inference.validated_metrics as m; print(m.FALLBACK_IDENTITY)" | tail -n 1)"
-          echo "bundle identity (MODEL_BUNDLE_URL):                        $BUNDLE_IDENTITY"
+          echo "bundle identity (restored):                                $BUNDLE_IDENTITY"
           echo "code-pinned identity (validated_metrics.FALLBACK_IDENTITY): $pinned"
           if [ "$pinned" != "$BUNDLE_IDENTITY" ]; then
-            echo "::error title=Bundle identity mismatch::MODEL_BUNDLE_URL restored identity $BUNDLE_IDENTITY but the code pins $pinned. Point the MODEL_BUNDLE_URL secret at this release's manifest asset (packaging/publish_model_bundle.py prints it) or commit the scripts/bump_model_release.py changes."
+            echo "::error title=Bundle identity mismatch::the restored bundle has identity $BUNDLE_IDENTITY but the code pins $pinned. Publish this model with packaging/publish_model_bundle.py (release brain-triage-$pinned) or commit the scripts/bump_model_release.py changes."
             echo "bundle identity $BUNDLE_IDENTITY != code-pinned identity $pinned"
             exit 1
           fi
@@ -422,11 +492,11 @@ jobs:
         run: '"$PYTHON" packaging/check_bundle_release.py --model-dir models/brain_triage_finetuned'
 
       # A bundle published with --allow-unvalidated ("validated": false) is for demo builds only:
-      # a release tag must never ship it (its artifact is named ...-UNVALIDATED-DEMO below).
+      # a release tag must never ship it (on a branch such a build is a rehearsal and uploads nothing).
       - name: Refuse an unvalidated model bundle on a release tag
         if: startsWith(github.ref, 'refs/tags/v') && steps.bundle.outputs.bundle_validated == '0'
         run: |
-          echo "::error title=Unvalidated model bundle::MODEL_BUNDLE_URL points at a bundle published with --allow-unvalidated (validated: false). A release tag needs a model that passed the gate (scripts/release_pipeline.py)."
+          echo "::error title=Unvalidated model bundle::the restored bundle was published with --allow-unvalidated (validated: false). A release tag needs a model that passed the gate (scripts/release_pipeline.py)."
           exit 1
 
       - name: Smoke-test frozen backend (/health)
@@ -477,20 +547,32 @@ jobs:
             echo
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Public repository: a workflow artifact is downloadable by any signed-in GitHub user, so only an
+      # installer WITHOUT the validated model is ever uploaded as one (clinic flavour / no bundle).
       - name: Upload installer artifact
+        if: steps.bundle.outputs.have_bundle != '1'
         uses: actions/upload-artifact@v4
         with:
-          name: sentinel-macos-arm64-${{ steps.bundle.outputs.have_bundle == '1' && (steps.bundle.outputs.bundle_validated == '0' && 'UNVALIDATED-DEMO' || 'full') || 'NO-VALIDATED-MODEL' }}
+          name: sentinel-macos-arm64-NO-VALIDATED-MODEL
           path: desktop-app/release/*.dmg
           if-no-files-found: error
           retention-days: 1        # public repo: installers must not stay downloadable
           compression-level: 0
 
-      # Full flavour only: a clinic-flavour run dispatched ON a tag ref (github.ref = refs/tags/v…)
-      # produces installers with the SAME file names — attaching them would --clobber the full
-      # installer in the tag's draft release.
+      # A model-bearing installer outside a v* tag (Run workflow on a branch) is a build rehearsal.
+      - name: Model-bearing installer not uploaded (branch build)
+        if: steps.bundle.outputs.have_bundle == '1' && !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "::notice title=Installer not uploaded::installer contains the validated model and is not uploaded from a branch build of a public repository; push a v* tag to receive it in the tag's draft release"
+          echo "- Not uploaded: installer contains the validated model and is not uploaded from a branch build of a public repository; push a v* tag to receive it in the tag's draft release" >> "$GITHUB_STEP_SUMMARY"
+
+      # The only route a model-bearing installer takes off the runner (draft release assets are visible
+      # to people with write access only). Model-bearing only: a clinic-flavour run dispatched ON a tag
+      # ref (github.ref = refs/tags/v…) produces installers with the SAME file names — attaching them
+      # would --clobber the full installer in the tag's draft release. An UNVALIDATED-DEMO bundle never
+      # gets here on a tag (refused above; bundle_validated != '0' is a second guard).
       - name: Attach to draft GitHub Release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.include_validated_model)
+        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.include_validated_model) && steps.bundle.outputs.have_bundle == '1' && steps.bundle.outputs.bundle_validated != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -499,6 +581,13 @@ jobs:
           if ! gh release view "$tag" >/dev/null 2>&1; then
             # the Windows job may create it first — ignore a duplicate-create error, the upload decides
             gh release create "$tag" --draft --title "Sentinel Medical AI $tag" --notes "Installers built by GitHub Actions run $GITHUB_RUN_ID" >/dev/null 2>&1 || true
+          fi
+          # Re-run of the tag's workflow (or a dispatch on the tag ref) after the release was published:
+          # uploading would make the model-bearing installer a PUBLIC asset. Only ever into a draft.
+          is_draft="$(gh release view "$tag" --json isDraft -q .isDraft 2>/dev/null || true)"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error title=Release already published::release $tag is published (isDraft=$is_draft), not a draft: nothing was uploaded. A model-bearing installer may only go into a DRAFT release; build it under a new v* tag."
+            exit 1
           fi
           for f in desktop-app/release/*.dmg; do
             gh release upload "$tag" "$f" --clobber

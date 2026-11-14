@@ -56,6 +56,9 @@ def _guide(lang: str) -> str:
     return (DOCS / f"admin_install_guide_{lang}.md").read_text(encoding="utf-8")
 
 
+UPLOAD_IF = "steps.bundle.outputs.have_bundle != '1'"
+
+
 # ---------------------------------------------------------------- workflow
 
 def test_workflow_parses_with_expected_triggers_and_runners():
@@ -134,9 +137,11 @@ def test_artifact_paths_match_electron_builder_output_dir():
         assert s["with"]["if-no-files-found"] == "error"
     assert uploads[0]["with"]["path"].endswith("*.exe")
     assert uploads[1]["with"]["path"].endswith("*.dmg")
-    # the artifact name says loudly when the validated model is absent
+    # only a model-less installer is ever an artifact (public repo), and its name says so loudly
+    assert uploads[0]["with"]["name"] == "sentinel-windows-x64-NO-VALIDATED-MODEL"
+    assert uploads[1]["with"]["name"] == "sentinel-macos-arm64-NO-VALIDATED-MODEL"
     for s in uploads:
-        assert "NO-VALIDATED-MODEL" in s["with"]["name"] and "steps.bundle.outputs.have_bundle" in s["with"]["name"]
+        assert s["if"] == UPLOAD_IF, s
 
 
 def test_public_model_keys_are_registry_or_extra_keys():
@@ -187,8 +192,8 @@ PIN_SNIPPET = "import src.inference.validated_metrics as m; print(m.FALLBACK_IDE
 
 
 def test_bundle_identity_is_checked_against_the_code_pin_in_both_jobs():
-    """The model CI restores comes from the hand-set MODEL_BUNDLE_URL secret; the numbers and
-    identity the app/docs quote come from the committed bump (validated_metrics.FALLBACK_IDENTITY).
+    """The model CI restores is the release the code pin names (or the MODEL_BUNDLE_URL fallback); the
+    numbers and identity the app/docs quote come from the committed bump (validated_metrics.FALLBACK_IDENTITY).
     Both jobs must fail when they differ, right after the restore, before anything is built."""
     from src.inference import validated_metrics as vm
     assert re.fullmatch(r"[0-9a-f]{12}", vm.FALLBACK_IDENTITY), vm.FALLBACK_IDENTITY
@@ -303,6 +308,10 @@ def test_smoke_scripts_share_the_health_contract():
 
 # ---------------------------------------------------------------- fetch_model_bundle.py
 
+# every variable fetch_model_bundle.py reads — cleared so the developer's shell cannot steer a test
+FETCH_ENV = ("MODEL_BUNDLE_URL", "MODEL_BUNDLE_TOKEN", "MODEL_BUNDLE_REPO", "GITHUB_TOKEN", "GITHUB_REPOSITORY")
+
+
 def _make_bundle(root: Path, tamper: bool = False) -> Path:
     d = root / "brain_triage_finetuned"
     d.mkdir(parents=True)
@@ -326,7 +335,7 @@ def _zip_dir(model_dir: Path, zip_path: Path, prefix: str) -> Path:
 
 def _run_fetch(tmp: Path, *args: str, env_extra: dict | None = None) -> tuple[int, str, dict]:
     out = tmp / "gh_output.txt"
-    env = {k: v for k, v in os.environ.items() if k not in ("MODEL_BUNDLE_URL", "MODEL_BUNDLE_TOKEN", "GITHUB_TOKEN")}
+    env = {k: v for k, v in os.environ.items() if k not in FETCH_ENV}
     env.update({"GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(tmp / "summary.md"), **(env_extra or {})})
     r = subprocess.run([sys.executable, str(FETCH), *args], cwd=str(tmp), env=env, capture_output=True, text=True)
     outputs = dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l) if out.exists() else {}
@@ -530,22 +539,41 @@ def test_dispatch_input_include_validated_model_skips_only_the_restore_step():
         conditional = [n for s, n in zip(steps, names) if "include_validated_model" in str(s.get("if", ""))]
         attach = next(i for i, n in enumerate(names) if n.startswith("Attach to draft GitHub Release"))
         assert sorted(conditional) == sorted([names[restore], names[note], names[attach]]), (job, conditional)
-        # with the restore skipped, have_bundle is empty -> the artifact falls back to NO-VALIDATED-MODEL,
+        # with the restore skipped, have_bundle is empty -> the NO-VALIDATED-MODEL artifact is uploaded,
         # the identity check is skipped and the smoke test does not demand 'ok'
         upload = next(s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact"))
-        assert upload["with"]["name"].endswith("|| 'NO-VALIDATED-MODEL' }}"), upload["with"]["name"]
+        assert upload["with"]["name"].endswith("-NO-VALIDATED-MODEL"), upload["with"]["name"]
+        assert _eval_if(upload["if"], event="workflow_dispatch", ref="refs/heads/main", include=False, have_bundle="")
         ident = next(s for s in steps if s.get("name") == IDENTITY_STEP)
         assert ident["if"] == "steps.bundle.outputs.have_bundle == '1'"
     assert "${REQUIRE_VALIDATED:-0}" in _text("packaging/smoke_backend.sh")
     assert "$env:REQUIRE_VALIDATED -eq '1'" in _text("packaging/smoke_backend.ps1")
 
 
-def _eval_if(expr: str, *, event: str, ref: str, include: bool) -> bool:
-    """Evaluate the small subset of GitHub expressions the attach/restore guards use."""
-    py = (expr.replace("&&", " and ").replace("||", " or ").replace("!inputs.", " not inputs.")
-          .replace("github.event_name", repr(event)).replace("inputs.include_validated_model", repr(include))
-          .replace("startsWith(github.ref, 'refs/tags/v')", repr(ref.startswith("refs/tags/v"))))
-    return bool(eval(py, {"__builtins__": {}}, {}))                       # noqa: S307 - test-only, fixed input
+def _eval_expr(expr: str, *, event: str, ref: str, include, have_bundle: str = "1", validated: str = "1"):
+    """Evaluate the small subset of GitHub expressions the restore/upload/attach guards use. A skipped
+    restore step leaves its outputs empty (have_bundle=''); bundle_validated is only written for
+    multipart manifests, so it may be '' on a model-bearing build too."""
+    py = expr
+    for name, value in (("startsWith(github.ref, 'refs/tags/v')", ref.startswith("refs/tags/v")),
+                        ("steps.bundle.outputs.have_bundle", have_bundle),
+                        ("steps.bundle.outputs.bundle_validated", validated),
+                        ("github.event_name", event), ("inputs.include_validated_model", include)):
+        py = py.replace(name, repr(value))
+    py = (py.replace("&&", " and ").replace("||", " or ").replace("!=", "\0").replace("!", " not ")
+          .replace("\0", "!="))
+    return eval(py, {"__builtins__": {}}, {})                             # noqa: S307 - test-only, fixed input
+
+
+def _eval_if(expr: str, *, event: str, ref: str, include, have_bundle: str = "1", validated: str = "1") -> bool:
+    return bool(_eval_expr(expr, event=event, ref=ref, include=include, have_bundle=have_bundle, validated=validated))
+
+
+def _expr_body(value: str) -> str:
+    """'${{ a && b }}' -> 'a && b'."""
+    m = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", value.strip())
+    assert m, value
+    return m.group(1)
 
 
 @pytest.mark.parametrize("event,ref,include,attach", [
@@ -624,3 +652,718 @@ def test_admin_guides_describe_ci_gate_retention_and_flavours():
         assert not re.search(r"\b14 (days|дней|kun)\b", tail), f"{lang}: stale 14-day retention in §13"
         assert "NO-VALIDATED-MODEL" in g[:g.index("\n## 4. ")], f"{lang}: §3 must name the clinic flavour"
 
+
+
+# ---------------------------------------------------------------- 2026-11-10: public repo, tag gate, bundle by identity
+
+NOTICE_STEP = "Model-bearing installer not uploaded (branch build)"
+NOTICE_TEXT = ("installer contains the validated model and is not uploaded from a branch build of a public "
+               "repository; push a v* tag to receive it in the tag")
+ATTACH_STEP = "Attach to draft GitHub Release (tag builds)"
+MODELS_REPO_EXPR = "${{ vars.MODEL_BUNDLE_REPO || 'SHAXZODBR/SIAA-models' }}"
+
+
+def _step(job: str, prefix: str) -> dict:
+    return next(s for s in _steps(job) if s.get("name", "").startswith(prefix))
+
+
+def test_model_bearing_installer_is_never_a_workflow_artifact():
+    """(A) Artifacts of a public repository are downloadable by any signed-in user: an installer that
+    holds the validated model leaves the runner only through the tag's draft release."""
+    for job, ext in (("windows", "*.exe"), ("macos", "*.dmg")):
+        steps = _steps(job)
+        names = [s.get("name", s.get("uses", "")) for s in steps]
+        uploads = [s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact")]
+        assert len(uploads) == 1, job
+        up = uploads[0]
+        assert up["if"] == UPLOAD_IF, (job, up)
+        assert "${{" not in up["with"]["name"] and up["with"]["name"].endswith("-NO-VALIDATED-MODEL"), up["with"]
+        assert up["with"]["retention-days"] == 1 and up["with"]["path"].endswith(ext)
+        # the rehearsal notice: model-bearing build outside a v* tag
+        notice = _step(job, NOTICE_STEP)
+        assert notice["if"] == "steps.bundle.outputs.have_bundle == '1' && !startsWith(github.ref, 'refs/tags/v')", job
+        assert "::notice title=" in notice["run"] and "GITHUB_STEP_SUMMARY" in notice["run"], job
+        assert notice["run"].count(NOTICE_TEXT) == 2, (job, notice["run"])   # annotation + summary line
+        assert "secrets." not in yaml.safe_dump(notice)
+        # draft release: tag, not the clinic flavour, a model inside, never an UNVALIDATED-DEMO bundle
+        attach = _step(job, ATTACH_STEP)
+        cond = attach["if"]
+        for frag in ("startsWith(github.ref, 'refs/tags/v')", RESTORE_IF, "steps.bundle.outputs.have_bundle == '1'",
+                     "steps.bundle.outputs.bundle_validated != '0'"):
+            assert frag in cond, (job, frag, cond)
+        assert "gh release create" in attach["run"] and "--draft" in attach["run"]
+        build = next(i for i, n in enumerate(names) if n.startswith("Build "))
+        refuse = names.index("Refuse an unvalidated model bundle on a release tag")
+        assert refuse < build < names.index("Upload installer artifact") < names.index(NOTICE_STEP) < names.index(ATTACH_STEP), (job, names)
+    header = WORKFLOW.read_text(encoding="utf-8").split("\nname:", 1)[0]
+    for frag in ("PUBLIC", "NEVER a workflow artifact", "DRAFT GitHub Release", "rehearsal", "retention-days: 1",
+                 "--require", "MODEL_BUNDLE_REPO", "brain-triage-<identity12>"):
+        assert frag in header, frag
+    # header secrets section: the token is what matters, the URL is an optional fallback
+    assert "the one secret that matters" in header and "optional fallback, no longer edited per model release" in header
+
+
+# (event, ref, include_validated_model, have_bundle, bundle_validated) -> (artifact?, draft release?, notice?)
+# have_bundle '' = restore step skipped (clinic flavour); bundle_validated '' = a plain-zip bundle.
+@pytest.mark.parametrize("event,ref,include,have,validated,artifact,attach,notice", [
+    ("push", "refs/tags/v1.1.0", None, "1", "1", False, True, False),                  # release: draft only
+    ("push", "refs/tags/v1.1.0", None, "1", "", False, True, False),                   # zip bundle (no flag)
+    ("workflow_dispatch", "refs/tags/v1.1.0", True, "1", "1", False, True, False),     # full, dispatched on a tag
+    ("workflow_dispatch", "refs/tags/v1.1.0", False, "", "", True, False, False),      # clinic on a tag: artifact only
+    ("workflow_dispatch", "refs/heads/main", True, "1", "1", False, False, True),      # branch full: rehearsal
+    ("workflow_dispatch", "refs/heads/main", True, "1", "0", False, False, True),      # branch UNVALIDATED-DEMO
+    ("workflow_dispatch", "refs/heads/main", True, "0", "", True, False, False),       # branch, no token: model-less
+    ("workflow_dispatch", "refs/heads/main", False, "", "", True, False, False),       # clinic flavour on a branch
+])
+def test_installer_route_truth_table(event, ref, include, have, validated, artifact, attach, notice):
+    for job in BUILDERS:
+        kw = dict(event=event, ref=ref, include=include, have_bundle=have, validated=validated)
+        upload = next(s for s in _steps(job) if str(s.get("uses", "")).startswith("actions/upload-artifact"))
+        assert _eval_if(upload["if"], **kw) is artifact, (job, kw)
+        assert _eval_if(_step(job, ATTACH_STEP)["if"], **kw) is attach, (job, kw)
+        assert _eval_if(_step(job, NOTICE_STEP)["if"], **kw) is notice, (job, kw)
+        # a model-bearing installer always takes at most one route, and never the public one
+        if have == "1":
+            assert not artifact and not (attach and notice)
+
+
+@pytest.mark.parametrize("event,ref,include", [
+    ("push", "refs/tags/v1.1.0", None),
+    ("workflow_dispatch", "refs/tags/v1.1.0", True),
+])
+def test_tag_build_without_a_bundle_fails_instead_of_attaching(event, ref, include):
+    """(B) the rows "tag + have_bundle != '1'" are unreachable: the restore runs with --require and fails."""
+    for job in BUILDERS:
+        restore = _step(job, "Restore validated triage model")
+        assert _eval_if(restore["if"], event=event, ref=ref, include=include)
+        assert _eval_expr(_expr_body(restore["env"]["BUNDLE_REQUIRED"]), event=event, ref=ref, include=include) == "1"
+
+
+def test_restore_passes_require_on_tags_only():
+    """(B) a v* tag ref: --require (a missing bundle fails); a branch: warn and continue."""
+    for job in BUILDERS:
+        restore = _step(job, "Restore validated triage model")
+        expr = _expr_body(restore["env"]["BUNDLE_REQUIRED"])
+        assert _eval_expr(expr, event="push", ref="refs/tags/v1.1.0", include=None) == "1"
+        assert _eval_expr(expr, event="workflow_dispatch", ref="refs/tags/v2.0.0", include=True) == "1"
+        assert _eval_expr(expr, event="workflow_dispatch", ref="refs/heads/main", include=True) == "0"
+        assert _eval_expr(expr, event="workflow_dispatch", ref="refs/heads/v-feature", include=True) == "0"
+        assert len(re.findall(r"--require(?![-\w])", restore["run"])) == 1, (job, restore["run"])
+    win = _step("windows", "Restore validated triage model")["run"]
+    assert "if ($env:BUNDLE_REQUIRED -eq '1') { $fetchArgs += @('--require', '--require-newest') }" in win
+    assert "packaging\\fetch_model_bundle.py @fetchArgs" in win and "$LASTEXITCODE -ne 0" in win
+
+
+@pytest.mark.parametrize("required,expect_require", [("1", True), ("0", False)])
+def test_macos_restore_script_passes_require_only_when_required(tmp_path, required, expect_require):
+    """Run the macOS step's bash exactly as written, with a fake $PYTHON that records its argv."""
+    run = _step("macos", "Restore validated triage model")["run"]
+    rec = tmp_path / "argv.txt"
+    fake = tmp_path / "fake_python"
+    fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{rec}"\n')
+    fake.chmod(0o755)
+    r = subprocess.run(["bash", "-c", run], cwd=str(tmp_path), capture_output=True, text=True, timeout=60,
+                       env={"PATH": os.environ.get("PATH", ""), "PYTHON": str(fake), "BUNDLE_REQUIRED": required})
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = rec.read_text().splitlines()
+    assert argv[:3] == ["packaging/fetch_model_bundle.py", "--dest", "models"], argv
+    assert ("--require" in argv) is expect_require, argv
+
+
+def test_restore_step_resolves_the_bundle_by_identity_from_the_models_repo():
+    """(C) both jobs pass MODEL_BUNDLE_REPO (repository variable with a default); MODEL_BUNDLE_URL stays
+    wired as the fallback; the identity check stays an independent step."""
+    for job in BUILDERS:
+        restore = _step(job, "Restore validated triage model")
+        env = restore["env"]
+        assert env["MODEL_BUNDLE_REPO"] == MODELS_REPO_EXPR, job
+        assert env["MODEL_BUNDLE_TOKEN"] == "${{ secrets.MODEL_BUNDLE_TOKEN }}"
+        assert env["MODEL_BUNDLE_URL"] == "${{ secrets.MODEL_BUNDLE_URL }}"
+        assert env["GITHUB_TOKEN"] == "${{ github.token }}"
+        names = [s.get("name", "") for s in _steps(job)]
+        assert names[names.index(restore["name"]) + 1] == IDENTITY_STEP
+    # no other step sees the model token
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("secrets.MODEL_BUNDLE_TOKEN") == 2 and text.count("secrets.MODEL_BUNDLE_URL") == 2
+
+
+# ---- fetch_model_bundle.py: resolution by identity (in-process, fake GitHub API, no network)
+
+API_TOKEN = "ghp_FAKE_fetch_token_0123456789"
+MODELS_REPO = "o/models"
+ASSET_URL = "https://api.github.com/repos/o/models/releases/assets/4242"
+
+
+def _load_fetch():
+    spec = importlib.util.spec_from_file_location("fetch_model_bundle_under_test", FETCH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _identity_of(model_dir: Path) -> str:
+    return json.loads((model_dir / "MANIFEST.json").read_text())["files"]["model.safetensors"][:12]
+
+
+class _FakeApi:
+    """Stands in for fetch_model_bundle._http_get (the lookup) and .download (the asset bytes)."""
+
+    def __init__(self, mod, release: dict | None = None, error: BaseException | None = None,
+                 assets: dict | None = None):
+        self.mod, self.release, self.error = mod, release, error
+        self.assets = assets or {}          # asset API URL -> local file standing in for its bytes
+        self.gets: list[tuple[str, dict]] = []
+        self.downloads: list[tuple[str, str]] = []
+        self._download = mod.download
+
+    def http_get(self, url, headers):
+        self.gets.append((url, dict(headers)))
+        if self.error is not None:
+            raise self.error
+        return json.dumps(self.release).encode()
+
+    def download(self, url, out, token=""):
+        self.downloads.append((url, token))
+        if url in self.assets:
+            url = self.assets[url].as_uri()
+        return self._download(url, out, token)
+
+
+@pytest.fixture
+def fetch_env(tmp_path, monkeypatch):
+    for var in FETCH_ENV + ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY"):
+        monkeypatch.delenv(var, raising=False)
+    out = tmp_path / "gh_output.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    mod = _load_fetch()
+    model_dir = _make_bundle(tmp_path / "src")
+    zip_path = _zip_dir(model_dir, tmp_path / "bundle.zip", "brain_triage_finetuned/")
+    identity = _identity_of(model_dir)
+    release = {"tag_name": f"brain-triage-{identity}", "assets": [
+        {"name": f"brain_triage_finetuned_{identity}.zip.part-00",
+         "url": "https://api.github.com/repos/o/models/releases/assets/4241"},
+        {"name": "manifest.json", "url": ASSET_URL}]}
+    api = _FakeApi(mod, release=release, assets={ASSET_URL: zip_path})
+    monkeypatch.setattr(mod, "_http_get", api.http_get)
+    monkeypatch.setattr(mod, "download", api.download)
+
+    def outputs() -> dict:
+        return dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l) if out.exists() else {}
+
+    return mod, api, identity, zip_path, outputs
+
+
+def test_fetch_resolves_release_by_identity_and_restores_its_manifest_asset(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    monkeypatch.setenv("MODEL_BUNDLE_REPO", MODELS_REPO)
+    monkeypatch.setenv("MODEL_BUNDLE_TOKEN", API_TOKEN)
+    dest = tmp_path / "models"
+    rc = mod.main(["--dest", str(dest), "--identity", identity])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out + cap.err
+    # exactly one lookup: the release named after the identity, with the bearer token in the header only
+    assert len(api.gets) == 1
+    url, headers = api.gets[0]
+    assert url == f"https://api.github.com/repos/{MODELS_REPO}/releases/tags/brain-triage-{identity}"
+    assert headers["Authorization"] == f"Bearer {API_TOKEN}" and API_TOKEN not in url
+    assert headers["Accept"] == "application/vnd.github+json"
+    # the manifest asset's API URL is then used exactly like a --url (same token)
+    assert api.downloads == [(ASSET_URL, API_TOKEN)]
+    assert (dest / "brain_triage_finetuned" / "model.safetensors").is_file()
+    assert outputs() == {"have_bundle": "1", "model_identity": identity}
+    assert f"brain-triage-{identity}" in cap.out and ASSET_URL not in cap.out
+    assert API_TOKEN not in cap.out + cap.err
+
+
+def test_fetch_identity_defaults_to_the_code_pin(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    pin = tmp_path / "validated_metrics.py"
+    pin.write_text(f"FALLBACK_EVALUATED_ON = '2031-01-02'\nFALLBACK_IDENTITY = '{identity}'\n")
+    monkeypatch.setattr(mod, "PIN_FILE", pin)
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--repo", MODELS_REPO, "--token", API_TOKEN])
+    assert rc == 0, capsys.readouterr()
+    assert api.gets[0][0].endswith(f"/releases/tags/brain-triage-{identity}")
+    assert outputs()["model_identity"] == identity
+
+
+@pytest.mark.parametrize("flag_url,repo,env_url,expect", [
+    (True, True, True, "flag"),          # an operator's explicit --url always wins
+    (True, False, True, "flag"),
+    (False, True, True, "repo"),         # a configured repository beats the environment URL
+    (False, True, False, "repo"),
+    (False, False, True, "env"),         # the fallback, exactly as before
+    (False, False, False, "absent"),
+])
+def test_fetch_source_precedence(tmp_path, fetch_env, monkeypatch, capsys, flag_url, repo, env_url, expect):
+    mod, api, identity, zip_path, outputs = fetch_env
+    flag_zip = tmp_path / "flag.zip"
+    env_zip = tmp_path / "env.zip"
+    flag_zip.write_bytes(zip_path.read_bytes())
+    env_zip.write_bytes(zip_path.read_bytes())
+    monkeypatch.setenv("MODEL_BUNDLE_TOKEN", API_TOKEN)
+    if repo:
+        monkeypatch.setenv("MODEL_BUNDLE_REPO", MODELS_REPO)
+    if env_url:
+        monkeypatch.setenv("MODEL_BUNDLE_URL", env_zip.as_uri())
+    argv = ["--dest", str(tmp_path / "models"), "--identity", identity]
+    if flag_url:
+        argv += ["--url", flag_zip.as_uri()]
+    rc = mod.main(argv)
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out + cap.err
+    first = api.downloads[0][0] if api.downloads else None
+    assert first == {"flag": flag_zip.as_uri(), "repo": ASSET_URL, "env": env_zip.as_uri(), "absent": None}[expect]
+    assert bool(api.gets) is (expect == "repo")
+    assert outputs()["have_bundle"] == ("0" if expect == "absent" else "1")
+
+
+def _http_error(code: int):
+    import io
+    import urllib.error
+    body = io.BytesIO(json.dumps({"message": f"Bad credentials {API_TOKEN}"}).encode())
+    return urllib.error.HTTPError("https://api.github.com/x", code, f"err {API_TOKEN}", {}, body)
+
+
+def _url_error():
+    import urllib.error
+    return urllib.error.URLError(f"connection refused (token {API_TOKEN})")
+
+
+@pytest.mark.parametrize("case,error,release,expect", [
+    ("not_found", _http_error(404), None,
+     "no release brain-triage-{id} in o/models, or the token cannot read that repository (expired?)"),
+    ("unauthorized", _http_error(401), None, "token rejected (HTTP 401)"),
+    ("forbidden", _http_error(403), None, "token rejected (HTTP 403)"),
+    ("server_error", _http_error(502), None, "GitHub API answered HTTP 502"),
+    ("unreachable", _url_error(), None, "cannot reach the GitHub API"),
+    ("no_manifest", None, {"assets": [{"name": "other.zip", "url": ASSET_URL}]},
+     "release brain-triage-{id} exists in o/models but holds no manifest.json: re-run packaging/publish_model_bundle.py"),
+    ("foreign_asset_host", None, {"assets": [{"name": "manifest.json", "url": "https://evil.example/m.json"}]},
+     "has no GitHub API URL"),
+    ("not_json", None, "<html>", "is not JSON"),
+])
+def test_fetch_lookup_failures_are_hard_and_never_fall_back(tmp_path, fetch_env, monkeypatch, capsys,
+                                                            case, error, release, expect):
+    mod, api, identity, zip_path, outputs = fetch_env
+    api.error, api.release = error, release
+    if release == "<html>":
+        monkeypatch.setattr(mod, "_http_get", lambda url, headers: b"<html>")
+    monkeypatch.setenv("MODEL_BUNDLE_REPO", MODELS_REPO)
+    monkeypatch.setenv("MODEL_BUNDLE_TOKEN", API_TOKEN)
+    monkeypatch.setenv("MODEL_BUNDLE_URL", zip_path.as_uri())      # a perfectly good fallback — must NOT be used
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--identity", identity])
+    cap = capsys.readouterr()
+    assert rc == 1, (case, cap.out + cap.err)
+    assert expect.format(id=identity) in cap.err, (case, cap.err)
+    assert "::error title=Validated model bundle::" in cap.out
+    assert API_TOKEN not in cap.out + cap.err, case
+    assert api.downloads == [], case                                 # no silent fallback to MODEL_BUNDLE_URL
+    assert outputs() == {"have_bundle": "0"}
+    assert not (tmp_path / "models" / "brain_triage_finetuned").exists()
+
+
+def test_fetch_repo_without_token_is_the_absent_case(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, zip_path, outputs = fetch_env
+    monkeypatch.setenv("MODEL_BUNDLE_REPO", MODELS_REPO)
+    monkeypatch.setenv("MODEL_BUNDLE_URL", zip_path.as_uri())
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_job_token")              # the job token of ANOTHER repository
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/code")
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--identity", identity])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out + cap.err
+    assert "MODEL_BUNDLE_TOKEN is not set" in cap.out and "MODEL_BUNDLE_URL is not set" not in cap.out
+    assert "WITHOUT" in cap.out and outputs() == {"have_bundle": "0"}
+    assert api.gets == [] and api.downloads == []
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--identity", identity, "--require"])
+    assert rc == 1 and "MODEL_BUNDLE_TOKEN is not set" in capsys.readouterr().out
+    assert api.gets == [] and api.downloads == []
+
+
+def test_fetch_uses_the_job_token_only_for_the_building_repository(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    monkeypatch.setenv("MODEL_BUNDLE_REPO", MODELS_REPO)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_job_token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "O/Models")              # case-insensitive, like GitHub
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--identity", identity])
+    assert rc == 0, capsys.readouterr()
+    assert api.gets[0][1]["Authorization"] == "Bearer ghs_job_token"
+    assert api.downloads == [(ASSET_URL, "ghs_job_token")]
+
+
+def test_fetch_fails_when_the_restored_identity_is_not_the_requested_one(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    other = "abcdefabcdef"
+    assert other != identity
+    api.release["tag_name"] = f"brain-triage-{other}"                # a release holding the wrong model
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--repo", MODELS_REPO, "--token", API_TOKEN,
+                   "--identity", other])
+    cap = capsys.readouterr()
+    assert rc == 1, cap.out + cap.err
+    assert f"restored identity {identity} != requested identity {other}" in cap.err
+    assert outputs().get("have_bundle") == "0" and "model_identity" not in outputs()
+    assert API_TOKEN not in cap.out + cap.err
+
+
+@pytest.mark.parametrize("argv,expect", [
+    (["--repo", "not-a-repo"], "must be OWNER/NAME"),
+    (["--repo", "o/.."], "must be OWNER/NAME"),
+    (["--repo", MODELS_REPO, "--identity", "XYZ"], "--identity must be 12 lowercase hex digits"),
+])
+def test_fetch_rejects_malformed_repo_or_identity(tmp_path, fetch_env, capsys, argv, expect):
+    mod, api, *_ = fetch_env
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--token", API_TOKEN, *argv])
+    assert rc == 1 and expect in capsys.readouterr().err
+    assert api.gets == [] and api.downloads == []
+
+
+def test_pin_reader_reads_the_real_code_pin_without_importing_it():
+    from src.inference import validated_metrics as vm
+    mod = _load_fetch()
+    assert mod.PIN_FILE == REPO / "src" / "inference" / "validated_metrics.py"
+    assert mod.read_pinned_identity() == vm.FALLBACK_IDENTITY
+    assert mod.read_pinned_identity(mod.PIN_FILE) == vm.FALLBACK_IDENTITY
+
+
+@pytest.mark.parametrize("text,expect", [
+    (None, "cannot read the code-pinned identity"),                                 # file missing
+    ("FALLBACK_IDENTITY = '0d559766ce58'\ndef broken(:\n", "cannot read the code-pinned identity"),
+    ("FALLBACK_SENS = 0.9\n", "no FALLBACK_IDENTITY"),
+    ("FALLBACK_IDENTITY = compute()\n", "not a 12-hex-digit string literal"),
+    ("FALLBACK_IDENTITY = 'NOT-HEX-AT-ALL'\n", "not a 12-hex-digit string literal"),
+])
+def test_pin_reader_refuses_a_broken_pin_file(tmp_path, fetch_env, monkeypatch, capsys, text, expect):
+    mod, api, *_ = fetch_env
+    pin = tmp_path / "validated_metrics.py"
+    if text is not None:
+        pin.write_text(text)
+    with pytest.raises(ValueError, match=re.escape(expect)):
+        mod.read_pinned_identity(pin)
+    # through main: a clear error before any network call (a token is available)
+    monkeypatch.setattr(mod, "PIN_FILE", pin)
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--repo", MODELS_REPO, "--token", API_TOKEN])
+    assert rc == 1 and expect in capsys.readouterr().err
+    assert api.gets == [] and api.downloads == []
+
+
+def test_fetch_module_import_has_no_side_effects_and_no_pin_read(tmp_path, monkeypatch):
+    """The frozen backend execs this file for POST /models/import: importing it must not read the pin."""
+    calls = []
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: calls.append(self) or "")
+    _load_fetch()
+    assert not any(p.name == "validated_metrics.py" for p in calls)
+
+
+def test_admin_guides_describe_installer_routes_tag_gate_and_no_per_release_secret():
+    """(A)(B)(C) in §13 of every guide: model-bearing installers only in the tag's draft release, the clinic
+    flavour as a 1-day artifact, --require on tags, and the model found by identity (no secret edit)."""
+    markers = {
+        "en": ("It is never uploaded as a workflow artifact", "no longer needs editing per model release",
+               "The one secret that matters for the model"),
+        "ru": ("Он никогда не загружается как артефакт рабочего процесса",
+               "больше не нужно менять при каждом выпуске модели", "Единственный секрет, от которого зависит модель"),
+        "uz": ("U hech qachon ish jarayoni artefakti sifatida yuklanmaydi",
+               "har bir model relizida o‘zgartirish endi shart emas", "Model uchun yagona muhim sir"),
+    }
+    for lang in LANGS:
+        g = _guide(lang)
+        tail = g[g.index("\n## 13. "):]
+        for frag in ("MODEL_BUNDLE_REPO", "brain-triage-<identity12>", "--require", "`v*`",
+                     "**Artifacts** → `sentinel-windows-x64-NO-VALIDATED-MODEL`", "**Releases**",
+                     "packaging/publish_model_bundle.py", "scripts/bump_model_release.py", *markers[lang]):
+            assert frag in tail, (lang, frag)
+        assert "**Artifacts** → `sentinel-windows-x64-full`" not in g, f"{lang}: the full flavour is no longer an artifact"
+
+
+# ---------------------------------------------------------------- 2026-11-11 review: published release, part hosts, newest pin
+
+def _attach_bash_run(tmp_path: Path, *, exists: bool, is_draft: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run the macOS attach step's bash exactly as written, with a fake `gh` on PATH that logs its argv."""
+    run = _step("macos", ATTACH_STEP)["run"]
+    work = tmp_path / "ws"
+    (work / "desktop-app" / "release").mkdir(parents=True)
+    (work / "desktop-app" / "release" / "Sentinel Medical AI-9.9.9-arm64.dmg").write_bytes(b"dmg")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "gh.log"
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'case "$*" in\n'
+        '  "release view "*"--json isDraft"*) printf "%s\\n" "$FAKE_IS_DRAFT"; exit 0;;\n'
+        '  "release view "*) [ "$FAKE_EXISTS" = "1" ] && exit 0; exit 1;;\n'
+        'esac\n'
+        'exit 0\n')
+    gh.chmod(0o755)
+    env = {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}", "GITHUB_REF_NAME": "v9.9.9",
+           "GITHUB_RUN_ID": "1", "FAKE_EXISTS": "1" if exists else "0", "FAKE_IS_DRAFT": is_draft}
+    r = subprocess.run(["bash", "-c", run], cwd=str(work), capture_output=True, text=True, timeout=60, env=env)
+    return r, (log.read_text().splitlines() if log.exists() else [])
+
+
+@pytest.mark.parametrize("exists,is_draft", [(True, "false"), (True, ""), (True, "False")])
+def test_attach_refuses_a_published_release_and_uploads_nothing(tmp_path, exists, is_draft):
+    """A re-run of the tag's workflow (or a dispatch on the tag ref) after the release was published must
+    not upload the model-bearing installer into that public release."""
+    r, calls = _attach_bash_run(tmp_path, exists=exists, is_draft=is_draft)
+    assert r.returncode != 0, (r.stdout, r.stderr, calls)
+    assert not any(c.startswith("release upload") for c in calls), calls
+    assert "::error" in r.stdout and "published" in r.stdout and "nothing was uploaded" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_attach_uploads_into_a_draft_release(tmp_path, exists):
+    r, calls = _attach_bash_run(tmp_path, exists=exists, is_draft="true")
+    assert r.returncode == 0, (r.stdout, r.stderr, calls)
+    uploads = [c for c in calls if c.startswith("release upload")]
+    assert uploads == ["release upload v9.9.9 desktop-app/release/Sentinel Medical AI-9.9.9-arm64.dmg --clobber"], calls
+    assert ("release create v9.9.9 --draft" in "\n".join(calls)) is (not exists), calls
+    draft_check = next(i for i, c in enumerate(calls) if "--json isDraft" in c)
+    assert draft_check < calls.index(uploads[0])
+
+
+def test_both_attach_scripts_check_is_draft_before_the_first_upload():
+    for job in BUILDERS:
+        run = _step(job, ATTACH_STEP)["run"]
+        check = run.find("--json isDraft -q .isDraft")
+        assert check != -1, (job, run)
+        assert check < run.index("gh release upload"), job
+        assert check > run.index("gh release create"), job                # after view / create
+        assert "::error title=" in run and "nothing was uploaded" in run, job
+    win = _step("windows", ATTACH_STEP)["run"]
+    assert "-cne 'true'" in win and "throw" in win[win.index("isDraft"):win.index("gh release upload")]
+    mac = _step("macos", ATTACH_STEP)["run"]
+    assert '!= "true"' in mac and "exit 1" in mac[mac.index("isDraft"):mac.index("gh release upload")]
+
+
+# ---- token only for the bundle's host; lookup-resolved parts only on api.github.com
+
+PART_SAME = "https://api.github.com/repos/o/models/releases/assets/4241"
+PART_FOREIGN = "https://evil.example.net/part1"
+
+
+def _multipart_assets(tmp_path: Path, zip_path: Path, parts: list[str]) -> dict:
+    data = zip_path.read_bytes()
+    half = len(data) // 2
+    chunks = [data[:half], data[half:]] if len(parts) == 2 else [data]
+    assets = {}
+    for i, (purl, chunk) in enumerate(zip(parts, chunks)):
+        p = tmp_path / f"part{i}"
+        p.write_bytes(chunk)
+        assets[purl] = p
+    man = tmp_path / "multipart_manifest.json"
+    man.write_text(json.dumps({"parts": parts, "sha256": hashlib.sha256(data).hexdigest()}))
+    assets[ASSET_URL] = man
+    return assets
+
+
+def test_lookup_resolved_bundle_refuses_a_part_outside_the_github_api(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, zip_path, outputs = fetch_env
+    api.assets = _multipart_assets(tmp_path, zip_path, [PART_SAME, PART_FOREIGN])
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--repo", MODELS_REPO, "--token", API_TOKEN,
+                   "--identity", identity])
+    cap = capsys.readouterr()
+    assert rc == 1, cap.out + cap.err
+    assert not any(u == PART_FOREIGN for u, _ in api.downloads), api.downloads     # no request to that host
+    assert not any(u == PART_SAME for u, _ in api.downloads), api.downloads        # refused before any part
+    assert "https://api.github.com" in cap.err and "evil.example.net" in cap.err, cap.err
+    assert API_TOKEN not in cap.out + cap.err
+    assert outputs() == {"have_bundle": "0"}
+
+
+def test_explicit_url_sends_the_token_only_to_the_bundle_host(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, zip_path, outputs = fetch_env
+    api.assets = _multipart_assets(tmp_path, zip_path, [PART_SAME, PART_FOREIGN])
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--url", ASSET_URL, "--token", API_TOKEN])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out + cap.err
+    assert api.downloads == [(ASSET_URL, API_TOKEN), (ASSET_URL, API_TOKEN), (PART_SAME, API_TOKEN),
+                             (PART_FOREIGN, "")], api.downloads
+    assert outputs()["have_bundle"] == "1"
+    assert API_TOKEN not in cap.out + cap.err
+
+
+def test_lookup_resolved_bundle_with_all_parts_on_the_api_restores(tmp_path, fetch_env, capsys):
+    mod, api, identity, zip_path, outputs = fetch_env
+    other = "https://api.github.com/repos/o/models/releases/assets/4243"
+    api.assets = _multipart_assets(tmp_path, zip_path, [PART_SAME, other])
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--repo", MODELS_REPO, "--token", API_TOKEN,
+                   "--identity", identity])
+    assert rc == 0, capsys.readouterr()
+    assert [t for _, t in api.downloads] == [API_TOKEN] * 4
+
+
+# ---- --require-newest: the pinned release must be the newest model release (independent of the pin)
+
+NEWEST_MSG = ("the code pins {id} but the models repository holds a newer model release {tag}: commit and push "
+              "the scripts/bump_model_release.py changes before tagging")
+LIST_URL = f"https://api.github.com/repos/{MODELS_REPO}/releases?per_page=100"
+
+
+def _listing_api(api, identity: str, listing):
+    api.release["created_at"] = "2031-03-01T10:00:00Z"
+    pinned = {"tag_name": f"brain-triage-{identity}", "created_at": "2031-03-01T10:00:00Z", "draft": False}
+    body = listing(pinned) if callable(listing) else listing
+    tag_body = json.dumps(api.release).encode()
+
+    def http_get(url, headers):
+        api.gets.append((url, dict(headers)))
+        if url == LIST_URL:
+            if isinstance(body, BaseException):
+                raise body
+            return body if isinstance(body, bytes) else json.dumps(body).encode()
+        return tag_body
+    return http_get
+
+
+def _newest_argv(tmp_path, identity, *extra):
+    return ["--dest", str(tmp_path / "models"), "--repo", MODELS_REPO, "--token", API_TOKEN,
+            "--identity", identity, "--require", "--require-newest", *extra]
+
+
+def test_require_newest_fails_when_the_models_repo_holds_a_newer_model(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    newer = "brain-triage-aaaaaaaaaaaa"
+    monkeypatch.setattr(mod, "_http_get", _listing_api(api, identity, lambda pinned: [
+        {"tag_name": newer, "created_at": "2031-04-01T09:00:00Z", "draft": False}, pinned]))
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc = mod.main(_newest_argv(tmp_path, identity))
+    cap = capsys.readouterr()
+    assert rc == 1, cap.out + cap.err
+    assert NEWEST_MSG.format(id=identity, tag=newer) in cap.err, cap.err
+    assert "::error title=" in cap.out
+    assert [u for u, _ in api.gets] == [f"https://api.github.com/repos/{MODELS_REPO}/releases/tags/brain-triage-{identity}",
+                                        LIST_URL]
+    assert api.gets[1][1]["Authorization"] == f"Bearer {API_TOKEN}" and API_TOKEN not in api.gets[1][0]
+    assert api.downloads == [] and outputs() == {"have_bundle": "0"}
+    assert API_TOKEN not in cap.out + cap.err
+
+
+def test_require_newest_passes_when_the_pinned_release_is_the_newest(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    monkeypatch.setattr(mod, "_http_get", _listing_api(api, identity, lambda pinned: [
+        pinned, {"tag_name": "brain-triage-bbbbbbbbbbbb", "created_at": "2031-01-01T00:00:00Z", "draft": False}]))
+    rc = mod.main(_newest_argv(tmp_path, identity))
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out + cap.err
+    assert len(api.gets) == 2 and outputs()["have_bundle"] == "1"
+
+
+@pytest.mark.parametrize("how", ["env", "flag"])
+def test_require_newest_override_warns_and_continues(tmp_path, fetch_env, monkeypatch, capsys, how):
+    mod, api, identity, _, outputs = fetch_env
+    newer = "brain-triage-aaaaaaaaaaaa"
+    monkeypatch.setattr(mod, "_http_get", _listing_api(api, identity, lambda pinned: [
+        {"tag_name": newer, "created_at": "2031-04-01T09:00:00Z", "draft": False}, pinned]))
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    extra = ()
+    if how == "env":
+        monkeypatch.setenv("MODEL_BUNDLE_ALLOW_OLDER", "1")
+    else:
+        extra = ("--allow-older",)
+    rc = mod.main(_newest_argv(tmp_path, identity, *extra))
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out + cap.err
+    assert "WARNING" in cap.out and newer in cap.out and "::warning title=" in cap.out, cap.out
+    assert outputs()["have_bundle"] == "1"
+    assert API_TOKEN not in cap.out + cap.err
+
+
+def test_require_newest_ignores_drafts_and_unrelated_tags(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    monkeypatch.setattr(mod, "_http_get", _listing_api(api, identity, lambda pinned: [
+        {"tag_name": "brain-triage-cccccccccccc", "created_at": "2031-05-01T00:00:00Z", "draft": True},
+        {"tag_name": "v2.0.0", "created_at": "2031-05-02T00:00:00Z", "draft": False},
+        {"tag_name": "chest-triage-dddddddddddd", "created_at": "2031-05-03T00:00:00Z", "draft": False},
+        pinned]))
+    rc = mod.main(_newest_argv(tmp_path, identity))
+    assert rc == 0, capsys.readouterr()
+
+
+@pytest.mark.parametrize("case,body", [
+    ("not_json", b"<html>"),
+    ("not_a_list", {"message": "Not Found"}),
+    ("entry_without_date", lambda pinned: [{"tag_name": "brain-triage-aaaaaaaaaaaa", "draft": False}, pinned]),
+    ("bad_date", lambda pinned: [{"tag_name": "brain-triage-aaaaaaaaaaaa", "created_at": "yesterday",
+                                  "draft": False}, pinned]),
+    ("http_error", _http_error(403)),
+    ("unreachable", _url_error()),
+])
+def test_require_newest_malformed_listing_is_a_hard_failure(tmp_path, fetch_env, monkeypatch, capsys, case, body):
+    mod, api, identity, _, outputs = fetch_env
+    monkeypatch.setattr(mod, "_http_get", _listing_api(api, identity, body))
+    monkeypatch.setenv("MODEL_BUNDLE_ALLOW_OLDER", "1")          # the override never excuses an unreadable answer
+    rc = mod.main(_newest_argv(tmp_path, identity))
+    cap = capsys.readouterr()
+    assert rc == 1, (case, cap.out + cap.err)
+    assert "releases of o/models" in cap.err, (case, cap.err)
+    assert API_TOKEN not in cap.out + cap.err, case
+    assert api.downloads == [] and outputs() == {"have_bundle": "0"}
+
+
+def test_require_newest_pinned_release_without_date_is_a_hard_failure(tmp_path, fetch_env, monkeypatch, capsys):
+    mod, api, identity, _, outputs = fetch_env
+    get = _listing_api(api, identity, lambda pinned: [pinned])
+    api.release.pop("created_at")
+    monkeypatch.setattr(mod, "_http_get", lambda url, headers: (json.dumps(api.release).encode()
+                                                                 if "/tags/" in url else get(url, headers)))
+    rc = mod.main(_newest_argv(tmp_path, identity))
+    assert rc == 1 and "created_at" in capsys.readouterr().err
+
+
+def test_require_newest_does_nothing_without_a_repository_lookup(tmp_path, fetch_env, capsys):
+    mod, api, identity, zip_path, outputs = fetch_env
+    rc = mod.main(["--dest", str(tmp_path / "models"), "--url", zip_path.as_uri(), "--require", "--require-newest"])
+    assert rc == 0, capsys.readouterr()
+    assert api.gets == []
+
+
+def test_restore_passes_require_newest_on_tags_only_and_forwards_the_override():
+    for job in BUILDERS:
+        restore = _step(job, "Restore validated triage model")
+        assert restore["env"]["MODEL_BUNDLE_ALLOW_OLDER"] == "${{ vars.MODEL_BUNDLE_ALLOW_OLDER }}", job
+        assert restore["run"].count("--require-newest") == 1, job
+    win = _step("windows", "Restore validated triage model")["run"]
+    assert "if ($env:BUNDLE_REQUIRED -eq '1') { $fetchArgs += @('--require', '--require-newest') }" in win
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "Independent re-check" not in text
+    assert text.count("vars.MODEL_BUNDLE_ALLOW_OLDER") == 2
+
+
+@pytest.mark.parametrize("required,expect", [("1", True), ("0", False)])
+def test_macos_restore_script_passes_require_newest_only_on_tags(tmp_path, required, expect):
+    run = _step("macos", "Restore validated triage model")["run"]
+    rec = tmp_path / "argv.txt"
+    fake = tmp_path / "fake_python"
+    fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{rec}"\n')
+    fake.chmod(0o755)
+    r = subprocess.run(["bash", "-c", run], cwd=str(tmp_path), capture_output=True, text=True, timeout=60,
+                       env={"PATH": os.environ.get("PATH", ""), "PYTHON": str(fake), "BUNDLE_REQUIRED": required})
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = rec.read_text().splitlines()
+    assert ("--require-newest" in argv) is expect and ("--require" in argv) is expect, argv
+
+
+def test_identity_recheck_is_documented_as_what_it_is():
+    """D11 and the workflow comment must not call the pin comparison independent; the newest-release check is."""
+    d11 = _text("docs/dev/finish_line_contract.md")
+    d11 = d11[d11.index("D11."):]
+    d11 = d11[:d11.index("\nD12.")] if "\nD12." in d11 else d11
+    assert "stays as an independent check" not in d11
+    assert "--require-newest" in d11 and "MODEL_BUNDLE_ALLOW_OLDER" in d11
+    assert "MODEL_BUNDLE_URL secret" not in _text("packaging/check_bundle_release.py")
+
+
+def test_admin_guides_describe_published_release_refusal_and_newest_model_gate():
+    markers = {
+        "en": ("uploads nothing and fails", "newer model release"),
+        "ru": ("ничего не загружает и завершается ошибкой", "более новый выпуск модели"),
+        "uz": ("hech narsa yuklamaydi va xato bilan tugaydi", "yangiroq model relizi"),
+    }
+    for lang in LANGS:
+        tail = _guide(lang)
+        tail = tail[tail.index("\n## 13. "):]
+        for frag in (*markers[lang], "MODEL_BUNDLE_ALLOW_OLDER", "--require-newest"):
+            assert frag in tail, (lang, frag)

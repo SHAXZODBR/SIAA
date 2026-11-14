@@ -35,6 +35,8 @@ import numpy as np
 import pydicom
 from loguru import logger
 
+from src.pipeline.dicom_objects import is_image_object
+
 LOCALIZER_DESC_RE = re.compile(r'scout|localizer|topogram|scano', re.I)
 BRAIN_DESC_RE = re.compile(r'brain|head|std|axial|routine', re.I)
 # Hemorrhage is read on the soft-tissue kernel; a bone/lung kernel is only a
@@ -198,8 +200,12 @@ def is_axial_orientation(iop: Optional[list[float]]) -> bool:
 def read_series_headers(file_paths: list[Path]) -> list[SeriesInfo]:
     """Header-only pass (stop_before_pixels) grouping the upload by
     SeriesInstanceUID. Files that do not parse as DICOM are skipped. A file
-    without SeriesInstanceUID gets its own pseudo-series."""
-    by_uid: dict[str, SeriesInfo] = {}
+    without SeriesInstanceUID gets its own pseudo-series. Non-image objects and
+    secondary captures (is_image_object: SR / PR, a "Dose Report" page) are left
+    out whenever the upload holds an acquired image; an upload of only such
+    objects is grouped as a whole, as before."""
+    image_by_uid: dict[str, SeriesInfo] = {}
+    other_by_uid: dict[str, SeriesInfo] = {}
     for order, p in enumerate(file_paths):
         try:
             ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
@@ -207,6 +213,7 @@ def read_series_headers(file_paths: list[Path]) -> list[SeriesInfo]:
             continue
         if not (ds.get('SOPClassUID') or ds.get('Modality')):
             continue       # force=True parses almost anything — require a DICOM signal
+        by_uid = image_by_uid if is_image_object(ds) else other_by_uid
         uid = str(ds.get('SeriesInstanceUID') or '').strip() or f'__nouid__{order}'
         series = by_uid.get(uid)
         if series is None:
@@ -238,7 +245,7 @@ def read_series_headers(file_paths: list[Path]) -> list[SeriesInfo]:
             path=Path(p), order=order, instance_number=inst, z=z,
             rows=int(ds.get('Rows') or 0), cols=int(ds.get('Columns') or 0),
         ))
-    return list(by_uid.values())
+    return list((image_by_uid or other_by_uid).values())
 
 
 # ---------------------------------------------------------------------------
