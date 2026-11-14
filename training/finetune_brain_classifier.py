@@ -35,12 +35,34 @@
       tune/            (optional; written by scripts/combine_training_sets.py)
         (same structure)
 
-  Checkpoint selection (--select-split): the epoch with the best accuracy on
-  the SELECTION split is saved. Default: tune/ when <data>/tune has images,
-  else val/ with a loud WARNING — in a release set val/ is the GATE set
-  (locked holdout, scored by scripts/eval_study_level.py), and picking the
-  best of N epochs on it biases the gate numbers upward. training_metrics.json
-  records which split selected the checkpoint (checkpoint_selection).
+  Checkpoint selection (--select-split): the best epoch on the SELECTION split
+  is saved. Default: tune/ when <data>/tune has images, else val/ with a loud
+  WARNING — in a release set val/ is the GATE set (locked holdout, scored by
+  scripts/eval_study_level.py), and picking the best of N epochs on it biases
+  the gate numbers upward. training_metrics.json records which split and which
+  rule selected the checkpoint (checkpoint_selection).
+
+  What "best" means (--select-metric):
+    slice_acc  (default) the highest slice accuracy. Blind to the operating
+               point: on a 3:1 abnormal:normal split an epoch that calls almost
+               everything abnormal scores as well as a balanced one.
+    study      the shipped protocol on the selection split — a study is flagged
+               when the mean abnormal probability of its slices is >= 0.50 (the
+               study key is the file name without its trailing _<k>, as in
+               scripts/eval_study_level.py). Among the epochs whose study
+               sensitivity is >= --select-min-sens (default 0.90: a triage tool
+               must first not miss) the one with the highest specificity is
+               kept; when no epoch reaches it, the most sensitive one. Needs a
+               class named by --abnormal-class (default 'abnormal').
+  The study-level numbers of every epoch are recorded in training_metrics.json
+  whichever rule selects.
+
+  Augmentation (--augment): random horizontal flip, small rotation / shift /
+  zoom and brightness / contrast jitter on the TRAINING images only. Without it
+  the last blocks memorise a few thousand slices within three epochs (train
+  accuracy 1.00 while the selection loss doubles).
+
+  --seed N makes the shuffling, the augmentation and the new head reproducible.
 
   Run:
     python training/finetune_brain_classifier.py \\
@@ -85,8 +107,9 @@ CLASS_ORDER = ['glioma_tumor', 'meningioma_tumor', 'no_tumor', 'pituitary_tumor'
 
 
 class BrainImageDataset(Dataset):
-    def __init__(self, root: Path, processor, classes: list[str]):
+    def __init__(self, root: Path, processor, classes: list[str], augment=None):
         self.processor = processor
+        self.augment = augment            # PIL image -> PIL image, training split only
         self.classes = classes
         self.cls_to_idx = {c: i for i, c in enumerate(classes)}
         self.samples: list[tuple[Path, int]] = []
@@ -96,7 +119,7 @@ class BrainImageDataset(Dataset):
                 print(f"[warn] missing class dir: {cls_dir}")
                 continue
             for ext in IMAGE_EXTS:
-                for fp in cls_dir.glob(ext):
+                for fp in sorted(cls_dir.glob(ext)):
                     self.samples.append((fp, self.cls_to_idx[cls]))
         if not self.samples:
             raise RuntimeError(f"No images found under {root}")
@@ -108,6 +131,8 @@ class BrainImageDataset(Dataset):
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         img = self._load(path)
+        if self.augment is not None:
+            img = self.augment(img)
         proc = self.processor(images=img, return_tensors='pt')
         return {
             'pixel_values': proc['pixel_values'].squeeze(0),
@@ -157,6 +182,70 @@ def resolve_select_split(data: Path, requested: Optional[str]) -> tuple[str, Opt
     return split, warning
 
 
+SELECT_METRICS = ('slice_acc', 'study')
+STUDY_THRESHOLD = 0.5                 # the shipped protocol: mean abnormal probability >= 0.50 -> flagged
+
+
+def build_augmentation():
+    """Training-time augmentation of one PIL slice: left-right flip, small rotation / shift / zoom,
+    brightness / contrast jitter. Deliberately mild — the anatomy stays an axial brain slice."""
+    from torchvision import transforms as T
+    return T.Compose([
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1), fill=0),
+        T.ColorJitter(brightness=0.15, contrast=0.15),
+    ])
+
+
+def study_key(path: Path) -> str:
+    """'<study key>_<k>.png' -> study key (the rule of scripts/eval_study_level.py)."""
+    return Path(path).stem.rsplit('_', 1)[0]
+
+
+def _auc(pos: list[float], neg: list[float]) -> Optional[float]:
+    """Rank AUC (ties count 1/2). None when a class is empty."""
+    if not pos or not neg:
+        return None
+    wins = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg)
+    return wins / (len(pos) * len(neg))
+
+
+def study_metrics(samples: list[tuple[Path, int]], abnormal_probs: list[float], abnormal_idx: int,
+                  threshold: float = STUDY_THRESHOLD) -> dict:
+    """Shipped-protocol metrics of the selection split: slices are grouped into studies by file name,
+    a study is flagged when the mean abnormal probability of its slices is >= threshold."""
+    by_study: dict[tuple[str, int], list[float]] = {}
+    for (path, label), prob in zip(samples, abnormal_probs):
+        by_study.setdefault((study_key(path), label), []).append(float(prob))
+    pos = [sum(v) / len(v) for (_, label), v in by_study.items() if label == abnormal_idx]
+    neg = [sum(v) / len(v) for (_, label), v in by_study.items() if label != abnormal_idx]
+    tp = sum(1 for m in pos if m >= threshold)
+    tn = sum(1 for m in neg if m < threshold)
+    sens = tp / len(pos) if pos else None
+    spec = tn / len(neg) if neg else None
+    return {'n_abnormal': len(pos), 'n_normal': len(neg), 'tp': tp, 'fn': len(pos) - tp,
+            'tn': tn, 'fp': len(neg) - tn, 'sensitivity': sens, 'specificity': spec,
+            'balanced_accuracy': (sens + spec) / 2 if sens is not None and spec is not None else None,
+            'auc': _auc(pos, neg), 'threshold': threshold}
+
+
+def selection_key(metric: str, sel_acc: float, sel_loss: float, study: Optional[dict], min_sens: float) -> tuple:
+    """Sort key of an epoch — the larger, the better.
+    slice_acc: the slice accuracy alone (the first of equal epochs wins, as before).
+    study    : epochs whose study sensitivity reaches min_sens rank above all others and among
+               themselves by specificity, then sensitivity; the rest by sensitivity, then
+               specificity; a lower selection loss breaks what is still tied."""
+    if metric == 'slice_acc':
+        return (sel_acc,)
+    sens = (study or {}).get('sensitivity')
+    spec = (study or {}).get('specificity')
+    sens = -1.0 if sens is None else sens
+    spec = -1.0 if spec is None else spec
+    if sens >= min_sens:
+        return (1, spec, sens, -sel_loss)
+    return (0, sens, spec, -sel_loss)
+
+
 # ----------------------------------------------------------------------------
 # TRAINING LOOP
 # ----------------------------------------------------------------------------
@@ -189,7 +278,9 @@ def train_one_epoch(model, loader, optim, sched, criterion, device, epoch, total
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, probs_out: Optional[list] = None):
+    """(loss, slice accuracy, per-class counts). With probs_out (a list) the softmax row of every
+    sample is appended in loader order (the loader must not shuffle)."""
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -202,6 +293,8 @@ def evaluate(model, loader, criterion, device):
         logits = out.logits if hasattr(out, 'logits') else out
         loss = criterion(logits, labels)
         preds = logits.argmax(dim=-1)
+        if probs_out is not None:
+            probs_out.extend(torch.softmax(logits.float(), dim=-1).cpu().tolist())
         total_loss += loss.item() * labels.size(0)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
@@ -237,9 +330,24 @@ def main():
     p.add_argument('--balance', action='store_true',
                      help='inverse-frequency class weighting (critical for imbalanced data like hemorrhage)')
     p.add_argument('--select-split', choices=['tune', 'val'], default=None,
-                     help='split whose accuracy picks the saved epoch (default: tune when <data>/tune exists, '
+                     help='split that picks the saved epoch (default: tune when <data>/tune exists, '
                           'else val with a WARNING: val is the gate set of a release)')
+    p.add_argument('--select-metric', choices=SELECT_METRICS, default='slice_acc',
+                     help="what 'best epoch' means: slice_acc (default) or study = the shipped protocol on the "
+                          'selection split: sensitivity >= --select-min-sens first, then the highest specificity')
+    p.add_argument('--select-min-sens', type=float, default=0.90,
+                     help='--select-metric study: study sensitivity an epoch must reach (default 0.90)')
+    p.add_argument('--abnormal-class', default='abnormal',
+                     help="class whose probability flags a study (--select-metric study; default 'abnormal')")
+    p.add_argument('--augment', action='store_true',
+                     help='augment the training images (flip, small rotation / shift / zoom, brightness / contrast)')
+    p.add_argument('--seed', type=int, default=None,
+                     help='seed for shuffling, augmentation and a new head (default: not seeded)')
     args = p.parse_args()
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
 
     select_split, select_warning = resolve_select_split(args.data, args.select_split)
     if select_warning:
@@ -249,6 +357,12 @@ def main():
 
     # Generic: any disease, not just tumor. Folder names must match these.
     class_order = [c.strip() for c in args.classes.split(',')] if args.classes else CLASS_ORDER
+    abnormal_idx = class_order.index(args.abnormal_class) if args.abnormal_class in class_order else None
+    if args.select_metric == 'study' and abnormal_idx is None:
+        raise SystemExit(f"--select-metric study needs the class '{args.abnormal_class}' in --classes "
+                         f"(got {class_order}); pass --abnormal-class or use --select-metric slice_acc")
+    if not 0.0 <= args.select_min_sens <= 1.0:
+        raise SystemExit('--select-min-sens must be between 0 and 1')
 
     # Device
     if args.device == 'auto':
@@ -296,7 +410,11 @@ def main():
     base_model.to(device)
 
     # Data
-    train_ds = BrainImageDataset(args.data / 'train', processor, class_order)
+    augment = build_augmentation() if args.augment else None
+    if augment is not None:
+        print('[augment] training images: horizontal flip, rotation ±10°, shift 5 %, zoom 0.9–1.1, '
+              'brightness / contrast ±15 %')
+    train_ds = BrainImageDataset(args.data / 'train', processor, class_order, augment=augment)
     sel_ds   = BrainImageDataset(args.data / select_split, processor, class_order)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                 num_workers=0, drop_last=False)
@@ -324,8 +442,10 @@ def main():
 
     args.output.mkdir(parents=True, exist_ok=True)
     metrics = {'epochs': []}
-    best_sel_acc = -1.0          # the first epoch is always saved, even at accuracy 0
+    best_sel_acc = -1.0          # slice accuracy of the saved epoch
+    best_key = None              # the first epoch is always saved
     best_epoch = 0
+    best_study = None
     start = time.time()
 
     for epoch in range(1, args.epochs + 1):
@@ -333,10 +453,18 @@ def main():
             base_model, train_loader, optim, sched, criterion,
             device, epoch, args.epochs,
         )
-        sel_loss, sel_acc, per_cls = evaluate(base_model, sel_loader, criterion, device)
+        probs: Optional[list] = [] if abnormal_idx is not None else None
+        sel_loss, sel_acc, per_cls = evaluate(base_model, sel_loader, criterion, device, probs_out=probs)
+        study = (study_metrics(sel_ds.samples, [row[abnormal_idx] for row in probs], abnormal_idx)
+                 if probs is not None else None)
         elapsed = (time.time() - start) / 60
         print(f"  >> epoch {epoch}: train acc {tr_acc:.3f} | {select_split} acc {sel_acc:.3f} | "
               f"{select_split} loss {sel_loss:.4f} | {elapsed:.1f}min elapsed")
+        if study is not None and study['sensitivity'] is not None and study['specificity'] is not None:
+            auc = study['auc']
+            print(f"     {select_split} studies ({study['n_abnormal']} abnormal / {study['n_normal']} normal): "
+                  f"sensitivity {study['sensitivity']:.3f} | specificity {study['specificity']:.3f} | "
+                  f"auc {'—' if auc is None else format(auc, '.3f')}")
 
         ep = {
             'epoch': epoch,
@@ -344,21 +472,39 @@ def main():
             'select_split': select_split, 'select_loss': sel_loss, 'select_acc': sel_acc,
             'per_class': {class_order[k]: v for k, v in per_cls.items()},
         }
+        if study is not None:
+            ep['study'] = study
         if select_split == 'val':            # legacy keys: only when val really was evaluated
             ep.update(val_loss=sel_loss, val_acc=sel_acc)
         metrics['epochs'].append(ep)
 
-        if sel_acc > best_sel_acc:
+        key = selection_key(args.select_metric, sel_acc, sel_loss, study, args.select_min_sens)
+        if best_key is None or key > best_key:
+            best_key = key
             best_sel_acc = sel_acc
             best_epoch = epoch
+            best_study = study
             base_model.save_pretrained(args.output)
             processor.save_pretrained(args.output)
-            print(f"     ✓ saved best to {args.output} ({select_split}_acc {sel_acc:.3f})")
+            why = (f"{select_split}_acc {sel_acc:.3f}" if args.select_metric == 'slice_acc' else
+                   f"{select_split} study sensitivity {study['sensitivity']:.3f} / specificity "
+                   f"{study['specificity']:.3f}" if study and study['sensitivity'] is not None
+                   and study['specificity'] is not None else f"{select_split}_acc {sel_acc:.3f}")
+            print(f"     ✓ saved best to {args.output} ({why})")
 
     metrics['checkpoint_selection'] = {
-        'split': select_split, 'metric': 'slice accuracy', 'best_epoch': best_epoch, 'best_acc': best_sel_acc,
+        'split': select_split,
+        'metric': ('slice accuracy' if args.select_metric == 'slice_acc' else
+                   f'study protocol (mean {args.abnormal_class} probability >= {STUDY_THRESHOLD:.2f}): '
+                   f'sensitivity >= {args.select_min_sens:.2f} first, then specificity'),
+        'select_metric': args.select_metric,
+        'best_epoch': best_epoch, 'best_acc': best_sel_acc,
         'data': str(args.data / select_split), 'gate_set_used_for_selection': select_split == 'val',
     }
+    if args.select_metric == 'study':
+        metrics['checkpoint_selection'].update(min_sensitivity=args.select_min_sens, best_study=best_study)
+    metrics['augment'] = bool(args.augment)
+    metrics['seed'] = args.seed
     if select_split == 'val':
         metrics['best_val_acc'] = best_sel_acc
     metrics['base_model'] = args.base_model
